@@ -1,0 +1,38 @@
+# Compiled
+*.class
+*.jar
+*.war
+
+# Build output
+build/
+out/
+target/
+.gradle/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+.classpath
+.project
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets — KHÔNG commit
+.env
+*.p12
+*.jks
+application-local.properties
+application-local.yml
+
+# Logs
+logs/
+*.log
+
+# Runtime
+*.pid
