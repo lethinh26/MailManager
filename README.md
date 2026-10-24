@@ -34,7 +34,5 @@ cd "Mail Client"
 - `architechture/docs/01-thiet-ke-tong-the.md` — kiến trúc
 - `architechture/docs/02-danh-sach-endpoint-va-phan-cong.md` — API + phân công
 - `architechture/docs/03-task-breakdown.md` — timeline 3 tuần
-- `architechture/docs/04-task-details.md` — chi tiết modules
-- `architechture/docs/task-files/` — file MD riêng từng sub-task
 
 Backlog Lark: https://msgmclt9kdj2.sg.larksuite.com/base/CVR2bm043ahjzCs1ohHltC9Zgcg
