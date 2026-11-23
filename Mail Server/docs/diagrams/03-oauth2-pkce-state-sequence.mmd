@@ -1,0 +1,65 @@
+sequenceDiagram
+    autonumber
+    actor User as Người dùng
+    participant Client as Mail Client (Swing)
+    participant GmailCtrl as GmailAccountController / OAuth2Controller
+    participant LinkSvc as GmailAccountLinkService
+    participant OAuthSvc as OAuth2Service
+    participant StateStore as OAuth2StateStore (RAM)
+    participant Browser as Trình duyệt Web
+    participant GoogleAuth as Google OAuth2 Server
+    participant DB as MySQL (UNIQUE user_id, email_key)
+    participant MailFac as DefaultMailConnectionFactory (IMAPS/SMTP)
+
+    rect rgb(235, 245, 255)
+        note over User, DB: Luồng A — Liên kết / Thêm Google OAuth2 (PKCE S256 + Upsert theo email_key)
+        User->>Client: Bấm "Đăng nhập Google" hoặc "Thêm phương thức đăng nhập"
+        Client->>GmailCtrl: GET /api/oauth2/authorize-url (Bearer JWT)
+        GmailCtrl->>OAuthSvc: getAuthorizeUrl(userId, accountId?)
+        OAuthSvc->>StateStore: save(state, userId, codeVerifier, TTL=10m)
+        GmailCtrl-->>Client: 200 OK { authorizeUrl }
+        Client->>Browser: Mở Google Consent (scope https://mail.google.com/)
+        User->>GoogleAuth: Chọn tài khoản Google & Cho phép
+        GoogleAuth-->>Browser: 302 /api/oauth2/callback?code=...&state=...
+        Browser->>GmailCtrl: GET /api/oauth2/callback
+        GmailCtrl->>OAuthSvc: handleCallback(code, state)
+        OAuthSvc->>GoogleAuth: POST /token (code + code_verifier) & GET /userinfo
+        GoogleAuth-->>OAuthSvc: refresh_token + email + picture
+        OAuthSvc->>LinkSvc: upsertOAuth2(user, email, encRefreshToken)
+        LinkSvc->>DB: findByUserIdAndEmailKey(userId, normalizeKey(email))
+        alt Chưa tồn tại hộp thư
+            LinkSvc->>DB: INSERT gmail_accounts (authType=OAUTH2)
+            LinkSvc-->>OAuthSvc: outcome = CREATED
+        else Đã tồn tại (kể cả từ App Password)
+            LinkSvc->>DB: UPDATE giữ nguyên id, displayName, appPasswordEncrypted; đặt OAUTH2 làm chính
+            LinkSvc-->>OAuthSvc: outcome = METHOD_ADDED / METHOD_UPDATED
+        end
+        OAuthSvc-->>Browser: HTML hiển thị email che (c***@gmail.com) & "Đã thêm phương thức" (không báo lỗi)
+    end
+
+    rect rgb(240, 253, 244)
+        note over User, DB: Luồng B — Thêm App Password dự phòng (Kiểm tra trước cục bộ + Upsert)
+        User->>Client: Nhập email ở Wizard App Password
+        Client->>Client: EmailNormalizer.normalizeKey(email) so với danh sách cục bộ
+        Client-->>User: Báo ngay "Hộp thư này đã liên kết bằng Google. Bấm 'Thêm App Password'..."
+        User->>Client: Bấm "Thêm App Password"
+        Client->>GmailCtrl: POST /api/gmail-accounts/app-password
+        GmailCtrl->>MailFac: testImap(email, appPassword) qua IMAPS 993
+        GmailCtrl->>LinkSvc: upsertAppPassword(user, email, encAppPass)
+        LinkSvc->>DB: Upsert theo (user_id, email_key), retry 1 lần nếu race UNIQUE
+        GmailCtrl-->>Client: 200 OK { outcome: METHOD_ADDED, methods: {hasOAuth:true, hasAppPassword:true} }
+    end
+
+    rect rgb(255, 247, 237)
+        note over Client, MailFac: Luồng C — Tự động Fallback OAuth2 -> App Password (giữ nguyên NEEDS_REAUTH)
+        Client->>MailFac: Đọc/Gửi thư (preferredMethod = OAUTH2)
+        MailFac->>OAuthSvc: getFreshAccessToken(account)
+        OAuthSvc-->>MailFac: ném ReauthRequiredException (invalid_grant -> NEEDS_REAUTH)
+        alt Hộp thư có App Password dự phòng
+            MailFac->>DB: fallbackActive=true (GIỮ NGUYÊN status=NEEDS_REAUTH) + Audit FALLBACK_TO_APP_PASSWORD
+            MailFac->>MailFac: Mở IMAPS/SMTP bằng App Password đúng 1 lần (không retry lỗi auth)
+            MailFac-->>Client: Thao tác thành công + dải cam "Đang dùng App Password dự phòng"
+        else Không có App Password
+            MailFac-->>Client: 409 GMAIL_NEEDS_REAUTH
+        end
+    end

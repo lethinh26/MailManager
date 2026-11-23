@@ -1,0 +1,44 @@
+erDiagram
+    USERS ||--o{ GMAIL_ACCOUNTS : "sở hữu (1-N)"
+    USERS ||--o{ AUDIT_LOGS : "thực hiện (1-N)"
+
+    USERS {
+        bigint id PK "Tự tăng (ID duy nhất)"
+        varchar username UK "Tên đăng nhập (3-50 ký tự)"
+        varchar password_hash "Mật khẩu băm BCrypt"
+        varchar full_name "Họ và tên người dùng"
+        varchar email "Email liên hệ"
+        varchar role "Vai trò: ADMIN | USER"
+        boolean enabled "Trạng thái kích hoạt tài khoản"
+        boolean must_change_password "Cờ bắt buộc đổi mật khẩu"
+        timestamp created_at "Thời điểm tạo tài khoản"
+        timestamp updated_at "Thời điểm cập nhật"
+    }
+
+    GMAIL_ACCOUNTS {
+        bigint id PK "Tự tăng (ID tài khoản liên kết)"
+        bigint user_id FK "Khóa ngoại tham chiếu users.id"
+        varchar email "Địa chỉ Gmail liên kết"
+        varchar auth_type "Loại xác thực: APP_PASSWORD | OAUTH2"
+        text encrypted_secret "Mã hóa AES-256-GCM (App Pass / Refresh Token)"
+        varchar status "Trạng thái: OK | NEEDS_REAUTH | DISABLED"
+        timestamp created_at "Thời điểm liên kết"
+        timestamp updated_at "Thời điểm cập nhật"
+    }
+
+    SYSTEM_SETTINGS {
+        varchar setting_key PK "Khóa cấu hình: MAINTENANCE_MODE, ALLOW_REGISTER..."
+        varchar setting_value "Giá trị cấu hình (true/false, text)"
+        varchar description "Mô tả mục đích cờ động"
+        timestamp updated_at "Thời điểm cập nhật"
+    }
+
+    AUDIT_LOGS {
+        bigint id PK "Tự tăng (ID bản ghi kiểm toán)"
+        bigint user_id FK "Khóa ngoại tham chiếu users.id (nullable)"
+        varchar action "Hành động: LOGIN_SUCCESS, UNLINK_GMAIL, REVOKE..."
+        text detail "Chi tiết nhật ký hành động"
+        varchar ip_address "Địa chỉ IP thực hiện thao tác"
+        timestamp created_at "Thời điểm ghi nhận"
+    }
+

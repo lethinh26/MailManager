@@ -1,0 +1,50 @@
+sequenceDiagram
+    autonumber
+    actor User as Người dùng (Client Swing)
+    participant AuthCtrl as AuthController (EP-A2)
+    participant AuthService as AuthService
+    participant RateLimiter as RateLimitService
+    participant UserRepo as UserRepository
+    participant PwdEncoder as PasswordEncoder (BCrypt)
+    participant JwtProv as JwtProvider
+    participant AuditLog as AuditLogService
+
+    User->>AuthCtrl: POST /api/auth/login {username, password}
+    AuthCtrl->>AuthService: login(request, clientIp)
+    AuthService->>RateLimiter: checkRateLimit(clientIp)
+    alt Đã vượt quá 5 lần sai trong 15 phút
+        RateLimiter-->>AuthService: Ném RateLimitException
+        AuthService-->>AuthCtrl: 429 TOO_MANY_ATTEMPTS
+        AuthCtrl-->>User: HTTP 429 (Kèm header Retry-After)
+    else Trong ngưỡng cho phép
+        RateLimiter-->>AuthService: OK
+    end
+
+    AuthService->>UserRepo: findByUsername(username)
+    alt Không tìm thấy User
+        UserRepo-->>AuthService: Optional.empty()
+        AuthService->>PwdEncoder: matches(password, DUMMY_HASH) (Chống time-attack)
+        AuthService->>RateLimiter: recordFailure(clientIp)
+        AuthService-->>User: 401 INVALID_CREDENTIALS ("Sai tên đăng nhập hoặc mật khẩu")
+    else Tìm thấy User
+        UserRepo-->>AuthService: User entity
+        AuthService->>PwdEncoder: matches(password, user.getPasswordHash())
+        alt Mật khẩu KHÔNG khớp
+            PwdEncoder-->>AuthService: false
+            AuthService->>RateLimiter: recordFailure(clientIp)
+            AuthService-->>User: 401 INVALID_CREDENTIALS ("Sai tên đăng nhập hoặc mật khẩu")
+        else Mật khẩu KHỚP
+            PwdEncoder-->>AuthService: true
+            alt Tài khoản bị khóa (enabled == false)
+                AuthService-->>User: 403 ACCOUNT_LOCKED ("Tài khoản đã bị vô hiệu hóa")
+            else Tài khoản hợp lệ
+                AuthService->>RateLimiter: recordSuccess(clientIp)
+                AuthService->>JwtProv: generateToken(user) (HMAC SHA-256, hạn 24h)
+                JwtProv-->>AuthService: accessToken (JWT)
+                AuthService->>AuditLog: log(user.getId(), "LOGIN_SUCCESS", clientIp)
+                AuthService-->>AuthCtrl: LoginResponse {accessToken, tokenType="Bearer", expiresIn=86400, user}
+                AuthCtrl-->>User: HTTP 200 OK [Cache-Control: no-store]
+            end
+        end
+    end
+

@@ -1,0 +1,24 @@
+flowchart LR
+    subgraph LAN["Mạng Cục Bộ LAN (192.168.1.0/24)"]
+        Client["PC Client (Swing UI)<br>192.168.1.15"]
+    end
+
+    subgraph ServerZone["Máy Chủ Mail Server (192.168.1.10)"]
+        Server["Mail Server Proxy<br>(Spring Boot 3.3.5 / Java 21)"]
+        Keystore[("PKCS12 Keystore<br>SAN: localhost, LAN IPs")]
+        LocalDB[("MySQL 8.0 DB<br>users, gmail_accounts")]
+        Server --- Keystore
+        Server --- LocalDB
+    end
+
+    subgraph GoogleCloud["Hạ Tầng Điện Toán Đám Mây Google"]
+        GmailIMAP["Gmail IMAP Server<br>imap.gmail.com:993"]
+        GmailSMTP["Gmail SMTP Server<br>smtp.gmail.com:587"]
+        GoogleOAuth["Google Identity Provider<br>oauth2.googleapis.com"]
+    end
+
+    Client -- "Tier 1: HTTPS Port 8443<br>[TLS 1.2/1.3, PKCS12 Self-signed with SAN]<br>JWT Bearer, REST API JSON" --> Server
+    Server -- "Tier 2A: IMAPS Port 993<br>[TLS 1.2/1.3 Trực tiếp]<br>XOAUTH2 / SASL PLAIN" --> GmailIMAP
+    Server -- "Tier 2B: SMTP Port 587<br>[STARTTLS Bắt buộc]<br>XOAUTH2 / SASL PLAIN" --> GmailSMTP
+    Server -- "Tier 2C: HTTPS Port 443<br>[TLS 1.3]<br>OAuth2 Token Exchange / Revoke" --> GoogleOAuth
+

@@ -1,0 +1,41 @@
+# Biểu Đồ Tuần Tự: Nghiệp Vụ Cốt Lõi — Tải Tệp Đính Kèm Rồi Xóa Thư (M12 + M16)
+
+Biểu đồ mô tả tính năng cốt lõi của đề tài **Mail Manager**: tự động hoặc thủ công tải xuống, xác minh dung lượng + mã băm SHA-256 cho toàn bộ tệp đính kèm về thư mục có tổ chức `<Downloads>/MailManager/<email>/<yyyy-MM-dd>/`, sau đó mới chuyển thư vào Thùng rác. Bất biến an toàn tuyệt đối: **nếu tải lỗi hoặc bị hủy giữa chừng thì TUYỆT ĐỐI KHÔNG XÓA thư**.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Người dùng / Bộ hẹn giờ Tự động dọn
+    participant Client as AttachmentCleanupService (SwingWorker)
+    participant Disk as Ổ đĩa cục bộ (<Downloads>/MailManager/<email>/<yyyy-MM-dd>/)
+    participant Server as Mail Server (HTTPS :8443)
+    participant Gmail as Gmail IMAPS (:993)
+
+    User->>Client: Chọn thư & Xác nhận (hoặc Timer định kỳ kích hoạt)
+    loop Với mỗi thư mục tiêu (kiểm tra cờ Hủy trước mỗi bước)
+        Client->>Server: GET /api/mails/{gmailId}/{folder}/{uid}?loadRemote=false
+        Server-->>Client: 200 OK (danh sách attachments[])
+        alt Chế độ chạy thử (Dry-Run)
+            Client-->>User: Ghi nhật ký báo cáo — KHÔNG tải & KHÔNG xóa
+        else Thực thi thật
+            loop Với từng tệp đính kèm trong thư
+                Client->>Client: Làm sạch tên tệp (chống ../) & chống trùng tên (1), (2)...
+                Client->>Server: GET /api/mails/{gmailId}/{folder}/{uid}/attachments/{idx}/download
+                Server->>Gmail: Stream từng chunk 8KB (không nạp RAM)
+                Server-->>Client: Binary stream (RFC 5987, nosniff)
+                Client->>Disk: Ghi ra tệp tạm .part & tính SHA-256 trực tiếp
+                Client->>Disk: Xác minh bytes > 0 & khớp kích thước -> Atomic Rename sang tệp đích
+            end
+            alt MỌI tệp đính kèm đã tải & xác minh thành công (không bị Hủy)
+                Client->>Server: DELETE /api/mails/{gmailId}/{folder}/{uid}?permanent=false
+                Server->>Gmail: Chuyển thư vào Thùng rác ([Gmail]/Trash) + ghi Audit DELETE_MAIL
+                Server-->>Client: 204 No Content
+                Client-->>User: Nhật ký: Đã tải N tệp (kèm SHA-256) & đã chuyển thư vào Thùng rác
+            else Bất kỳ tệp nào lỗi HOẶC người dùng bấm Hủy
+                Note over Client,Server: BẤT BIẾN AN TOÀN: TUYỆT ĐỐI KHÔNG GỌI DELETE!
+                Client-->>User: Báo lỗi / Đã hủy (giữ nguyên thư trên máy chủ)
+            end
+        end
+    end
+```
+
