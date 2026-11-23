@@ -1,0 +1,44 @@
+sequenceDiagram
+    autonumber
+    participant Module as Caller Module (M04/M08/M10/M16)
+    participant Factory as MailConnectionFactory
+    participant TokenProv as AccessTokenProvider
+    participant Google as Google Token Endpoint
+    participant Cipher as AesCipher
+    participant Session as Jakarta Mail Session
+    participant Gmail as Gmail IMAP / SMTP Server
+
+    Module->>Factory: openImap(credentials) hoặc openSmtp(credentials)
+    alt authType == OAUTH2
+        Factory->>TokenProv: getAccessToken(account)
+        alt Token trong bộ nhớ còn hạn (> 60s)
+            TokenProv-->>Factory: Trả về Access Token có sẵn
+        else Token hết hạn hoặc chưa có
+            TokenProv->>Cipher: decrypt(account.getEncryptedSecret())
+            Cipher-->>TokenProv: refreshToken
+            TokenProv->>Google: POST oauth2.googleapis.com/token (refresh_token)
+            alt Refresh thành công
+                Google-->>TokenProv: {access_token, expires_in}
+                TokenProv-->>Factory: Access Token mới
+            else Google trả lỗi invalid_grant
+                Google-->>TokenProv: HTTP 400 invalid_grant
+                TokenProv->>TokenProv: Cập nhật status = NEEDS_REAUTH trong DB
+                TokenProv-->>Factory: Ném GmailAuthException (NEEDS_REAUTH)
+                Factory-->>Module: HTTP 422 Unprocessable Entity
+            end
+        end
+    else authType == APP_PASSWORD
+        Factory->>Cipher: decrypt(account.getEncryptedSecret())
+        Cipher-->>Factory: appPassword (16 ký tự)
+    end
+
+    Factory->>Session: getInstance(props) (Host, Port, Timeout 10/30/30s, TLS 1.2/1.3)
+    Factory->>Factory: Mở Store / Transport kèm Retry lỗi mạng (tối đa 2 lần, ngắt ngay nếu auth failed)
+    Factory->>Gmail: connect(host, port, user, secret/token)
+    Gmail-->>Factory: Kết nối thành công
+    Factory-->>Module: Trả về ImapConnection / SmtpConnection (AutoCloseable)
+
+    Note over Module,Gmail: Module thực hiện tác vụ ngắn hạn (Fetch / Send / Delete mail)
+    Module->>Factory: conn.close() (Khối try-with-resources)
+    Factory->>Gmail: Store.close() / Transport.close() (Nuốt ngoại lệ đóng)
+

@@ -1,0 +1,15 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="MailServerApplication" type="Application" factoryName="Application">
+    <option name="MAIN_CLASS_NAME" value="com.mailapp.MailServerApplication" />
+    <module name="mail-server.main" />
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/Mail Server" />
+    <envs>
+      <env name="SPRING_PROFILES_ACTIVE" value="dev" />
+    </envs>
+    <option name="ENV_FILES" value="$PROJECT_DIR$/Mail Server/.env" />
+    <method v="2">
+      <option name="Make" enabled="true" />
+    </method>
+  </configuration>
+</component>
+

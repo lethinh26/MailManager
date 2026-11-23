@@ -6,6 +6,7 @@
 # Build output
 build/
 out/
+bin/
 target/
 .gradle/
 
@@ -25,10 +26,19 @@ Thumbs.db
 
 # Secrets — KHÔNG commit
 .env
+.env*
+!.env.example
+certs/
 *.p12
 *.jks
+*.cer
+*.private.env.json
+http-client.private.env.json
 application-local.properties
 application-local.yml
+
+# Local unmasked test evidence — KHÔNG commit
+docs/evidence/
 
 # Logs
 logs/

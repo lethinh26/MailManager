@@ -1,0 +1,17 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Server (Docker MySQL)" type="Application" factoryName="Application">
+    <option name="MAIN_CLASS_NAME" value="com.mailapp.MailServerApplication" />
+    <module name="mail-server.main" />
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/Mail Server" />
+    <envs>
+      <env name="SPRING_PROFILES_ACTIVE" value="dev" />
+      <env name="SPRING_DATASOURCE_URL" value="jdbc:mysql://localhost:3307/mailapp_db?useSSL=false&amp;serverTimezone=Asia/Ho_Chi_Minh&amp;characterEncoding=UTF-8&amp;allowPublicKeyRetrieval=true" />
+      <env name="DB_USER" value="mailapp" />
+    </envs>
+    <option name="ENV_FILES" value="$PROJECT_DIR$/Mail Server/.env" />
+    <method v="2">
+      <option name="Make" enabled="true" />
+    </method>
+  </configuration>
+</component>
+

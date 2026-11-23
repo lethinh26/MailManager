@@ -1,0 +1,70 @@
+### 1. Danh sách người dùng (EP-AD2)
+GET {{baseUrl}}/api/admin/users?page=0&size=20&sortBy=createdAt&sortDir=desc
+Authorization: Bearer {{adminToken}}
+
+### 2. Tạo người dùng thủ công (EP-AD1 — sinh mật khẩu tạm ngẫu nhiên)
+POST {{baseUrl}}/api/admin/users
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{
+  "username": "sv_ptit_01",
+  "fullName": "Sinh Viên PTIT 01",
+  "email": "sv01@ptit.edu.vn",
+  "role": "USER"
+}
+
+### 3. Chi tiết người dùng kèm danh sách Gmail metadata (EP-AD3)
+GET {{baseUrl}}/api/admin/users/2
+Authorization: Bearer {{adminToken}}
+
+### 4. Khóa & Mở khóa tài khoản (EP-AD4, EP-AD5)
+PUT {{baseUrl}}/api/admin/users/2/lock
+Authorization: Bearer {{adminToken}}
+
+###
+PUT {{baseUrl}}/api/admin/users/2/unlock
+Authorization: Bearer {{adminToken}}
+
+### 5. Đổi vai trò (EP-AD6)
+PUT {{baseUrl}}/api/admin/users/2/role
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{
+  "role": "ADMIN"
+}
+
+### 6. Đặt lại mật khẩu tạm một lần (EP-AD7)
+PUT {{baseUrl}}/api/admin/users/2/reset-password
+Authorization: Bearer {{adminToken}}
+
+### 7. Đọc & Cập nhật cấu hình hệ thống (EP-S1, EP-S2)
+GET {{baseUrl}}/api/admin/settings
+Authorization: Bearer {{adminToken}}
+
+###
+PUT {{baseUrl}}/api/admin/settings
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{
+  "settings": {
+    "ALLOW_REGISTRATION": "true",
+    "MAX_GMAIL_PER_USER": "5",
+    "MAX_ATTACHMENT_SIZE_MB": "25"
+  }
+}
+
+### 8. Thống kê tổng quan (EP-ST1)
+GET {{baseUrl}}/api/admin/stats
+Authorization: Bearer {{adminToken}}
+
+### 9. Nhật ký hệ thống & Xuất CSV (EP-ST2)
+GET {{baseUrl}}/api/admin/logs?page=0&size=20
+Authorization: Bearer {{adminToken}}
+
+###
+GET {{baseUrl}}/api/admin/logs/export
+Authorization: Bearer {{adminToken}}
+

@@ -1,0 +1,82 @@
+### 1. Đăng nhập lấy JWT
+POST {{baseUrl}}/api/auth/login
+Content-Type: application/json
+
+{
+  "username": "lethanhcuong",
+  "password": "UserPassword123!"
+}
+
+> {% client.global.set("token", response.body.accessToken); %}
+
+### 2. Lấy danh sách tài khoản Gmail (EP-G1)
+GET {{baseUrl}}/api/gmail-accounts
+Authorization: Bearer {{token}}
+
+### 3. Liên kết Gmail bằng App Password (EP-G2)
+POST {{baseUrl}}/api/gmail-accounts/app-password
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "email": "your-email@gmail.com",
+  "appPassword": "<GMAIL_APP_PASSWORD_16_KY_TU>",
+  "displayName": "Gmail cá nhân"
+}
+
+### 4. Đổi tên hiển thị Gmail
+PATCH {{baseUrl}}/api/gmail-accounts/1
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "displayName": "Gmail Công Việc PTIT"
+}
+
+### 4b. [Mở rộng ngoài 27] Đổi phương thức đăng nhập chính (OAUTH2 hoặc APP_PASSWORD)
+PUT {{baseUrl}}/api/gmail-accounts/1/preferred-method
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "preferredMethod": "APP_PASSWORD"
+}
+
+### 4c. [Mở rộng ngoài 27] Gỡ một phương thức đăng nhập khỏi hộp thư (còn phương thức khác)
+DELETE {{baseUrl}}/api/gmail-accounts/1/methods/APP_PASSWORD
+Authorization: Bearer {{token}}
+
+### 4d. [Mở rộng ngoài 27] Gỡ phương thức cuối cùng (bắt buộc confirmUnlink=true để hủy liên kết)
+DELETE {{baseUrl}}/api/gmail-accounts/1/methods/OAUTH2?confirmUnlink=true
+Authorization: Bearer {{token}}
+
+### 5. Lấy danh sách thư mục Gmail (M08)
+GET {{baseUrl}}/api/mails/folders?gmailId=1
+Authorization: Bearer {{token}}
+
+### 6. Liệt kê & tìm kiếm thư trong INBOX (M08)
+GET {{baseUrl}}/api/mails?gmailId=1&folder=INBOX&page=0&size=30
+Authorization: Bearer {{token}}
+
+### 7. Đọc chi tiết 1 thư (M08 - mặc định chặn ảnh từ xa)
+GET {{baseUrl}}/api/mails/1/INBOX/1001?loadRemote=false
+Authorization: Bearer {{token}}
+
+### 8. Tải tệp đính kèm dạng stream (M12)
+GET {{baseUrl}}/api/mails/1/INBOX/1001/attachments/0/download
+Authorization: Bearer {{token}}
+
+### 9. Cập nhật cờ thư: Đánh dấu đã đọc & gắn sao (M17)
+PUT {{baseUrl}}/api/mails/1/INBOX/1001/flags
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "seen": true,
+  "flagged": true
+}
+
+### 10. Xóa thư (chuyển vào Thùng rác - M16)
+DELETE {{baseUrl}}/api/mails/1/INBOX/1001?permanent=false
+Authorization: Bearer {{token}}
+

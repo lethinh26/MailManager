@@ -1,0 +1,37 @@
+# Build & dependency caches
+build/
+.gradle/
+bin/
+out/
+
+# Logs & temp files
+logs/
+*.log
+*.tmp
+
+# Environment & Secrets - TUYỆT ĐỐI KHÔNG đưa vào image
+.env
+.env.*
+*.p12
+*.jks
+*.cer
+*.key
+*.crt
+
+# Test reports & Evidence
+docs/evidence/
+docs/reports/
+build/reports/
+
+# IDE & Editor files
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# Git repository
+.git/
+.gitignore
+.gitattributes
+

@@ -13,10 +13,19 @@ logs/
 
 # Secrets
 .env
+.env*
+!.env.example
 *.p12
 *.jks
+*.cer
+*.private.env.json
+http-client.private.env.json
 
 # Build
 **/build/
 **/out/
+**/bin/
 **/.gradle/
+
+# Generated UI mockup screenshots
+docs/screenshots/
