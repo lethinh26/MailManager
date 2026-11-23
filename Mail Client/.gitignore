@@ -5,6 +5,7 @@
 # Build output
 build/
 out/
+bin/
 .gradle/
 
 # IDE
@@ -22,3 +23,11 @@ Thumbs.db
 # Logs
 logs/
 *.log
+
+# Secrets & Certificates
+certs/
+*.cer
+*.p12
+*.jks
+.env
+.env*
