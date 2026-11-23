@@ -77,6 +77,39 @@ class MailboxRegressionTest {
     }
 
     @Test
+    @DisplayName("(e) Tải thêm chỉ trả về thư mới thay vì dựng lại toàn bộ danh sách")
+    void testAppendReturnsOnlyNewItems() {
+        java.util.Set<Long> loaded = new java.util.HashSet<>(Set.of(103L, 102L, 101L));
+        MailListResponse page1 = new MailListResponse(
+                List.of(
+                        sampleMail(101L, 5001L, "Mail 101 duplicate"),
+                        sampleMail(100L, 5001L, "Mail 100"),
+                        sampleMail(99L, 5001L, "Mail 99")
+                ),
+                1, 3, 5L, true, 5001L);
+
+        List<MailSummaryDto> added = MailboxViewModel.selectNewItems(loaded, page1);
+
+        assertEquals(List.of(100L, 99L), added.stream().map(MailSummaryDto::uid).toList(),
+                "Chỉ thư chưa có trong tập UID đã tải mới được thêm");
+        assertTrue(loaded.contains(99L), "Tập UID phải được cập nhật để lần sau không thêm trùng");
+    }
+
+    @Test
+    @DisplayName("(e) Chỉ tải lại trang 0 khi đang append và UIDVALIDITY đổi")
+    void testReloadDetectionOnUidValidityChange() {
+        MailListResponse same = new MailListResponse(
+                List.of(sampleMail(100L, 5001L, "Mail 100")), 1, 3, 5L, true, 5001L);
+        MailListResponse changed = new MailListResponse(
+                List.of(sampleMail(1L, 9999L, "Rebuilt")), 1, 3, 2L, false, 9999L);
+
+        assertFalse(MailboxViewModel.shouldReloadFromFirstPage(5001L, same, true));
+        assertTrue(MailboxViewModel.shouldReloadFromFirstPage(5001L, changed, true));
+        assertFalse(MailboxViewModel.shouldReloadFromFirstPage(5001L, changed, false),
+                "Tải trang 0 thì không cần phát hiện đổi UIDVALIDITY");
+    }
+
+    @Test
     @DisplayName("(b) Hồi quy bộ đếm thế hệ & hủy worker cũ khi đổi thư mục/thư liên tục, đóng cửa sổ, đăng xuất")
     void testWorkerGenerationCancelsStaleTasksAndOnLogoutOrClose() {
         WorkerCoordinator coord = new WorkerCoordinator();

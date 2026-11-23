@@ -91,6 +91,8 @@ public class MainFrame extends JFrame {
     private CardLayout listCardLayout;
     private JPanel listCardPanel;
     private DefaultListModel<MailSummaryDto> mailListModel;
+    /** UID đang có trong mailListModel, để "Tải thêm" chỉ thêm phần mới thay vì dựng lại cả danh sách. */
+    private final java.util.Set<Long> loadedUids = new java.util.HashSet<>();
     private JList<MailSummaryDto> mailList;
     private JButton loadMoreBtn;
     private JLabel mailCountLabel;
@@ -1054,6 +1056,7 @@ public class MainFrame extends JFrame {
                     } else {
                         selectedAccount = null;
                         folderListModel.clear();
+                        loadedUids.clear();
                         mailListModel.clear();
                         showEmptyListState("Chưa liên kết tài khoản Gmail",
                                 "Bấm nút bên dưới để liên kết Gmail qua OAuth2 hoặc App Password.",
@@ -1217,6 +1220,7 @@ public class MainFrame extends JFrame {
         // Nếu NEEDS_REAUTH nhưng có App Password dự phòng (hoặc đang fallbackActive), vẫn cho phép đọc/gửi thư qua dự phòng
         if ("NEEDS_REAUTH".equalsIgnoreCase(acc.status()) && !acc.hasAppPassword() && !acc.isFallbackActive()) {
             folderListModel.clear();
+            loadedUids.clear();
             mailListModel.clear();
             showEmptyListState("Tài khoản cần xác thực lại",
                     acc.email() + " đã hết hạn hoặc bị thu hồi quyền. Hãy cấp lại quyền để tiếp tục.",
@@ -1326,24 +1330,24 @@ public class MainFrame extends JFrame {
                 loadMoreBtn.setText("Tải thêm...");
                 try {
                     MailListResponse resp = get();
-                    List<MailSummaryDto> existingSnapshot = new ArrayList<>(mailListModel.size());
-                    for (int i = 0; i < mailListModel.size(); i++) {
-                        existingSnapshot.add(mailListModel.get(i));
-                    }
-                    MailboxViewModel.PageMergeResult merged = MailboxViewModel.mergeMailPage(
-                            existingSnapshot, currentUidValidity, resp, append);
                     // Nếu hộp thư đổi UIDVALIDITY giữa lúc tải thêm -> đồng bộ lại từ trang 0
-                    if (merged.uidValidityChanged()) {
+                    if (MailboxViewModel.shouldReloadFromFirstPage(currentUidValidity, resp, append)) {
                         loadMails(0, false);
                         return;
                     }
                     currentPage = resp.page();
                     totalMails = resp.total();
                     hasMoreMails = resp.hasMore();
-                    currentUidValidity = merged.uidValidity();
+                    if (resp.uidValidity() != 0) {
+                        currentUidValidity = resp.uidValidity();
+                    }
 
-                    mailListModel.clear();
-                    for (MailSummaryDto item : merged.items()) {
+                    if (!append) {
+                        loadedUids.clear();
+                        mailListModel.clear();
+                    }
+                    // Chỉ thêm thư chưa có: O(số thư mới) thay vì O(toàn bộ danh sách) mỗi lần tải thêm
+                    for (MailSummaryDto item : MailboxViewModel.selectNewItems(loadedUids, resp)) {
                         mailListModel.addElement(item);
                     }
 
@@ -2233,8 +2237,11 @@ public class MainFrame extends JFrame {
             selectedFolder = folders.get(0);
             folderList.setSelectedIndex(0);
         }
+        loadedUids.clear();
         mailListModel.clear();
-        for (MailSummaryDto m : mails) mailListModel.addElement(m);
+        for (MailSummaryDto m : mails) {
+            if (loadedUids.add(m.uid())) mailListModel.addElement(m);
+        }
         listCardLayout.show(listCardPanel, "LIST");
         mailCountLabel.setText("Hiển thị " + mails.size() + " / " + mails.size() + " thư");
         if (!mails.isEmpty()) mailList.setSelectedIndex(0);

@@ -38,7 +38,7 @@ public class MailboxViewModel {
                     existingItems != null ? List.copyOf(existingItems) : List.of(), 0);
         }
         // Nếu đang tải thêm trang mà máy chủ đổi UIDVALIDITY -> buộc tải lại từ trang 0
-        if (append && currentUidValidity != 0 && resp.uidValidity() != 0 && resp.uidValidity() != currentUidValidity) {
+        if (shouldReloadFromFirstPage(currentUidValidity, resp, append)) {
             return new PageMergeResult(true, resp.uidValidity(), List.of(), 0);
         }
 
@@ -52,17 +52,38 @@ public class MailboxViewModel {
             }
         }
 
-        int added = 0;
-        if (resp.items() != null) {
-            for (MailSummaryDto item : resp.items()) {
-                if (item != null && seenUids.add(item.uid())) {
-                    merged.add(item);
-                    added++;
-                }
+        List<MailSummaryDto> added = selectNewItems(seenUids, resp);
+        merged.addAll(added);
+
+        return new PageMergeResult(false, resp.uidValidity(), merged, added.size());
+    }
+
+    /**
+     * Chọn các thư trong trang chưa có trong {@code seenUids} và bổ sung UID của chúng vào tập.
+     * Dùng cho đường append tăng dần: chỉ thêm phần mới vào model, không dựng lại toàn bộ danh sách.
+     */
+    public static List<MailSummaryDto> selectNewItems(Set<Long> seenUids, MailListResponse resp) {
+        List<MailSummaryDto> added = new ArrayList<>();
+        if (resp == null || resp.items() == null) {
+            return added;
+        }
+        for (MailSummaryDto item : resp.items()) {
+            if (item != null && seenUids.add(item.uid())) {
+                added.add(item);
             }
         }
+        return added;
+    }
 
-        return new PageMergeResult(false, resp.uidValidity(), merged, added);
+    /** True khi đang tải thêm trang nhưng UIDVALIDITY của hộp thư đã thay đổi. */
+    public static boolean shouldReloadFromFirstPage(long currentUidValidity,
+                                                    MailListResponse resp,
+                                                    boolean append) {
+        return append
+                && currentUidValidity != 0
+                && resp != null
+                && resp.uidValidity() != 0
+                && resp.uidValidity() != currentUidValidity;
     }
 
     // === (b) Bộ đếm thế hệ & hủy worker cũ ===
