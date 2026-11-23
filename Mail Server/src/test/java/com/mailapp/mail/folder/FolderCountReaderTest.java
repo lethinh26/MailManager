@@ -6,6 +6,8 @@ import org.eclipse.angus.mail.imap.protocol.Status;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
@@ -46,5 +48,31 @@ class FolderCountReaderTest {
 
         assertEquals(10, counts.total());
         assertEquals(3, counts.unread());
+    }
+
+    @Test
+    @DisplayName("readAll giữ đúng thứ tự, gộp theo lô và cô lập lỗi trong từng lô")
+    void readAllPreservesOrderAndIsolatesFailures() {
+        List<String> names = List.of("INBOX", "A", "B", "C", "D", "E", "F");
+
+        java.util.Map<String, FolderCountReader.FolderCounts> result = FolderCountReader.readAll(3, names, batch -> {
+            // Lô chứa "D" cố tình lỗi: chỉ lô đó bị 0, các lô khác vẫn bình thường
+            if (batch.contains("D")) {
+                throw new IllegalStateException("boom");
+            }
+            java.util.Map<String, FolderCountReader.FolderCounts> out = new java.util.HashMap<>();
+            for (String n : batch) {
+                out.put(n, new FolderCountReader.FolderCounts(n.length(), n.length() * 2));
+            }
+            return out;
+        });
+
+        assertEquals(names.size(), result.size(), "Mọi folder đều phải có kết quả");
+        assertEquals(5, result.get("INBOX").total());
+        assertEquals(10, result.get("INBOX").unread());
+        assertEquals(0, result.get("C").total(), "Lô lỗi trả 0 thay vì làm hỏng cả danh sách");
+        assertEquals(0, result.get("D").total());
+        assertEquals(1, result.get("F").total(), "Lô khác vẫn đọc bình thường");
+        assertEquals(names, new java.util.ArrayList<>(result.keySet()), "Phải giữ nguyên thứ tự đầu vào");
     }
 }

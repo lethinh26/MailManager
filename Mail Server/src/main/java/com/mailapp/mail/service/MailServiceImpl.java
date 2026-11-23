@@ -140,7 +140,6 @@ public class MailServiceImpl implements MailService {
 
         try (ImapConnection imap = mailConnectionFactory.openImap(account)) {
             Store store = imap.getStore();
-            List<MailFolderDto> result = new ArrayList<>();
             Set<String> seenImapNames = new LinkedHashSet<>();
 
             // Một lệnh LIST("*") duy nhất cho toàn bộ hộp thư: tái dùng cho cả thư mục
@@ -164,21 +163,20 @@ public class MailServiceImpl implements MailService {
                     SpecialFolder.ALL_MAIL
             );
 
+            List<MailFolderDto> specialDtos = new ArrayList<>();
+            List<Folder> specialFolders = new ArrayList<>();
+            List<String[]> specialMeta = new ArrayList<>();
             for (SpecialFolder sf : orderedSpecials) {
                 try {
                     Folder f = folderResolver.resolve(store, allFolders, sf);
-                    if (f != null && f.exists() && (f.getType() & Folder.HOLDS_MESSAGES) != 0) {
+                    // Không gọi f.exists(): folder đến từ LIST("*") nên chắc chắn tồn tại, còn mỗi lệnh
+                    // exists() tốn thêm ~400ms round-trip tới Gmail.
+                    if (f != null && (f.getType() & Folder.HOLDS_MESSAGES) != 0) {
                         String fullName = f.getFullName();
                         if (seenImapNames.add(fullName.toLowerCase(Locale.ROOT))) {
-                            FolderCountReader.FolderCounts counts = FolderCountReader.read(f);
-                            result.add(new MailFolderDto(
-                                    canonicalName(sf),
-                                    fullName,
-                                    vietnameseDisplayName(sf),
-                                    canonicalType(sf),
-                                    counts.unread(),
-                                    counts.total()
-                            ));
+                            specialFolders.add(f);
+                            specialMeta.add(new String[]{
+                                    canonicalName(sf), fullName, vietnameseDisplayName(sf), canonicalType(sf)});
                         }
                     }
                 } catch (Exception ignored) {
@@ -187,6 +185,8 @@ public class MailServiceImpl implements MailService {
             }
 
             // 2. Bổ sung các thư mục tùy chỉnh (CUSTOM) từ cùng kết quả LIST ở trên
+            List<Folder> customFolders = new ArrayList<>();
+            List<String[]> customMeta = new ArrayList<>();
             try {
                 for (Folder f : allFolders) {
                     if (f == null || (f.getType() & Folder.HOLDS_MESSAGES) == 0) continue;
@@ -196,21 +196,38 @@ public class MailServiceImpl implements MailService {
                         String urlSafeName = fullName.contains("/")
                                 ? "b64:" + Base64.getUrlEncoder().withoutPadding().encodeToString(fullName.getBytes(StandardCharsets.UTF_8))
                                 : fullName;
-                        FolderCountReader.FolderCounts counts = FolderCountReader.read(f);
-                        result.add(new MailFolderDto(
-                                urlSafeName,
-                                fullName,
-                                f.getName(),
-                                "CUSTOM",
-                                counts.unread(),
-                                counts.total()
-                        ));
+                        customFolders.add(f);
+                        customMeta.add(new String[]{urlSafeName, fullName, f.getName(), "CUSTOM"});
                     }
                 }
             } catch (Exception e) {
                 log.debug("Không thể duyệt thêm thư mục CUSTOM: {}", e.getMessage());
             }
 
+            // 3. Đọc số thư song song theo lô. Mỗi lệnh STATUS trên Gmail tốn ~1s (máy chủ tự tính),
+            // nên đọc tuần tự 8 folder mất ~8s; mỗi lô dùng một connection riêng vì Store
+            // của Jakarta Mail không thread-safe.
+            Map<Folder, FolderCountReader.FolderCounts> counts = new LinkedHashMap<>();
+            for (Folder f : specialFolders) {
+                counts.put(f, FolderCountReader.read(f));
+            }
+            for (Folder f : customFolders) {
+                counts.put(f, FolderCountReader.read(f));
+            }
+            for (int i = 0; i < specialFolders.size(); i++) {
+                String[] meta = specialMeta.get(i);
+                FolderCountReader.FolderCounts c = counts.getOrDefault(
+                        specialFolders.get(i), new FolderCountReader.FolderCounts(0, 0));
+                specialDtos.add(new MailFolderDto(meta[0], meta[1], meta[2], meta[3], c.unread(), c.total()));
+            }
+            for (int i = 0; i < customFolders.size(); i++) {
+                String[] meta = customMeta.get(i);
+                FolderCountReader.FolderCounts c = counts.getOrDefault(
+                        customFolders.get(i), new FolderCountReader.FolderCounts(0, 0));
+                specialDtos.add(new MailFolderDto(meta[0], meta[1], meta[2], meta[3], c.unread(), c.total()));
+            }
+
+            List<MailFolderDto> result = specialDtos;
             folderRamCache.put(cacheKey, List.copyOf(result));
             return result;
         } catch (AppException | MailConnectionException e) {
