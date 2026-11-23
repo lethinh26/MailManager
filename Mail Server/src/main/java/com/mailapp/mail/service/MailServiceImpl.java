@@ -62,10 +62,13 @@ public class MailServiceImpl implements MailService {
      * Bộ nhớ đệm tạm thời TRONG RAM (Caffeine, TTL cực ngắn — tuyệt đối KHÔNG lưu thư vào DB)
      * giúp mở lại thư mục / nội dung thư vừa xem dưới 5ms và giảm tải kết nối tới Gmail.
      */
+    /** Số thư trong folder đổi chậm; giữ cache đủ lâu để các lần refresh liên tiếp không đụng Gmail. */
+    private static final int FOLDER_CACHE_TTL_SECONDS = 120;
+
     private final com.github.benmanes.caffeine.cache.Cache<String, List<MailFolderDto>> folderRamCache =
             com.github.benmanes.caffeine.cache.Caffeine.newBuilder()
                     .maximumSize(200)
-                    .expireAfterWrite(java.time.Duration.ofSeconds(25))
+                    .expireAfterWrite(java.time.Duration.ofSeconds(FOLDER_CACHE_TTL_SECONDS))
                     .build();
 
     private final com.github.benmanes.caffeine.cache.Cache<String, MailDetailResponse> detailRamCache =
