@@ -1,0 +1,70 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: mailapp-mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:?Thieu DB_PASSWORD trong .env}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-mailapp_db}
+      MYSQL_USER: ${MYSQL_USER:-mailapp}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?Thieu DB_PASSWORD trong .env}
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p$$MYSQL_ROOT_PASSWORD || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - mailapp-net
+
+  mail-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mailapp-server
+    restart: always
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      SERVER_ADDRESS: 0.0.0.0
+      SERVER_PORT: ${SERVER_PORT:-8443}
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-prod}
+      MAILAPP_DEV_SEED: ${MAILAPP_DEV_SEED:-false}
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/${MYSQL_DATABASE:-mailapp_db}?useSSL=false&serverTimezone=Asia/Ho_Chi_Minh&characterEncoding=UTF-8&allowPublicKeyRetrieval=true
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: com.mysql.cj.jdbc.Driver
+      SPRING_DATASOURCE_USERNAME: ${MYSQL_USER:-mailapp}
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD:?Thieu DB_PASSWORD trong .env}
+      SPRING_JPA_DATABASE_PLATFORM: org.hibernate.dialect.MySQLDialect
+      DB_USER: ${MYSQL_USER:-mailapp}
+      DB_PASSWORD: ${DB_PASSWORD:?Thieu DB_PASSWORD trong .env}
+      JWT_SECRET: ${JWT_SECRET:-}
+      AES_KEY: ${AES_KEY:-}
+      KEYSTORE_PASSWORD: ${KEYSTORE_PASSWORD:-}
+      ADMIN_INITIAL_PASSWORD: ${ADMIN_INITIAL_PASSWORD:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-https://localhost:8443/api/oauth2/callback}
+    ports:
+      - "${SERVER_PORT:-8443}:8443"
+    volumes:
+      - ./certs:/app/certs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -k -f https://localhost:8443/actuator/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    networks:
+      - mailapp-net
+
+volumes:
+  mysql_data:
+
+networks:
+  mailapp-net:
+    driver: bridge
