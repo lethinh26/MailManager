@@ -1638,7 +1638,7 @@ public class MainFrame extends JFrame {
         ComposeDialog dlg = new ComposeDialog(this, apiClient, currentGmailAccounts, selectedAccount,
                 SessionStore.getInstance().getPublicConfig(), () -> {
             setStatus("Đã gửi thư thành công.");
-            refreshCurrentMailbox();
+            loadFolders();
         });
         if (original != null && mode != null) {
             dlg.prefillReplyOrForward(original, mode);
@@ -1857,7 +1857,7 @@ public class MainFrame extends JFrame {
                     if (cleanupService.getConsecutiveErrors() >= 3) {
                         disableAutoCleanWithWarning("Tự động dọn gặp 3 lỗi liên tiếp và đã tự tắt để bảo vệ dữ liệu.");
                     } else if (ok > 0) {
-                        refreshCurrentMailbox();
+                        loadFolders();
                     }
                 } catch (Exception ex) {
                     if (ex.getCause() instanceof ApiException apiEx && "GMAIL_NEEDS_REAUTH".equalsIgnoreCase(apiEx.getCode())) {
@@ -2076,7 +2076,9 @@ public class MainFrame extends JFrame {
         if (selectedAccount == null) {
             loadGmailAccounts();
         } else {
-            loadFolders();
+            // Refresh chỉ cần tải lại danh sách thư. Gọi loadFolders() ở đây từng gây
+            // thêm một request IMAP đắt đỏ (~8s với Gmail) cho mỗi lần bấm Làm mới.
+            loadMails(0, false);
         }
     }
 
