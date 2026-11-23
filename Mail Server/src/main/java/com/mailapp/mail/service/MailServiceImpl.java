@@ -139,6 +139,16 @@ public class MailServiceImpl implements MailService {
             List<MailFolderDto> result = new ArrayList<>();
             Set<String> seenImapNames = new LinkedHashSet<>();
 
+            // Một lệnh LIST("*") duy nhất cho toàn bộ hộp thư: tái dùng cho cả thư mục
+            // đặc biệt lẫn custom. Trước đây mỗi resolve() tự LIST riêng (6-7 RTT).
+            Folder[] allFolders;
+            try {
+                allFolders = store.getDefaultFolder().list("*");
+            } catch (Exception e) {
+                log.debug("Không thể liệt kê thư mục: {}", e.getMessage());
+                allFolders = new Folder[0];
+            }
+
             // 1. Phân giải các thư mục đặc biệt theo thứ tự chuẩn UI
             List<SpecialFolder> orderedSpecials = List.of(
                     SpecialFolder.INBOX,
@@ -152,7 +162,7 @@ public class MailServiceImpl implements MailService {
 
             for (SpecialFolder sf : orderedSpecials) {
                 try {
-                    Folder f = folderResolver.resolve(store, sf);
+                    Folder f = folderResolver.resolve(store, allFolders, sf);
                     if (f != null && f.exists() && (f.getType() & Folder.HOLDS_MESSAGES) != 0) {
                         String fullName = f.getFullName();
                         if (seenImapNames.add(fullName.toLowerCase(Locale.ROOT))) {
@@ -173,27 +183,24 @@ public class MailServiceImpl implements MailService {
                 }
             }
 
-            // 2. Bổ sung các thư mục tùy chỉnh (CUSTOM)
+            // 2. Bổ sung các thư mục tùy chỉnh (CUSTOM) từ cùng kết quả LIST ở trên
             try {
-                Folder[] all = store.getDefaultFolder().list("*");
-                if (all != null) {
-                    for (Folder f : all) {
-                        if (f == null || (f.getType() & Folder.HOLDS_MESSAGES) == 0) continue;
-                        String fullName = f.getFullName();
-                        if (fullName == null || fullName.equalsIgnoreCase("[Gmail]")) continue;
-                        if (seenImapNames.add(fullName.toLowerCase(Locale.ROOT))) {
-                            String urlSafeName = fullName.contains("/")
-                                    ? "b64:" + Base64.getUrlEncoder().withoutPadding().encodeToString(fullName.getBytes(StandardCharsets.UTF_8))
-                                    : fullName;
-                            result.add(new MailFolderDto(
-                                    urlSafeName,
-                                    fullName,
-                                    f.getName(),
-                                    "CUSTOM",
-                                    safeUnreadCount(f),
-                                    safeMessageCount(f)
-                            ));
-                        }
+                for (Folder f : allFolders) {
+                    if (f == null || (f.getType() & Folder.HOLDS_MESSAGES) == 0) continue;
+                    String fullName = f.getFullName();
+                    if (fullName == null || fullName.equalsIgnoreCase("[Gmail]")) continue;
+                    if (seenImapNames.add(fullName.toLowerCase(Locale.ROOT))) {
+                        String urlSafeName = fullName.contains("/")
+                                ? "b64:" + Base64.getUrlEncoder().withoutPadding().encodeToString(fullName.getBytes(StandardCharsets.UTF_8))
+                                : fullName;
+                        result.add(new MailFolderDto(
+                                urlSafeName,
+                                fullName,
+                                f.getName(),
+                                "CUSTOM",
+                                safeUnreadCount(f),
+                                safeMessageCount(f)
+                        ));
                     }
                 }
             } catch (Exception e) {

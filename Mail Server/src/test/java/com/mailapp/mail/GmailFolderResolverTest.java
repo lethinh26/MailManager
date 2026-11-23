@@ -87,6 +87,22 @@ class GmailFolderResolverTest {
     }
 
     @Test
+    @DisplayName("Resolve từ danh sách folder có sẵn: không gọi lại LIST('*') cho mỗi thư mục đặc biệt")
+    void resolveFromPrefetchedFoldersDoesNotListAgain() throws MessagingException {
+        Folder[] allFolders = new Folder[]{sentFolder};
+        when(sentFolder.getAttributes()).thenReturn(new String[]{"\\Sent", "\\HasNoChildren"});
+        when(store.getFolder("[Gmail]/Trash")).thenReturn(trashFolder);
+        when(trashFolder.exists()).thenReturn(true);
+
+        assertEquals(sentFolder,
+                resolver.resolve(store, allFolders, GmailFolderResolver.SpecialFolder.SENT));
+        assertEquals(trashFolder,
+                resolver.resolve(store, allFolders, GmailFolderResolver.SpecialFolder.TRASH));
+
+        verify(store, never()).getDefaultFolder();
+    }
+
+    @Test
     @DisplayName("Ném MessagingException khi không thể tìm thấy thư mục qua cả RFC lẫn fallback")
     void testResolveNotFoundThrowsException() throws MessagingException {
         when(store.getDefaultFolder()).thenReturn(defaultFolder);

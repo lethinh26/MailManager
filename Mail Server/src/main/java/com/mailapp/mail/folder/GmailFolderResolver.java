@@ -66,23 +66,47 @@ public class GmailFolderResolver {
         Objects.requireNonNull(store, "Store không được null");
         Objects.requireNonNull(target, "SpecialFolder không được null");
 
+        // Inbox luôn chuẩn theo giao thức IMAP, không cần LIST
+        if (target == SpecialFolder.INBOX) {
+            return store.getFolder("INBOX");
+        }
+
+        // Mỗi lần gọi resolve() riêng lẻ phải LIST một lần. listFolders() dùng overload
+        // bên dưới để tái dùng cùng một kết quả LIST cho toàn bộ thư mục đặc biệt.
+        Folder[] allFolders;
+        try {
+            allFolders = store.getDefaultFolder().list("*");
+        } catch (Exception e) {
+            log.debug("Không thể duyệt thuộc tính RFC 6154, chuyển sang cơ chế fallback: {}", e.getMessage());
+            allFolders = new Folder[0];
+        }
+        return resolve(store, allFolders, target);
+    }
+
+    /**
+     * Phân giải thư mục đặc biệt từ danh sách folder đã lấy sẵn bằng một lệnh LIST("*").
+     *
+     * @param store      Store IMAP, chỉ dùng cho INBOX và fallback theo tên
+     * @param allFolders kết quả LIST("*") của store.getDefaultFolder()
+     * @param target     thư mục đặc biệt cần tìm
+     */
+    public Folder resolve(Store store, Folder[] allFolders, SpecialFolder target) throws MessagingException {
+        Objects.requireNonNull(store, "Store không được null");
+        Objects.requireNonNull(target, "SpecialFolder không được null");
+
         // 1. Inbox luôn chuẩn theo giao thức IMAP
         if (target == SpecialFolder.INBOX) {
             return store.getFolder("INBOX");
         }
 
-        // 2. Thử phân giải theo thuộc tính RFC 6154
-        try {
-            Folder defaultFolder = store.getDefaultFolder();
-            Folder[] allFolders = defaultFolder.list("*");
+        // 2. Phân giải theo thuộc tính RFC 6154 từ danh sách có sẵn (không LIST lại)
+        if (allFolders != null) {
             for (Folder folder : allFolders) {
                 if (hasAttribute(folder, target.getRfcAttribute())) {
                     log.debug("Phân giải thư mục {} theo RFC 6154 thành công: {}", target, folder.getFullName());
                     return folder;
                 }
             }
-        } catch (Exception e) {
-            log.debug("Không thể duyệt thuộc tính RFC 6154, chuyển sang cơ chế fallback: {}", e.getMessage());
         }
 
         // 3. Fallback: Thử tìm theo danh sách tên phổ biến (đa ngôn ngữ)
