@@ -7,6 +7,7 @@ import com.mailapp.exception.MailNetworkException;
 import com.mailapp.mail.ImapConnection;
 import com.mailapp.mail.MailConnectionFactory;
 import com.mailapp.mail.SmtpConnection;
+import com.mailapp.mail.folder.FolderCountReader;
 import com.mailapp.mail.folder.GmailFolderResolver;
 import com.mailapp.mail.folder.GmailFolderResolver.SpecialFolder;
 import com.mailapp.mail.model.MailCredentials;
@@ -166,15 +167,14 @@ public class MailServiceImpl implements MailService {
                     if (f != null && f.exists() && (f.getType() & Folder.HOLDS_MESSAGES) != 0) {
                         String fullName = f.getFullName();
                         if (seenImapNames.add(fullName.toLowerCase(Locale.ROOT))) {
-                            int total = safeMessageCount(f);
-                            int unread = safeUnreadCount(f);
+                            FolderCountReader.FolderCounts counts = FolderCountReader.read(f);
                             result.add(new MailFolderDto(
                                     canonicalName(sf),
                                     fullName,
                                     vietnameseDisplayName(sf),
                                     canonicalType(sf),
-                                    unread,
-                                    total
+                                    counts.unread(),
+                                    counts.total()
                             ));
                         }
                     }
@@ -193,13 +193,14 @@ public class MailServiceImpl implements MailService {
                         String urlSafeName = fullName.contains("/")
                                 ? "b64:" + Base64.getUrlEncoder().withoutPadding().encodeToString(fullName.getBytes(StandardCharsets.UTF_8))
                                 : fullName;
+                        FolderCountReader.FolderCounts counts = FolderCountReader.read(f);
                         result.add(new MailFolderDto(
                                 urlSafeName,
                                 fullName,
                                 f.getName(),
                                 "CUSTOM",
-                                safeUnreadCount(f),
-                                safeMessageCount(f)
+                                counts.unread(),
+                                counts.total()
                         ));
                     }
                 }
@@ -1245,14 +1246,6 @@ public class MailServiceImpl implements MailService {
                 folder.close(expunge);
             } catch (Exception ignored) {}
         }
-    }
-
-    private int safeMessageCount(Folder f) {
-        try { return Math.max(0, f.getMessageCount()); } catch (Exception e) { return 0; }
-    }
-
-    private int safeUnreadCount(Folder f) {
-        try { return Math.max(0, f.getUnreadMessageCount()); } catch (Exception e) { return 0; }
     }
 
     private String safeContentType(Part part) {
