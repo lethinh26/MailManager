@@ -31,6 +31,7 @@ class GmailMultiAuthClientTest {
     private final AtomicReference<String> lastRequestMethod = new AtomicReference<>();
     private final AtomicReference<String> lastRequestPath = new AtomicReference<>();
     private final AtomicReference<String> lastRequestBody = new AtomicReference<>();
+    private final AtomicReference<String> lastRequestContentType = new AtomicReference<>();
 
     @BeforeEach
     void setUp() throws Exception {
@@ -39,6 +40,7 @@ class GmailMultiAuthClientTest {
             lastRequestMethod.set(exchange.getRequestMethod());
             lastRequestPath.set(exchange.getRequestURI().toString());
             lastRequestBody.set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            lastRequestContentType.set(exchange.getRequestHeaders().getFirst("Content-Type"));
 
             String resp;
             if ("PUT".equals(exchange.getRequestMethod())) {
@@ -154,11 +156,15 @@ class GmailMultiAuthClientTest {
     @DisplayName("ApiClient hỗ trợ link outcome, PUT /preferred-method và DELETE /methods/{method}")
     void apiClientCallsMultiAuthEndpointsCorrectly() throws Exception {
         GmailAccountDto linked = apiClient.linkGmailWithAppPassword("cuongdfle@gmail.com", "abcd efgh ijkl mnop", "Lê Cường");
+        assertEquals("application/json", lastRequestContentType.get(),
+                "Body JSON bắt buộc gửi kèm Content-Type application/json, nếu không Spring trả 500 INTERNAL_SERVER_ERROR");
         assertEquals("METHOD_ADDED", linked.outcome());
         assertTrue(linked.hasOAuth());
         assertTrue(linked.hasAppPassword());
 
         GmailAccountDto pref = apiClient.setPreferredGmailMethod(10L, "APP_PASSWORD");
+        assertEquals("application/json", lastRequestContentType.get(),
+                "PUT /preferred-method cũng phải gửi Content-Type application/json");
         assertEquals("PUT", lastRequestMethod.get());
         assertEquals("/api/gmail-accounts/10/preferred-method", lastRequestPath.get());
         assertTrue(lastRequestBody.get().contains("APP_PASSWORD"));

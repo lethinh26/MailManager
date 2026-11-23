@@ -336,6 +336,7 @@ public class ApiClient {
             throws IOException, InterruptedException {
         String json = objectMapper.writeValueAsString(Map.of("preferredMethod", preferredMethod));
         HttpRequest request = newRequestBuilder("/api/gmail-accounts/" + id + "/preferred-method")
+                .header("Content-Type", "application/json")
                 .PUT(HttpRequest.BodyPublishers.ofString(json))
                 .build();
         return execute(request, GmailAccountDto.class);
@@ -370,6 +371,7 @@ public class ApiClient {
         }
         String json = objectMapper.writeValueAsString(payload);
         HttpRequest request = newRequestBuilder("/api/gmail-accounts/app-password")
+                .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(json))
                 .build();
 
@@ -632,6 +634,7 @@ public class ApiClient {
         String json = objectMapper.writeValueAsString(body);
 
         HttpRequest request = newMailRequestBuilder(path.toString())
+                .header("Content-Type", "application/json")
                 .PUT(HttpRequest.BodyPublishers.ofString(json))
                 .build();
         return execute(request, MailFlagsDto.class);

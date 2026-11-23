@@ -188,10 +188,13 @@ public class V3__GmailEmailKeyMultiAuth extends BaseJavaMigration {
         }
 
         // 5. Thay UNIQUE(user_id, email) bằng UNIQUE(user_id, email_key)
-        dropOldUniqueConstraint(conn, isH2);
+        // Phải tạo index mới TRƯỚC: trên MySQL, khóa ngoại fk_gmail_accounts_user
+        // đang mượn uk_user_gmail làm index hỗ trợ (user_id là cột đầu). Drop index cũ
+        // trước khi có index thay thế sẽ bị lỗi 1553 "needed in a foreign key constraint".
         if (!constraintOrIndexExists(conn, "gmail_accounts", "uk_user_gmail_key")) {
             executeSql(conn, "ALTER TABLE gmail_accounts ADD CONSTRAINT uk_user_gmail_key UNIQUE (user_id, email_key)");
         }
+        dropOldUniqueConstraint(conn, isH2);
     }
 
     private void dropOldUniqueConstraint(Connection conn, boolean isH2) throws SQLException {
