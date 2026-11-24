@@ -58,6 +58,10 @@ tasks.named('test') {
 }
 
 bootRun {
-    systemProperties = System.properties
+    javaLauncher = javaToolchains.launcherFor {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+    // Forward only explicit -D arguments, not Gradle's JVM internals (e.g. java.home).
+    systemProperties = gradle.startParameter.systemPropertiesArgs
 }
 

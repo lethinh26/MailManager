@@ -150,16 +150,11 @@ docker compose down
    cd "Mail Server"
    docker compose up -d mysql
    ```
-2. Chạy `Mail Server` bằng script đi kèm (tự nạp biến từ `.env` và truyền tham số JDBC cổng `3307`):
+2. Sau khi MySQL sẵn sàng, chạy trực tiếp bằng Gradle trong thư mục `Mail Server`:
    ```powershell
-   cd "Mail Server"
-   .\scripts\run-server.ps1
+   .\gradlew bootRun
    ```
-   Hoặc chạy bằng Gradle trực tiếp (đã có biến môi trường trong `.env`):
-   ```powershell
-   cd "Mail Server"
-   .\gradlew.bat bootRun --args="--spring.profiles.active=dev --spring.datasource.url=jdbc:mysql://localhost:3307/mailapp_db?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Ho_Chi_Minh&characterEncoding=UTF-8"
-   ```
+   Gradle tự chọn JDK 21 đã cài; ứng dụng tự nạp `.env`, dùng profile `dev` nếu chưa cấu hình profile và kết nối MySQL theo `MYSQL_PORT` / `MYSQL_DATABASE`. Không cần đặt lại `JAVA_HOME` hoặc truyền JDBC URL mỗi lần. Gradle Wrapper vẫn cần JVM tương thích với Gradle (tối thiểu Java 17 cho dự án Spring Boot này).
    *(Trong profile `dev`, Swagger UI mở tại `https://localhost:8443/swagger-ui.html`.)*
 
 ---
