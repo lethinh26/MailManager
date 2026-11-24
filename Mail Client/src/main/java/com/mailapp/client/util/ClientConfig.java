@@ -113,6 +113,21 @@ public class ClientConfig {
         saveConfig();
     }
 
+    // === Vị trí các thanh kéo (splitter) ===
+    public int getSplit(String key, int defaultVal) {
+        try {
+            return Integer.parseInt(properties.getProperty(key, String.valueOf(defaultVal)));
+        } catch (NumberFormatException e) {
+            return defaultVal;
+        }
+    }
+
+    public void setSplit(String key, int pos) {
+        if (pos <= 0) return;
+        properties.setProperty(key, String.valueOf(pos));
+        saveConfig();
+    }
+
     public boolean isInsecureMode() {
         return Boolean.getBoolean("mailclient.insecure");
     }

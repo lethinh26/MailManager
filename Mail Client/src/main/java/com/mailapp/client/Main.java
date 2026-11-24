@@ -49,6 +49,8 @@ public class Main {
         try {
             UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
         } catch (Exception ignored) {}
+        // Phải đặt SAU khi đã chọn Look & Feel, nếu không L&F sẽ ghi đè lại.
+        Theme.installUiDefaults();
 
         if (generateIconsMode) {
             generateBrandAssets();

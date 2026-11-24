@@ -12,6 +12,7 @@ import com.mailapp.client.ui.dialogs.*;
 import com.mailapp.client.ui.theme.AppIcons;
 import com.mailapp.client.ui.theme.AvatarUtil;
 import com.mailapp.client.ui.theme.Theme;
+import com.mailapp.client.ui.theme.WrapLayout;
 import com.mailapp.client.util.ClientConfig;
 import com.mailapp.client.util.ClientSafetyUtil;
 import com.mailapp.client.util.SessionStore;
@@ -111,8 +112,7 @@ public class MainFrame extends JFrame {
     private JButton expandHeaderBtn;
     private JPanel remoteImgBanner;
     private JLabel truncatedBanner;
-    private JToggleButton htmlToggleBtn;
-    private JToggleButton textToggleBtn;
+    private JToggleButton modeToggleBtn;
     private JButton starActionBtn;
     private JButton unreadActionBtn;
     private JButton replyBtn;
@@ -169,33 +169,28 @@ public class MainFrame extends JFrame {
         northStack.add(buildToolbar());
         outerPanel.add(northStack, BorderLayout.NORTH);
 
-        // 3-Column Split Layout
+        // 3-Column Split Layout (kéo được, có nút thu/mở 1 chạm, nhớ vị trí)
         JPanel leftCol = buildLeftColumn();
         JPanel middleCol = buildMiddleColumn();
         JPanel rightCol = buildRightColumn();
 
         JSplitPane midRightSplit = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, middleCol, rightCol);
-        midRightSplit.setDividerLocation(340);
-        midRightSplit.setDividerSize(5);
-        midRightSplit.setBorder(null);
-        midRightSplit.setResizeWeight(0.36);
+        Theme.styleSplitter(midRightSplit);
+        midRightSplit.setResizeWeight(0.34);
 
         JSplitPane mainSplit = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, leftCol, midRightSplit);
-        mainSplit.setDividerLocation(235);
-        mainSplit.setDividerSize(5);
-        mainSplit.setBorder(null);
+        Theme.styleSplitter(mainSplit);
         mainSplit.setResizeWeight(0.0);
 
-        addComponentListener(new ComponentAdapter() {
-            @Override
-            public void componentResized(ComponentEvent e) {
-                int cw = getWidth();
-                if (cw <= 860) {
-                    mainSplit.setDividerLocation(195);
-                    midRightSplit.setDividerLocation(250);
-                }
-            }
-        });
+        ClientConfig cfg = ClientConfig.getInstance();
+        // Ưu tiên vị trí người dùng đã kéo (pixel); nếu chưa có thì dùng TỈ LỆ để lần layout đầu
+        // tự co theo cửa sổ (800x600 vẫn giữ cột giữa >= ~250px và cột đọc thư đủ chỗ cho 7 nút icon).
+        int savedLeft = cfg.getSplit("ui.split.left", -1);
+        int savedMid = cfg.getSplit("ui.split.mid", -1);
+        if (savedLeft > 0) mainSplit.setDividerLocation(savedLeft); else mainSplit.setDividerLocation(0.21);
+        if (savedMid > 0) midRightSplit.setDividerLocation(savedMid); else midRightSplit.setDividerLocation(0.40);
+        Theme.persistSplit(mainSplit, "ui.split.left");
+        Theme.persistSplit(midRightSplit, "ui.split.mid");
 
         outerPanel.add(mainSplit, BorderLayout.CENTER);
         outerPanel.add(buildStatusBar(), BorderLayout.SOUTH);
@@ -203,95 +198,107 @@ public class MainFrame extends JFrame {
         setContentPane(outerPanel);
     }
 
+    /**
+     * Toolbar 1 hàng, 3 vùng rõ ràng: nhóm hành động chính (trái) — nhóm hành động phụ icon-only (giữa)
+     * — nhóm tài khoản/cấu hình (phải). Ở cửa sổ hẹp vùng giữa tự xuống dòng thay vì đẩy nút ra ngoài.
+     */
     private JPanel buildToolbar() {
-        JPanel bar = new JPanel() {
-            @Override
-            public Dimension getPreferredSize() {
-                int availW = getParent() != null && getParent().getWidth() > 0 ? getParent().getWidth() : 1040;
-                Insets ins = getInsets();
-                int maxW = Math.max(200, availW - ins.left - ins.right);
-                int hgap = Theme.SP_2;
-                int vgap = Theme.SP_1;
-                int x = 0, rowH = 0, totalH = ins.top + ins.bottom;
-                for (Component c : getComponents()) {
-                    if (!c.isVisible()) continue;
-                    Dimension d = c.getPreferredSize();
-                    if (x > 0 && x + d.width > maxW) {
-                        totalH += rowH + vgap;
-                        x = 0;
-                        rowH = 0;
-                    }
-                    x += d.width + hgap;
-                    rowH = Math.max(rowH, d.height);
-                }
-                totalH += rowH;
-                return new Dimension(availW, Math.max(44, totalH));
-            }
-        };
-        bar.setLayout(new FlowLayout(FlowLayout.LEFT, Theme.SP_2, Theme.SP_1));
+        JPanel bar = new JPanel(new BorderLayout(Theme.SP_3, 0));
         bar.setBackground(Theme.bgSurface());
         bar.setBorder(new CompoundBorder(
                 BorderFactory.createMatteBorder(0, 0, 1, 0, Theme.border()),
-                new EmptyBorder(Theme.SP_1, Theme.SP_3, Theme.SP_1, Theme.SP_3)
+                new EmptyBorder(Theme.SP_2, Theme.SP_3, Theme.SP_2, Theme.SP_3)
         ));
+        bar.add(buildToolbarPrimary(), BorderLayout.WEST);
+        bar.add(buildToolbarActions(), BorderLayout.CENTER);
+        bar.add(buildToolbarAccount(), BorderLayout.EAST);
+        return bar;
+    }
 
-        JLabel brand = new JLabel(AppIcons.BRAND_NAME, AppIcons.logoIcon(28), SwingConstants.LEFT);
+    /** Trái: thương hiệu + Soạn thư (hành động chính duy nhất có nền màu). */
+    private JPanel buildToolbarPrimary() {
+        JPanel left = new JPanel(new FlowLayout(FlowLayout.LEFT, Theme.SP_2, 0));
+        left.setOpaque(false);
+
+        JLabel brand = new JLabel(AppIcons.BRAND_NAME, AppIcons.logoIcon(26), SwingConstants.LEFT);
         brand.setFont(Theme.fontSubTitle());
         brand.setForeground(Theme.primaryText());
         brand.setIconTextGap(Theme.SP_2);
-        bar.add(brand);
+        left.add(brand);
+        left.add(Box.createHorizontalStrut(Theme.SP_1));
 
         JButton composeBtn = Theme.primaryButton("Soạn thư", AppIcons.vectorIcon(AppIcons.Glyph.COMPOSE, 16, Color.WHITE));
         composeBtn.setToolTipText("Soạn thư mới (Ctrl+N)");
         composeBtn.setMnemonic(KeyEvent.VK_S);
         composeBtn.addActionListener(e -> openComposeDialog(null, null));
+        left.add(composeBtn);
+        return left;
+    }
 
-        JButton refreshBtn = Theme.secondaryButton("Làm mới", AppIcons.vectorIcon(AppIcons.Glyph.REFRESH, 16, Theme.textPrimary()));
-        refreshBtn.setToolTipText("Đồng bộ hộp thư hiện tại (Ctrl+R)");
-        refreshBtn.addActionListener(e -> refreshCurrentMailbox());
+    /** Giữa: hành động phụ, icon-only + tooltip để tiết kiệm chiều ngang. */
+    private JPanel buildToolbarActions() {
+        JPanel mid = new JPanel();
+        mid.setOpaque(false);
+        WrapLayout layout = new WrapLayout(FlowLayout.LEFT, Theme.SP_1, Theme.SP_1);
+        mid.setLayout(layout);
 
-        JButton cleanupBtn = Theme.successButton("Tải đính kèm & Xóa", AppIcons.vectorIcon(AppIcons.Glyph.DOWNLOAD, 16, Color.WHITE));
-        cleanupBtn.setToolTipText("Tải xuống & xác minh toàn bộ tệp đính kèm của thư đã chọn rồi xóa thư");
-        cleanupBtn.addActionListener(e -> openCleanupForSelectedMails());
+        JButton refreshBtn = Theme.iconButton(AppIcons.Glyph.REFRESH, "Làm mới hộp thư (Ctrl+R)", Theme.textPrimary(), this::refreshCurrentMailbox);
+        JButton cleanupBtn = Theme.iconButton(AppIcons.Glyph.DOWNLOAD, "Tải đính kèm & Xóa thư đã chọn", Theme.success(), this::openCleanupForSelectedMails);
+        JButton gmailMgrBtn = Theme.iconButton(AppIcons.Glyph.MAIL, "Quản lý tài khoản Gmail (OAuth2 / App Password)", Theme.primaryText(), this::openGmailManagerDialog);
 
-        JButton gmailMgrBtn = Theme.secondaryButton("Tài khoản Gmail", AppIcons.vectorIcon(AppIcons.Glyph.SHIELD, 16, Theme.primaryText()));
-        gmailMgrBtn.setToolTipText("Liên kết OAuth2 / App Password, kiểm tra kết nối, đổi tên, hủy liên kết");
-        gmailMgrBtn.addActionListener(e -> openGmailManagerDialog());
-
-        bar.add(composeBtn);
-        bar.add(refreshBtn);
-        bar.add(cleanupBtn);
-        bar.add(gmailMgrBtn);
-
-        adminToolbarBtn = Theme.secondaryButton("Quản trị", AppIcons.vectorIcon(AppIcons.Glyph.SHIELD, 16, Theme.warning()));
-        adminToolbarBtn.setToolTipText("Mở Bảng điều khiển Quản trị Hệ thống (chỉ dành cho ADMIN)");
+        adminToolbarBtn = Theme.iconButton(AppIcons.Glyph.SHIELD, "Bảng điều khiển Quản trị Hệ thống", Theme.warning(), this::openAdminFrame);
         adminToolbarBtn.setVisible(false);
-        adminToolbarBtn.addActionListener(e -> openAdminFrame());
-        bar.add(adminToolbarBtn);
 
-        JButton themeBtn = Theme.secondaryButton(
-                Theme.isDark() ? "Chế độ Sáng" : "Chế độ Tối",
-                AppIcons.vectorIcon(Theme.isDark() ? AppIcons.Glyph.SUN : AppIcons.Glyph.MOON, 15, Theme.textPrimary())
-        );
-        themeBtn.setToolTipText("Chuyển đổi giao diện Sáng / Tối");
-        themeBtn.addActionListener(e -> toggleTheme());
+        mid.add(refreshBtn);
+        mid.add(cleanupBtn);
+        mid.add(gmailMgrBtn);
+        mid.add(adminToolbarBtn);
+        return mid;
+    }
 
-        JButton settingsBtn = Theme.secondaryButton("Cài đặt", AppIcons.vectorIcon(AppIcons.Glyph.SETTINGS, 16, Theme.textPrimary()));
-        settingsBtn.setToolTipText("Cấu hình máy chủ, thư mục tải về và Tự động dọn");
-        settingsBtn.addActionListener(e -> openSettingsDialog());
+    /** Phải: account chip (mở menu hồ sơ) + chuyển Sáng/Tối + Cài đặt. */
+    private JPanel buildToolbarAccount() {
+        JPanel right = new JPanel(new FlowLayout(FlowLayout.RIGHT, Theme.SP_1, 0));
+        right.setOpaque(false);
 
         userProfileBtn = Theme.secondaryButton("Tài khoản", AppIcons.vectorIcon(AppIcons.Glyph.USER, 16, Theme.primaryText()));
-        userProfileBtn.setToolTipText("Xem hồ sơ cá nhân & đổi mật khẩu");
-        userProfileBtn.addActionListener(e -> openProfileDialog());
+        userProfileBtn.setToolTipText("Hồ sơ cá nhân, đổi mật khẩu và đăng xuất");
+        userProfileBtn.addActionListener(e -> showAccountMenu());
 
-        bar.add(themeBtn);
-        bar.add(settingsBtn);
-        bar.add(userProfileBtn);
-        return bar;
+        JButton themeBtn = Theme.iconButton(
+                Theme.isDark() ? AppIcons.Glyph.SUN : AppIcons.Glyph.MOON,
+                Theme.isDark() ? "Chuyển sang chế độ Sáng" : "Chuyển sang chế độ Tối",
+                Theme.textPrimary(), this::toggleTheme);
+
+        JButton settingsBtn = Theme.iconButton(AppIcons.Glyph.SETTINGS, "Cài đặt máy chủ, thư mục tải về và Tự động dọn", Theme.textPrimary(), this::openSettingsDialog);
+
+        right.add(userProfileBtn);
+        right.add(themeBtn);
+        right.add(settingsBtn);
+        return right;
+    }
+
+    /** Menu nhỏ dưới account chip: gộp các mục cá nhân thay vì chiếm thêm nút trên toolbar. */
+    private void showAccountMenu() {
+        JPopupMenu menu = new JPopupMenu();
+        JMenuItem profile = new JMenuItem("Hồ sơ tài khoản");
+        profile.addActionListener(e -> openProfileDialog());
+        JMenuItem changePw = new JMenuItem("Đổi mật khẩu");
+        changePw.addActionListener(e -> new ChangePasswordDialog(this, apiClient, false).setVisible(true));
+        JMenuItem gmail = new JMenuItem("Quản lý tài khoản Gmail");
+        gmail.addActionListener(e -> openGmailManagerDialog());
+        JMenuItem logout = new JMenuItem("Đăng xuất");
+        logout.addActionListener(e -> handleLogout());
+        menu.add(profile);
+        menu.add(changePw);
+        menu.add(gmail);
+        menu.addSeparator();
+        menu.add(logout);
+        menu.show(userProfileBtn, 0, userProfileBtn.getHeight());
     }
 
     private JPanel buildLeftColumn() {
-        JPanel left = new JPanel(new BorderLayout(0, Theme.SP_2));
+        JPanel left = new JPanel(new BorderLayout());
         left.setBackground(Theme.bgSurface());
         left.setBorder(BorderFactory.createMatteBorder(0, 0, 0, 1, Theme.border()));
 
@@ -303,42 +310,40 @@ public class MainFrame extends JFrame {
         JPanel accHeader = new JPanel(new BorderLayout());
         accHeader.setOpaque(false);
         JLabel accTitle = new JLabel("TÀI KHOẢN GMAIL");
-        accTitle.setFont(Theme.fontTiny());
+        accTitle.setFont(Theme.fontTiny().deriveFont(Font.BOLD));
         accTitle.setForeground(Theme.textMuted());
 
         JButton addAccBtn = new JButton("+ Thêm");
-        addAccBtn.setFont(Theme.fontTiny());
+        addAccBtn.setFont(Theme.fontTiny().deriveFont(Font.BOLD));
         addAccBtn.setForeground(Theme.primary());
         addAccBtn.setContentAreaFilled(false);
         addAccBtn.setBorderPainted(false);
         addAccBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        addAccBtn.setToolTipText("Liên kết thêm tài khoản Gmail");
         addAccBtn.addActionListener(e -> openGmailManagerDialog());
 
         accHeader.add(accTitle, BorderLayout.WEST);
         accHeader.add(addAccBtn, BorderLayout.EAST);
         accSection.add(accHeader, BorderLayout.NORTH);
 
-        accountsListPanel = new JPanel();
+        accountsListPanel = Theme.trackedWidthPanel(null);
         accountsListPanel.setLayout(new BoxLayout(accountsListPanel, BoxLayout.Y_AXIS));
         accountsListPanel.setBackground(Theme.bgSurface());
 
         JScrollPane accScroll = new JScrollPane(accountsListPanel);
         accScroll.setBorder(null);
         accScroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
-        accScroll.setPreferredSize(new Dimension(230, 128));
         accScroll.getViewport().setBackground(Theme.bgSurface());
+        accScroll.setMinimumSize(new Dimension(150, 60));
         accSection.add(accScroll, BorderLayout.CENTER);
 
         // Bottom half: Folders Tree/List
         JPanel folderSection = new JPanel(new BorderLayout(0, Theme.SP_1));
         folderSection.setOpaque(false);
-        folderSection.setBorder(new CompoundBorder(
-                BorderFactory.createMatteBorder(1, 0, 0, 0, Theme.border()),
-                new EmptyBorder(Theme.SP_3, Theme.SP_2, Theme.SP_2, Theme.SP_2)
-        ));
+        folderSection.setBorder(new EmptyBorder(Theme.SP_2, Theme.SP_2, Theme.SP_2, Theme.SP_2));
 
         JLabel folderTitle = new JLabel("  THƯ MỤC HỘP THƯ");
-        folderTitle.setFont(Theme.fontTiny());
+        folderTitle.setFont(Theme.fontTiny().deriveFont(Font.BOLD));
         folderTitle.setForeground(Theme.textMuted());
         folderSection.add(folderTitle, BorderLayout.NORTH);
 
@@ -362,8 +367,21 @@ public class MainFrame extends JFrame {
         folderScroll.getViewport().setBackground(Theme.bgSurface());
         folderSection.add(folderScroll, BorderLayout.CENTER);
 
-        left.add(accSection, BorderLayout.NORTH);
-        left.add(folderSection, BorderLayout.CENTER);
+        // Tài khoản ↔ Thư mục: thanh kéo dọc, double-click để thu/mở, nhớ vị trí.
+        JSplitPane leftSplit = new JSplitPane(JSplitPane.VERTICAL_SPLIT, accSection, folderSection);
+        Theme.styleSplitter(leftSplit);
+        leftSplit.setResizeWeight(0.0);
+        leftSplit.setBorder(null);
+        ClientConfig cfgLeft = ClientConfig.getInstance();
+        int savedLeft = cfgLeft.getSplit("ui.split.accounts", -1);
+        if (savedLeft > 0) {
+            SwingUtilities.invokeLater(() -> leftSplit.setDividerLocation(Math.max(150, savedLeft)));
+        } else {
+            leftSplit.setDividerLocation(0.32);
+        }
+        Theme.persistSplit(leftSplit, "ui.split.accounts");
+
+        left.add(leftSplit, BorderLayout.CENTER);
         return left;
     }
 
@@ -389,7 +407,7 @@ public class MainFrame extends JFrame {
                 super.paintComponent(g);
                 if (getText().isEmpty()) {
                     Graphics2D g2 = (Graphics2D) g.create();
-                    g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+                    Theme.applyTextHints(g2);
                     g2.setColor(Theme.textMuted());
                     g2.setFont(Theme.fontSmall());
                     Insets ins = getInsets();
@@ -613,37 +631,35 @@ public class MainFrame extends JFrame {
                 new EmptyBorder(Theme.SP_3, Theme.SP_4, Theme.SP_3, Theme.SP_4)
         ));
 
-        // Action row (gọn gàng, tự xuống dòng ở 800x600 để vẫn chừa đủ chiều cao đọc nội dung thư)
-        JPanel actionBar = Theme.createWrapPanel(Theme.SP_1, Theme.SP_1);
-        EmptyBorder compactBtnPad = new EmptyBorder(4, 8, 4, 8);
+        // Action bar: 7 nút icon-only + tooltip (mẫu Gmail). Tổng ~188px nên luôn vừa 1 hàng
+        // kể cả khi cột đọc thư co còn ~250px ở cửa sổ 800x600.
+        // ponytail: dùng FlowLayout (không wrap) vì WrapLayout cần revalidate mới tính lại số hàng;
+        // đổi lại thành segmented control / overflow "⋯" khi số hành động vượt quá 8.
+        JPanel actionBar = new JPanel(new FlowLayout(FlowLayout.LEFT, 1, 2));
+        actionBar.setOpaque(false);
+        EmptyBorder compactBtnPad = new EmptyBorder(4, 4, 4, 4);
+        int iconSz = 16;
 
-        replyBtn = Theme.secondaryButton("Trả lời", AppIcons.vectorIcon(AppIcons.Glyph.REPLY, 14, Theme.textPrimary()));
+        replyBtn = Theme.iconButton(AppIcons.Glyph.REPLY, iconSz, "Trả lời", Theme.textPrimary(), () -> openComposeDialog(currentDetail, "REPLY"));
         replyBtn.setBorder(compactBtnPad);
-        replyBtn.addActionListener(e -> openComposeDialog(currentDetail, "REPLY"));
 
-        replyAllBtn = Theme.secondaryButton("Trả lời tất cả", AppIcons.vectorIcon(AppIcons.Glyph.REPLY_ALL, 14, Theme.textPrimary()));
+        replyAllBtn = Theme.iconButton(AppIcons.Glyph.REPLY_ALL, iconSz, "Trả lời tất cả", Theme.textPrimary(), () -> openComposeDialog(currentDetail, "REPLY_ALL"));
         replyAllBtn.setBorder(compactBtnPad);
-        replyAllBtn.addActionListener(e -> openComposeDialog(currentDetail, "REPLY_ALL"));
 
-        forwardBtn = Theme.secondaryButton("Chuyển tiếp", AppIcons.vectorIcon(AppIcons.Glyph.FORWARD, 14, Theme.textPrimary()));
+        forwardBtn = Theme.iconButton(AppIcons.Glyph.FORWARD, iconSz, "Chuyển tiếp", Theme.textPrimary(), () -> openComposeDialog(currentDetail, "FORWARD"));
         forwardBtn.setBorder(compactBtnPad);
-        forwardBtn.addActionListener(e -> openComposeDialog(currentDetail, "FORWARD"));
 
-        starActionBtn = Theme.secondaryButton("Sao", AppIcons.vectorIcon(AppIcons.Glyph.STAR, 14, Theme.starGold()));
+        starActionBtn = Theme.iconButton(AppIcons.Glyph.STAR, iconSz, "Gắn sao", Theme.starGold(), this::toggleStarCurrentMail);
         starActionBtn.setBorder(compactBtnPad);
-        starActionBtn.addActionListener(e -> toggleStarCurrentMail());
 
-        unreadActionBtn = Theme.secondaryButton("Chưa đọc", AppIcons.vectorIcon(AppIcons.Glyph.UNREAD, 14, Theme.textPrimary()));
+        unreadActionBtn = Theme.iconButton(AppIcons.Glyph.UNREAD, iconSz, "Đánh dấu chưa đọc", Theme.textPrimary(), this::markCurrentMailUnread);
         unreadActionBtn.setBorder(compactBtnPad);
-        unreadActionBtn.addActionListener(e -> markCurrentMailUnread());
 
-        cleanupOneBtn = Theme.successButton("Tải & Xóa", AppIcons.vectorIcon(AppIcons.Glyph.DOWNLOAD, 14, Color.WHITE));
+        cleanupOneBtn = Theme.iconButton(AppIcons.Glyph.DOWNLOAD, iconSz, "Tải đính kèm & Xóa thư này", Theme.success(), this::openCleanupForCurrentMail);
         cleanupOneBtn.setBorder(compactBtnPad);
-        cleanupOneBtn.addActionListener(e -> openCleanupForCurrentMail());
 
-        deleteBtn = Theme.dangerButton("Xóa", AppIcons.vectorIcon(AppIcons.Glyph.DELETE, 14, Color.WHITE));
+        deleteBtn = Theme.iconButton(AppIcons.Glyph.DELETE, iconSz, "Xóa thư", Theme.danger(), this::deleteSelectedMails);
         deleteBtn.setBorder(compactBtnPad);
-        deleteBtn.addActionListener(e -> deleteSelectedMails());
 
         actionBar.add(replyBtn);
         actionBar.add(replyAllBtn);
@@ -653,21 +669,21 @@ public class MainFrame extends JFrame {
         actionBar.add(cleanupOneBtn);
         actionBar.add(deleteBtn);
 
-        // HTML / Plain text switcher (đồng bộ phong cách Light/Dark, không cắt chữ)
-        ButtonGroup bg = new ButtonGroup();
-        htmlToggleBtn = createFilterToggle("HTML sạch", null);
-        htmlToggleBtn.setSelected(true);
-        htmlToggleBtn.addActionListener(e -> { showHtmlMode = true; htmlToggleBtn.repaint(); textToggleBtn.repaint(); renderCurrentBody(); });
-        textToggleBtn = createFilterToggle("Văn bản", null);
-        textToggleBtn.setSelected(false);
-        textToggleBtn.addActionListener(e -> { showHtmlMode = false; htmlToggleBtn.repaint(); textToggleBtn.repaint(); renderCurrentBody(); });
-        bg.add(htmlToggleBtn);
-        bg.add(textToggleBtn);
-        actionBar.add(htmlToggleBtn);
-        actionBar.add(textToggleBtn);
+        // ponytail: 1 nút gạt thay cho 2 toggle HTML/Văn bản — đủ ở cột rộng 250px;
+        // đổi lại thành segmented control khi cột đọc thư được bảo đảm rộng >= 480px.
+        modeToggleBtn = createFilterToggle("HTML sạch", null);
+        modeToggleBtn.setSelected(true);
+        modeToggleBtn.setToolTipText("Chuyển giữa chế độ xem HTML sạch và văn bản thuần");
+        modeToggleBtn.addActionListener(e -> {
+            showHtmlMode = !showHtmlMode;
+            modeToggleBtn.setSelected(showHtmlMode);
+            modeToggleBtn.setText(showHtmlMode ? "HTML sạch" : "Văn bản");
+            modeToggleBtn.repaint();
+            renderCurrentBody();
+        });
 
         // Subject (căn trái tuyệt đối trong BoxLayout)
-        detailSubjectLabel = new JLabel("(Không có tiêu đề)");
+        detailSubjectLabel = Theme.ellipsisLabel("(Không có tiêu đề)");
         detailSubjectLabel.setFont(Theme.fontSubTitle());
         detailSubjectLabel.setForeground(Theme.textPrimary());
         detailSubjectLabel.setHorizontalAlignment(SwingConstants.LEFT);
@@ -682,10 +698,10 @@ public class MainFrame extends JFrame {
         JPanel senderMeta = new JPanel();
         senderMeta.setOpaque(false);
         senderMeta.setLayout(new BoxLayout(senderMeta, BoxLayout.Y_AXIS));
-        detailFromLabel = new JLabel();
+        detailFromLabel = Theme.ellipsisLabel("");
         detailFromLabel.setFont(Theme.fontBold());
         detailFromLabel.setForeground(Theme.textPrimary());
-        detailToDateLabel = new JLabel();
+        detailToDateLabel = Theme.ellipsisLabel("");
         detailToDateLabel.setFont(Theme.fontSmall());
         detailToDateLabel.setForeground(Theme.textSecondary());
         senderMeta.add(detailFromLabel);
@@ -714,13 +730,14 @@ public class MainFrame extends JFrame {
         expandedHeaderPanel.setBorder(new EmptyBorder(Theme.SP_2, Theme.SP_3, Theme.SP_2, Theme.SP_3));
         expandedHeaderPanel.setVisible(false);
 
-        // Blocked remote images banner
-        remoteImgBanner = new JPanel(new BorderLayout(Theme.SP_2, 0));
+        // Blocked remote images banner (wrap: ở cửa sổ hẹp nút xuống dòng thay vì bóp chữ thành "…")
+        remoteImgBanner = Theme.createWrapPanel(Theme.SP_2, Theme.SP_1);
         remoteImgBanner.setBackground(Theme.warningSoft());
         remoteImgBanner.setBorder(new EmptyBorder(Theme.SP_2, Theme.SP_3, Theme.SP_2, Theme.SP_3));
-        JLabel remLbl = new JLabel("Ảnh từ xa đã bị chặn để bảo vệ quyền riêng tư của bạn.");
+        JLabel remLbl = Theme.ellipsisLabel("Ảnh từ xa đã bị chặn để bảo vệ quyền riêng tư của bạn.");
         remLbl.setFont(Theme.fontSmall());
         remLbl.setForeground(Theme.warning());
+        remLbl.setToolTipText("Ảnh từ xa đã bị chặn để bảo vệ quyền riêng tư của bạn.");
         JButton loadRemoteBtn = Theme.secondaryButton("Tải ảnh từ xa", null);
         loadRemoteBtn.addActionListener(e -> {
             if (currentDetail != null) {
@@ -728,8 +745,8 @@ public class MainFrame extends JFrame {
                 if (cur != null) loadMailDetail(cur, true);
             }
         });
-        remoteImgBanner.add(remLbl, BorderLayout.CENTER);
-        remoteImgBanner.add(loadRemoteBtn, BorderLayout.EAST);
+        remoteImgBanner.add(remLbl);
+        remoteImgBanner.add(loadRemoteBtn);
         remoteImgBanner.setVisible(false);
 
         truncatedBanner = new JLabel("Nội dung thư rất lớn nên đã được cắt gọn an toàn ở mức 512 KB.");
@@ -785,6 +802,28 @@ public class MainFrame extends JFrame {
         bodyScroll.setBorder(null);
         bodyScroll.getViewport().setBackground(Theme.bgSurface());
 
+        // Thanh chọn chế độ xem đặt ngay trên nội dung thư: ở đây nó mới thể hiện rõ tác dụng.
+        // Dùng 1 hàng wrap (nhãn + 2 toggle) để ở cửa sổ hẹp các nút xuống dòng thay vì chồng lên nhãn.
+        JPanel bodyModeBar = Theme.createWrapPanel(Theme.SP_1, 2);
+        JLabel bodyModeLbl = new JLabel("Chế độ xem:");
+        bodyModeLbl.setFont(Theme.fontTiny());
+        bodyModeLbl.setForeground(Theme.textMuted());
+        bodyModeBar.add(bodyModeLbl);
+        bodyModeBar.add(modeToggleBtn);
+
+        JPanel bodyModeStrip = new JPanel(new BorderLayout());
+        bodyModeStrip.setBackground(Theme.bgSurfaceAlt());
+        bodyModeStrip.setBorder(new CompoundBorder(
+                BorderFactory.createMatteBorder(0, 0, 1, 0, Theme.border()),
+                new EmptyBorder(2, Theme.SP_3, 2, Theme.SP_3)
+        ));
+        bodyModeStrip.add(bodyModeBar, BorderLayout.CENTER);
+
+        JPanel bodyArea = new JPanel(new BorderLayout());
+        bodyArea.setBackground(Theme.bgSurface());
+        bodyArea.add(bodyModeStrip, BorderLayout.NORTH);
+        bodyArea.add(bodyScroll, BorderLayout.CENTER);
+
         // Attachments footer strip
         attachmentsContainer = new JPanel(new BorderLayout(0, Theme.SP_1));
         attachmentsContainer.setBackground(Theme.bgSurfaceAlt());
@@ -802,7 +841,7 @@ public class MainFrame extends JFrame {
         attachmentsContainer.setVisible(false);
 
         detail.add(detailNorth, BorderLayout.NORTH);
-        detail.add(bodyScroll, BorderLayout.CENTER);
+        detail.add(bodyArea, BorderLayout.CENTER);
         detail.add(attachmentsContainer, BorderLayout.SOUTH);
 
         detailCardPanel.add(empty, "EMPTY_DETAIL");
@@ -1137,67 +1176,51 @@ public class MainFrame extends JFrame {
         info.setOpaque(false);
         info.setLayout(new BoxLayout(info, BoxLayout.Y_AXIS));
 
-        JLabel nameLbl = new JLabel(name);
+        JLabel nameLbl = Theme.ellipsisLabel(name);
         nameLbl.setFont(Theme.fontBold());
         nameLbl.setForeground(Theme.textPrimary());
         nameLbl.setAlignmentX(Component.LEFT_ALIGNMENT);
 
-        JLabel emailLbl = new JLabel(acc.email());
+        JLabel emailLbl = Theme.ellipsisLabel(acc.email());
         emailLbl.setFont(Theme.fontTiny());
         emailLbl.setForeground(Theme.textSecondary());
         emailLbl.setAlignmentX(Component.LEFT_ALIGNMENT);
 
-        // Huy hiệu Google & App Password gọn gàng kèm dấu sao ★ cho phương thức chính
-        JPanel badgeRow = Theme.createWrapPanel(4, 2);
+        // Huy hiệu phương thức: chỉ hiện phương thức đang có, dùng nhãn ngắn để vừa cột hẹp.
+        // Dấu ★ (U+2605) không có trong Segoe UI → vẽ sao vector thay vì ký tự, tránh ô vuông lỗi font.
+        JPanel badgeRow = Theme.createWrapPanel(4, 3);
         badgeRow.setAlignmentX(Component.LEFT_ALIGNMENT);
-        JLabel gBadge = hasOAuth
-                ? Theme.badge(oauthPrimary ? "★ Google" : "Google", Theme.bgSelected(), Theme.primaryText())
-                : Theme.badge("Google —", Theme.bgHover(), Theme.textMuted());
-        JLabel pBadge = hasAppPass
-                ? Theme.badge(appPassPrimary ? "★ App Password" : "App Password", Theme.successSoft(), Theme.success())
-                : Theme.badge("App Password —", Theme.bgHover(), Theme.textMuted());
-        badgeRow.add(gBadge);
-        badgeRow.add(pBadge);
+        if (hasOAuth) {
+            Icon star = oauthPrimary ? AppIcons.vectorIcon(AppIcons.Glyph.STAR_FILLED, 10, Theme.primaryText()) : null;
+            badgeRow.add(Theme.badge("Google", star, Theme.bgSelected(), Theme.primaryText()));
+        }
+        if (hasAppPass) {
+            Icon star = appPassPrimary ? AppIcons.vectorIcon(AppIcons.Glyph.STAR_FILLED, 10, Theme.success()) : null;
+            badgeRow.add(Theme.badge("App Password", star, Theme.successSoft(), Theme.success()));
+        }
 
         info.add(nameLbl);
         info.add(emailLbl);
-        info.add(Box.createVerticalStrut(2));
-        info.add(badgeRow);
-
-        if (fallbackActive) {
-            JPanel fbStrip = new JPanel(new BorderLayout(4, 2));
-            fbStrip.setBackground(Theme.warningSoft());
-            fbStrip.setBorder(new CompoundBorder(
-                    BorderFactory.createLineBorder(Theme.warning(), 1),
-                    new EmptyBorder(3, 6, 3, 6)
-            ));
-            fbStrip.setAlignmentX(Component.LEFT_ALIGNMENT);
-            JLabel fbLbl = new JLabel("<html>Đang dùng App Password dự phòng - Google cần cấp lại quyền</html>");
-            fbLbl.setFont(Theme.fontTiny().deriveFont(Font.BOLD));
-            fbLbl.setForeground(Theme.warning());
-            JButton reBtn = new JButton("Cấp lại quyền");
-            reBtn.setFont(Theme.fontTiny().deriveFont(Font.BOLD));
-            reBtn.setForeground(Theme.primaryText());
-            reBtn.setContentAreaFilled(false);
-            reBtn.setBorderPainted(false);
-            reBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-            reBtn.addActionListener(e -> initiateOAuth2Flow());
-            fbStrip.add(fbLbl, BorderLayout.CENTER);
-            fbStrip.add(reBtn, BorderLayout.SOUTH);
+        if (badgeRow.getComponentCount() > 0) {
             info.add(Box.createVerticalStrut(3));
-            info.add(fbStrip);
-        } else if (needsReauth) {
+            info.add(badgeRow);
+        }
+
+        if (fallbackActive || needsReauth) {
             JPanel warnRow = Theme.createWrapPanel(4, 2);
             warnRow.setAlignmentX(Component.LEFT_ALIGNMENT);
-            warnRow.add(Theme.badge("Cần cấp lại quyền", Theme.dangerSoft(), Theme.danger()));
-            JButton reBtn = new JButton("Cấp lại");
+            warnRow.add(Theme.badge(fallbackActive ? "Đang dùng App Password dự phòng" : "Cần cấp lại quyền",
+                    Theme.warningSoft(), Theme.warning()));
+            JButton reBtn = new JButton(fallbackActive ? "Cấp lại quyền" : "Cấp lại");
             reBtn.setFont(Theme.fontTiny().deriveFont(Font.BOLD));
             reBtn.setForeground(Theme.primaryText());
             reBtn.setContentAreaFilled(false);
             reBtn.setBorderPainted(false);
             reBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            reBtn.setToolTipText("Cấp lại quyền truy cập Gmail bằng OAuth2");
             reBtn.addActionListener(e -> initiateOAuth2Flow());
             warnRow.add(reBtn);
+            info.add(Box.createVerticalStrut(2));
             info.add(warnRow);
         }
 
@@ -1440,13 +1463,13 @@ public class MainFrame extends JFrame {
         truncatedBanner.setVisible(detail.truncated());
 
         boolean starred = detail.flags() != null && detail.flags().flagged();
-        starActionBtn.setText(starred ? "Bỏ sao" : "Gắn sao");
-        starActionBtn.setIcon(AppIcons.vectorIcon(starred ? AppIcons.Glyph.STAR_FILLED : AppIcons.Glyph.STAR, 14, Theme.starGold()));
+        starActionBtn.setToolTipText(starred ? "Bỏ gắn sao" : "Gắn sao");
+        starActionBtn.setIcon(AppIcons.vectorIcon(starred ? AppIcons.Glyph.STAR_FILLED : AppIcons.Glyph.STAR, 17, Theme.starGold()));
 
         // Mặc định ưu tiên HTML nếu có, không thì văn bản thuần
         showHtmlMode = detail.htmlBody() != null && !detail.htmlBody().isBlank();
-        htmlToggleBtn.setSelected(showHtmlMode);
-        textToggleBtn.setSelected(!showHtmlMode);
+        modeToggleBtn.setSelected(showHtmlMode);
+        modeToggleBtn.setText(showHtmlMode ? "HTML sạch" : "Văn bản");
         renderCurrentBody();
 
         // Attachments chips
@@ -1572,7 +1595,9 @@ public class MainFrame extends JFrame {
             }
             bodyPane.setContentType("text/html; charset=UTF-8");
             bodyPane.setText("<html><head><style>"
-                    + "body{font-family:'Segoe UI',sans-serif;font-size:13px;padding:18px 22px;background:" + bgHex + ";color:" + fgHex + ";line-height:1.58;margin:0;}"
+                    + "body{font-family:'" + Theme.fontRegular().getFamily() + "',sans-serif;"
+                    + "font-size:" + Theme.fontRegular().getSize() + "px;"
+                    + "padding:18px 22px;background:" + bgHex + ";color:" + fgHex + ";line-height:1.62;margin:0;}"
                     + "a{color:" + linkHex + ";text-decoration:underline;}"
                     + "table{max-width:100%;border-collapse:collapse;}"
                     + "img{max-width:100%;height:auto;}"
@@ -1671,8 +1696,8 @@ public class MainFrame extends JFrame {
                             currentDetail.subject(), currentDetail.textBody(), currentDetail.htmlBody(),
                             currentDetail.truncated(), currentDetail.hasBlockedRemoteImages(),
                             currentDetail.attachments(), updated);
-                    starActionBtn.setText(updated.flagged() ? "Bỏ sao" : "Gắn sao");
-                    starActionBtn.setIcon(AppIcons.vectorIcon(updated.flagged() ? AppIcons.Glyph.STAR_FILLED : AppIcons.Glyph.STAR, 14, Theme.starGold()));
+                    starActionBtn.setToolTipText(updated.flagged() ? "Bỏ gắn sao" : "Gắn sao");
+                    starActionBtn.setIcon(AppIcons.vectorIcon(updated.flagged() ? AppIcons.Glyph.STAR_FILLED : AppIcons.Glyph.STAR, 17, Theme.starGold()));
                     updateListItemFlags(uid, updated);
                 } catch (Exception ex) {
                     handleCommonError(ex, "Không cập nhật được trạng thái sao");
@@ -2320,10 +2345,15 @@ public class MainFrame extends JFrame {
             center.setOpaque(false);
             center.setLayout(new BoxLayout(center, BoxLayout.Y_AXIS));
 
+            // Chiều cao dòng suy ra từ font thay vì số cứng, để tăng cỡ chữ không bị cắt chân chữ.
+            int baseLine = getFontMetrics(Theme.fontRegular()).getHeight();
+            int smallLine = getFontMetrics(Theme.fontSmall()).getHeight();
+            int tinyLine = getFontMetrics(Theme.fontTiny()).getHeight();
+
             JPanel topRow = new JPanel(new BorderLayout(Theme.SP_1, 0));
             topRow.setOpaque(false);
             topRow.setAlignmentX(Component.LEFT_ALIGNMENT);
-            topRow.setMaximumSize(new Dimension(Integer.MAX_VALUE, 22));
+            topRow.setMaximumSize(new Dimension(Integer.MAX_VALUE, baseLine + 2));
             JPanel rightTop = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
             rightTop.setOpaque(false);
             rightTop.add(iconsLbl);
@@ -2332,9 +2362,9 @@ public class MainFrame extends JFrame {
             topRow.add(rightTop, BorderLayout.EAST);
 
             subjectLbl.setAlignmentX(Component.LEFT_ALIGNMENT);
-            subjectLbl.setMaximumSize(new Dimension(Integer.MAX_VALUE, 20));
+            subjectLbl.setMaximumSize(new Dimension(Integer.MAX_VALUE, baseLine + 2));
             snippetLbl.setAlignmentX(Component.LEFT_ALIGNMENT);
-            snippetLbl.setMaximumSize(new Dimension(Integer.MAX_VALUE, 18));
+            snippetLbl.setMaximumSize(new Dimension(Integer.MAX_VALUE, Math.max(smallLine, tinyLine) + 2));
 
             center.add(topRow);
             center.add(Box.createVerticalStrut(3));

@@ -6,10 +6,13 @@ import javax.swing.*;
 import javax.swing.border.Border;
 import javax.swing.border.CompoundBorder;
 import javax.swing.border.EmptyBorder;
+import javax.swing.plaf.FontUIResource;
 import javax.swing.plaf.basic.BasicButtonUI;
+import javax.swing.plaf.basic.BasicSplitPaneDivider;
 import java.awt.*;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
+import java.awt.event.MouseListener;
 import java.awt.geom.RoundRectangle2D;
 
 /**
@@ -52,7 +55,7 @@ public final class Theme {
     public static Color border()          { return darkMode ? new Color(64, 72, 86)   : new Color(214, 222, 232); }
     public static Color textPrimary()     { return darkMode ? new Color(240, 244, 249): new Color(24, 31, 43); }
     public static Color textSecondary()   { return darkMode ? new Color(176, 186, 202): new Color(74, 86, 104); }
-    public static Color textMuted()       { return darkMode ? new Color(156, 168, 186): new Color(90, 102, 118); }
+    public static Color textMuted()       { return darkMode ? new Color(156, 168, 186): new Color(76, 87, 102); }
 
     // === Màu thương hiệu & ngữ nghĩa (đạt WCAG AA >= 4.5:1 với chữ trắng và với nền soft tương ứng) ===
     public static Color primary()         { return new Color(18, 92, 194); }
@@ -69,7 +72,7 @@ public final class Theme {
     public static Color dangerSoft()      { return darkMode ? new Color(72, 22, 28)   : new Color(254, 226, 226); }
     public static Color starGold()        { return darkMode ? new Color(250, 194, 56) : new Color(168, 96, 0); }
 
-    // === Kiểu chữ chuẩn ===
+    // === Kiểu chữ chuẩn (thang cỡ chữ đọc được ở màn 125%: 12/13/14/16/21/26) ===
     private static String resolveFontFamily() {
         String[] preferred = {"Segoe UI", "Inter", "SansSerif"};
         String[] available = GraphicsEnvironment.getLocalGraphicsEnvironment().getAvailableFontFamilyNames();
@@ -83,13 +86,37 @@ public final class Theme {
 
     private static final String FONT_FAMILY = resolveFontFamily();
 
-    public static Font fontRegular()      { return new Font(FONT_FAMILY, Font.PLAIN, 13); }
-    public static Font fontSmall()        { return new Font(FONT_FAMILY, Font.PLAIN, 12); }
-    public static Font fontTiny()         { return new Font(FONT_FAMILY, Font.PLAIN, 11); }
-    public static Font fontBold()         { return new Font(FONT_FAMILY, Font.BOLD, 13); }
-    public static Font fontSubTitle()     { return new Font(FONT_FAMILY, Font.BOLD, 15); }
-    public static Font fontTitle()        { return new Font(FONT_FAMILY, Font.BOLD, 20); }
-    public static Font fontDisplay()      { return new Font(FONT_FAMILY, Font.BOLD, 24); }
+    public static final int FONT_BASE = 14;
+    public static final int FONT_SMALL = 13;
+    public static final int FONT_TINY = 12;
+
+    public static Font fontRegular()      { return new Font(FONT_FAMILY, Font.PLAIN, FONT_BASE); }
+    public static Font fontSmall()        { return new Font(FONT_FAMILY, Font.PLAIN, FONT_SMALL); }
+    public static Font fontTiny()         { return new Font(FONT_FAMILY, Font.PLAIN, FONT_TINY); }
+    public static Font fontBold()         { return new Font(FONT_FAMILY, Font.BOLD, FONT_BASE); }
+    public static Font fontSubTitle()     { return new Font(FONT_FAMILY, Font.BOLD, 16); }
+    public static Font fontTitle()        { return new Font(FONT_FAMILY, Font.BOLD, 21); }
+    public static Font fontDisplay()      { return new Font(FONT_FAMILY, Font.BOLD, 26); }
+
+    public static void installUiDefaults() {
+        FontUIResource reg = new FontUIResource(fontRegular());
+        FontUIResource bold = new FontUIResource(fontBold());
+        for (String key : new String[]{
+                "Label.font", "Button.font", "ToggleButton.font", "RadioButton.font", "CheckBox.font",
+                "TextField.font", "TextArea.font", "TextPane.font", "EditorPane.font", "PasswordField.font",
+                "ComboBox.font", "List.font", "Table.font", "TableHeader.font", "Tree.font",
+                "Menu.font", "MenuItem.font", "CheckBoxMenuItem.font", "RadioButtonMenuItem.font",
+                "PopupMenu.font", "OptionPane.font", "OptionPane.messageFont", "OptionPane.buttonFont",
+                "ToolTip.font", "Spinner.font", "ProgressBar.font", "TabbedPane.font",
+                "MenuBar.font", "Panel.font", "ColorChooser.font", "FileChooser.font", "InternalFrame.font"}) {
+            UIManager.put(key, reg);
+        }
+        for (String key : new String[]{"TableHeader.font", "MenuBar.font"}) {
+            UIManager.put(key, bold);
+        }
+        UIManager.put("ToolTip.foreground", textPrimary());
+        UIManager.put("ToolTip.background", bgSurfaceAlt());
+    }
 
     /**
      * Hint khử răng cưa chữ khớp với cách Swing vẽ chữ native (LCD subpixel nếu desktop hỗ trợ),
@@ -109,6 +136,55 @@ public final class Theme {
             }
         }
     }
+
+    /** JLabel tự cắt chữ bằng "…" khi bị ép hẹp, tooltip giữ nguyên nội dung đầy đủ. */
+    public static JLabel ellipsisLabel(String text) {
+        JLabel l = new JLabel(text) {
+            private boolean paintingEllipsis;
+
+            @Override
+            public void paintComponent(Graphics g) {
+                String full = getText();
+                if (full == null || full.isEmpty() || getFont() == null) {
+                    super.paintComponent(g);
+                    return;
+                }
+                FontMetrics fm = getFontMetrics(getFont());
+                Insets in = getInsets();
+                int avail = getWidth() - in.left - in.right - (getIcon() != null ? getIcon().getIconWidth() + getIconTextGap() : 0);
+                if (avail <= 0 || fm.stringWidth(full) <= avail) {
+                    super.paintComponent(g);
+                    return;
+                }
+                String cut = full;
+                while (cut.length() > 1 && fm.stringWidth(cut + "…") > avail) {
+                    cut = cut.substring(0, cut.length() - 1);
+                }
+                paintingEllipsis = true;
+                try {
+                    setText(cut + "…");
+                    super.paintComponent(g);
+                } finally {
+                    setText(full);
+                    paintingEllipsis = false;
+                }
+            }
+
+            // Cho phép BoxLayout/GridBagLayout ép hẹp để phần "…" có tác dụng thay vì bị cắt cụt.
+            @Override public Dimension getMinimumSize()    { return new Dimension(0, super.getMinimumSize().height); }
+            @Override public Dimension getMaximumSize()    { return new Dimension(Integer.MAX_VALUE, super.getPreferredSize().height); }
+
+            @Override
+            public void setText(String t) {
+                super.setText(t);
+                // Giữ tooltip luôn khớp nội dung đầy đủ, kể cả khi caller đổi text sau khi tạo.
+                if (!paintingEllipsis) setToolTipText(t);
+            }
+        };
+        l.setToolTipText(text);
+        return l;
+    }
+
 
     // === Nút bo góc vẽ bằng Java2D (Chính / Phụ / Nguy hiểm) ===
     public static JButton primaryButton(String text, Icon icon) {
@@ -169,6 +245,10 @@ public final class Theme {
     }
 
     public static JLabel badge(String text, Color bg, Color fg) {
+        return badge(text, null, bg, fg);
+    }
+
+    public static JLabel badge(String text, Icon icon, Color bg, Color fg) {
         JLabel label = new JLabel(text) {
             @Override
             protected void paintComponent(Graphics g) {
@@ -182,8 +262,14 @@ public final class Theme {
         };
         label.setOpaque(false);
         label.setForeground(fg);
-        label.setFont(new Font(FONT_FAMILY, Font.BOLD, 11));
-        label.setBorder(new EmptyBorder(2, 8, 2, 8));
+        label.setFont(fontTiny().deriveFont(Font.BOLD));
+        label.setBorder(new EmptyBorder(2, icon != null ? 6 : 8, 2, 8));
+        label.setIconTextGap(4);
+        if (icon != null) {
+            label.setIcon(icon);
+            label.setHorizontalTextPosition(SwingConstants.RIGHT);
+        }
+        label.setToolTipText(text);
         return label;
     }
 
@@ -206,42 +292,109 @@ public final class Theme {
     }
 
     /**
-     * Panel tự động xuống dòng theo chiều rộng container cha (tính đúng preferredHeight để không bị cắt/chồng lấn ở 800x600 và HiDPI).
+     * Panel tự xuống dòng theo chiều rộng container cha.
+     * Dùng {@link WrapLayout} (tính preferredHeight theo width thật) thay vì FlowLayout:
+     * FlowLayout luôn báo preferredSize 1 hàng nên các hàng badge/nút bị tràn ra ngoài và bị cắt chữ.
      */
     public static JPanel createWrapPanel(int hgap, int vgap) {
-        JPanel p = new JPanel(new FlowLayout(FlowLayout.LEFT, hgap, vgap)) {
-            @Override
-            public Dimension getPreferredSize() {
-                int availW = getWidth();
-                if (availW <= 0 && getParent() != null) {
-                    availW = getParent().getWidth();
-                }
-                if (availW <= 0) availW = 760;
-                Insets ins = getInsets();
-                int maxW = Math.max(180, availW - ins.left - ins.right);
-                int x = 0, rowH = 0, totalH = ins.top + ins.bottom + vgap;
-                for (Component c : getComponents()) {
-                    if (!c.isVisible()) continue;
-                    Dimension d = c.getPreferredSize();
-                    if (x > 0 && x + d.width > maxW) {
-                        totalH += rowH + vgap;
-                        x = 0;
-                        rowH = 0;
-                    }
-                    x += d.width + hgap;
-                    rowH = Math.max(rowH, d.height);
-                }
-                totalH += rowH + vgap;
-                return new Dimension(availW, Math.max(32, totalH));
-            }
-            @Override
-            public Dimension getMaximumSize() {
-                Dimension pref = getPreferredSize();
-                return new Dimension(Integer.MAX_VALUE, pref.height);
-            }
-        };
+        WrapLayout layout = new WrapLayout(FlowLayout.LEFT, hgap, vgap);
+        JPanel p = new JPanel(layout);
         p.setOpaque(false);
         return p;
+    }
+
+    /** Panel luôn bám đúng bề rộng viewport (không sinh thanh cuộn ngang, không cắt nội dung). */
+    public static JPanel trackedWidthPanel(LayoutManager layout) {
+        return new TrackedWidthPanel(layout);
+    }
+
+    private static final class TrackedWidthPanel extends JPanel implements Scrollable {
+        TrackedWidthPanel(LayoutManager layout) { super(layout); }
+
+        @Override public Dimension getPreferredScrollableViewportSize() { return getPreferredSize(); }
+        @Override public int getScrollableUnitIncrement(Rectangle r, int o, int d) { return 16; }
+        @Override public int getScrollableBlockIncrement(Rectangle r, int o, int d) { return 64; }
+        @Override public boolean getScrollableTracksViewportWidth() { return true; }
+        @Override public boolean getScrollableTracksViewportHeight() { return false; }
+    }
+
+    /** Nút icon-only có tooltip + accessible name (dùng cho toolbar gọn). */
+    public static JButton iconButton(AppIcons.Glyph glyph, String tooltip, Color fg, Runnable action) {
+        return iconButton(glyph, 18, tooltip, fg, action);
+    }
+
+    public static JButton iconButton(AppIcons.Glyph glyph, int size, String tooltip, Color fg, Runnable action) {
+        JButton btn = new JButton(AppIcons.vectorIcon(glyph, size, fg));
+        btn.setToolTipText(tooltip);
+        btn.getAccessibleContext().setAccessibleName(tooltip);
+        btn.setUI(new BasicButtonUI());
+        btn.setOpaque(false);
+        btn.setContentAreaFilled(false);
+        btn.setBorderPainted(false);
+        btn.setFocusPainted(true);
+        btn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        btn.setBorder(new EmptyBorder(SP_2, SP_2, SP_2, SP_2));
+        if (action != null) btn.addActionListener(e -> action.run());
+        // Opaque chỉ bật khi hover: BasicButtonUI mới vẽ nền hover, còn bình thường vẫn trong suốt.
+        btn.addMouseListener(new MouseAdapter() {
+            @Override public void mouseEntered(MouseEvent e) { btn.setBackground(bgHover()); btn.setOpaque(true); btn.repaint(); }
+            @Override public void mouseExited(MouseEvent e)  { btn.setOpaque(false); btn.repaint(); }
+        });
+        return btn;
+    }
+
+    /**
+     * Splitter mảnh, kéo mượt (continuousLayout) và có nút thu/mở 1 chạm.
+     * Ngoài ra double-click lên thanh kéo = thu gọn / mở lại đúng vị trí trước đó.
+     */
+    public static void styleSplitter(JSplitPane split) {
+        split.setDividerSize(7);
+        split.setBorder(null);
+        split.setContinuousLayout(true);
+        split.setOneTouchExpandable(true);
+        split.setBackground(bgApp());
+
+        int[] lastExpanded = {-1};
+        onDivider(split, new MouseAdapter() {
+            @Override public void mousePressed(MouseEvent e) {
+                int pos = split.getDividerLocation();
+                if (pos > split.getDividerSize() + 4) lastExpanded[0] = pos;
+            }
+
+            @Override public void mouseClicked(MouseEvent e) {
+                if (e.getClickCount() != 2) return;
+                int min = split.getDividerSize() + 2;
+                int target = split.getDividerLocation() <= min
+                        ? (lastExpanded[0] > min ? lastExpanded[0] : split.getWidth() / 3)
+                        : min;
+                split.setDividerLocation(target);
+            }
+        });
+    }
+
+    /** Ghi vị trí divider vào ~/.mailclient/config.properties khi người dùng thả chuột (không ghi mỗi pixel kéo). */
+    public static void persistSplit(JSplitPane split, String key) {
+        onDivider(split, new MouseAdapter() {
+            @Override public void mouseReleased(MouseEvent e) {
+                int pos = split.getDividerLocation();
+                if (pos > 0) ClientConfig.getInstance().setSplit(key, pos);
+            }
+        });
+    }
+
+    /** Gắn listener vào divider thật của split; L&F có thể tạo divider muộn nên thử lại 1 lần. */
+    private static void onDivider(JSplitPane split, MouseListener listener) {
+        onDivider(split, listener, true);
+    }
+
+    private static void onDivider(JSplitPane split, MouseListener listener, boolean mayRetry) {
+        for (Component c : split.getComponents()) {
+            if (c instanceof BasicSplitPaneDivider divider) {
+                divider.addMouseListener(listener);
+                return;
+            }
+        }
+        if (mayRetry) SwingUtilities.invokeLater(() -> onDivider(split, listener, false));
     }
 }
 

@@ -379,11 +379,12 @@ public final class AppIcons {
                         g.draw(new Line2D.Double(12, 12, 17, 17));
                     }
                     case SETTINGS -> {
-                        g.draw(new Ellipse2D.Double(7, 7, 6, 6));
-                        for (int i = 0; i < 8; i++) {
-                            double ang = i * Math.PI / 4.0;
-                            g.draw(new Line2D.Double(10 + Math.cos(ang) * 5.2, 10 + Math.sin(ang) * 5.2,
-                                    10 + Math.cos(ang) * 7.8, 10 + Math.sin(ang) * 7.8));
+                        // Thanh trượt (sliders) — khác hẳn glyph SUN, tránh 2 nút cùng hình trên toolbar.
+                        for (int i = 0; i < 3; i++) {
+                            double ly = 5 + i * 5;
+                            g.draw(new Line2D.Double(3, ly, 17, ly));
+                            double knobX = i == 1 ? 12.5 : 6.5;
+                            g.fill(new Ellipse2D.Double(knobX - 1.9, ly - 1.9, 3.8, 3.8));
                         }
                     }
                     case ATTACHMENT -> {
