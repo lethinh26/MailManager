@@ -93,7 +93,7 @@ public final class AvatarUtil {
             public void paintIcon(Component c, Graphics g0, int x, int y) {
                 Graphics2D g = (Graphics2D) g0.create();
                 g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-                g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+                Theme.applyTextHints(g);
 
                 g.setColor(bg);
                 g.fill(new Ellipse2D.Double(x, y, diameter, diameter));

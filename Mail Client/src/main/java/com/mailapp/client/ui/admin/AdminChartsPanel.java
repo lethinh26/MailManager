@@ -38,7 +38,7 @@ public final class AdminChartsPanel {
             super.paintComponent(g0);
             Graphics2D g = (Graphics2D) g0.create();
             g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-            g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+            Theme.applyTextHints(g);
 
             int w = getWidth();
             int h = getHeight();
@@ -155,7 +155,7 @@ public final class AdminChartsPanel {
             super.paintComponent(g0);
             Graphics2D g = (Graphics2D) g0.create();
             g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-            g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+            Theme.applyTextHints(g);
 
             g.setFont(Theme.fontBold());
             g.setColor(Theme.textPrimary());

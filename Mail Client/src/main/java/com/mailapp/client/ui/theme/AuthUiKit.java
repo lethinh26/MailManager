@@ -401,7 +401,7 @@ public final class AuthUiKit {
                     super.paintChildren(g);
                     if (field.getDocument().getLength() == 0 && placeholder != null && !placeholder.isEmpty()) {
                         Graphics2D g2 = (Graphics2D) g.create();
-                        g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+                        Theme.applyTextHints(g2);
                         g2.setFont(Theme.fontRegular());
                         g2.setColor(Theme.textMuted());
                         FontMetrics fm = g2.getFontMetrics();
@@ -638,7 +638,7 @@ public final class AuthUiKit {
         protected void paintComponent(Graphics g) {
             Graphics2D g2 = (Graphics2D) g.create();
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-            g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+            Theme.applyTextHints(g2);
 
             int w = getWidth();
             int h = getHeight();
@@ -802,7 +802,7 @@ public final class AuthUiKit {
                 super.paintComponent(g);
                 Graphics2D g2 = (Graphics2D) g.create();
                 g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-                g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+                Theme.applyTextHints(g2);
                 int w = getWidth(), h = getHeight();
                 g2.setFont(Theme.fontTiny());
                 FontMetrics fm = g2.getFontMetrics();

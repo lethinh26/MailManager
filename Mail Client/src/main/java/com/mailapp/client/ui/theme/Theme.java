@@ -91,6 +91,25 @@ public final class Theme {
     public static Font fontTitle()        { return new Font(FONT_FAMILY, Font.BOLD, 20); }
     public static Font fontDisplay()      { return new Font(FONT_FAMILY, Font.BOLD, 24); }
 
+    /**
+     * Hint khử răng cưa chữ khớp với cách Swing vẽ chữ native (LCD subpixel nếu desktop hỗ trợ),
+     * để nét chữ ở component tự vẽ Java2D không bị mảnh/mờ hơn phần còn lại của cửa sổ.
+     */
+    public static void applyTextHints(Graphics2D g2) {
+        Object hints = Toolkit.getDefaultToolkit().getDesktopProperty("awt.font.desktophints");
+        if (hints instanceof java.util.Map<?, ?> map) {
+            // Giữ cả hướng subpixel và độ tương phản LCD do hệ điều hành chọn.
+            // Không ép fractional metrics ON: giữ nguyên cách tính chiều rộng chữ của Swing.
+            for (RenderingHints.Key key : new RenderingHints.Key[]{
+                    RenderingHints.KEY_TEXT_ANTIALIASING,
+                    RenderingHints.KEY_TEXT_LCD_CONTRAST,
+                    RenderingHints.KEY_FRACTIONALMETRICS}) {
+                Object value = map.get(key);
+                if (value != null) g2.setRenderingHint(key, value);
+            }
+        }
+    }
+
     // === Nút bo góc vẽ bằng Java2D (Chính / Phụ / Nguy hiểm) ===
     public static JButton primaryButton(String text, Icon icon) {
         return createStyledButton(text, icon, primary(), primaryHover(), Color.WHITE, null);

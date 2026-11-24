@@ -25,6 +25,11 @@ import java.util.List;
 public class Main {
 
     public static void main(String[] args) {
+        // Đặt trực tiếp trước khi Theme khởi tạo GraphicsEnvironment để Java2D
+        // nhận ClearType và DPI thật của Windows. Tôn trọng các JVM override.
+        System.getProperties().putIfAbsent("awt.useSystemAAFontSettings", "true");
+        System.getProperties().putIfAbsent("swing.aatext", "true");
+        System.getProperties().putIfAbsent("sun.java2d.uiScale.enabled", "true");
         if (args != null) {
             for (String arg : args) {
                 if ("-Dmailclient.insecure=true".equalsIgnoreCase(arg)
