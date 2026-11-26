@@ -65,10 +65,12 @@ class MailPerformanceAndResilienceTest {
 
         MailConnectionProperties props = new MailConnectionProperties();
         props.setImapHost("127.0.0.1");
+        props.setLocalTestTransport(true);
         props.setImapPort(greenMail.getImaps().getPort());
         props.setSmtpHost("127.0.0.1");
         props.setSmtpPort(greenMail.getSmtp().getPort());
         props.setRetryEnabled(false);
+        props.setPoolEnabled(false);
 
         DefaultMailConnectionFactory factory = new DefaultMailConnectionFactory(
                 props, aesCipher, mock(AccessTokenProvider.class), null);
@@ -88,15 +90,15 @@ class MailPerformanceAndResilienceTest {
         perfAccount.setAuthType(AuthType.APP_PASSWORD);
         perfAccount.setAppPasswordEncrypted(aesCipher.encrypt("perfpass"));
         perfAccount.setStatus(AccountStatus.ACTIVE);
-        when(repo.findById(100L)).thenReturn(Optional.of(perfAccount));
+        when(repo.findByIdAndUserId(100L, 100L)).thenReturn(Optional.of(perfAccount));
 
         mailService = new MailServiceImpl(
                 repo, factory, new GmailFolderResolver(), settings, audit,
                 new HtmlSanitizerService(), new MailHeaderAndRateGuard(100, 15, 120));
 
-        // 1. Nạp 100 thư thật vào GreenMail INBOX (tiếng Việt UTF-8)
+        // 1. Nạp 1000 thư thật vào GreenMail INBOX (tiếng Việt UTF-8)
         Session session = greenMail.getSmtp().createSession();
-        for (int i = 1; i <= 100; i++) {
+        for (int i = 1; i <= 1000; i++) {
             MimeMessage msg = new MimeMessage(session);
             msg.setFrom(new InternetAddress("sender" + i + "@ptit.edu.vn", "Người gửi " + i, StandardCharsets.UTF_8.name()));
             msg.setRecipient(Message.RecipientType.TO, new InternetAddress("perf@test.local"));
@@ -245,6 +247,40 @@ class MailPerformanceAndResilienceTest {
         assertEquals(25L * 1024 * 1024, streamedBytes[0], "Phải stream đủ 25 MB!");
         System.out.printf("[PERF_BENCHMARK] List30=%dms | List100=%dms | Open10MB=%dms | Stream25MB=%dms | StreamHeapDelta=%dMB%n",
                 ms30, ms100, ms10Mb, ms25Mb, heapDeltaMb);
+    }
+
+    @Test
+    void thousandMessageMailboxKeepsAdjacentDeepPagesOrderedWithoutDuplicates() {
+        // Cross the 500-message metadata fetch boundary on a real IMAP store.
+        MailListResponse first = mailService.listMails(perfUser, 100L, "INBOX", 4, 100,
+                null, null, null, null, null);
+        MailListResponse second = mailService.listMails(perfUser, 100L, "INBOX", 5, 100,
+                null, null, null, null, null);
+        assertEquals(1002, first.total());
+        assertEquals(1002, second.total());
+        assertEquals(first.uidValidity(), second.uidValidity());
+        assertEquals(100, first.items().size());
+        assertEquals(100, second.items().size());
+        List<MailSummaryDto> combined = new ArrayList<>(first.items());
+        combined.addAll(second.items());
+        assertEquals(200, combined.stream().map(MailSummaryDto::uid).distinct().count());
+        Comparator<MailSummaryDto> order = Comparator.comparing(
+                (MailSummaryDto item) -> item.date() == null ? null : java.time.Instant.parse(item.date()),
+                Comparator.nullsLast(Comparator.reverseOrder()))
+                .thenComparing(Comparator.comparingLong(MailSummaryDto::uid).reversed());
+        assertEquals(combined.stream().sorted(order).map(MailSummaryDto::uid).toList(),
+                combined.stream().map(MailSummaryDto::uid).toList());
+        // Search pages also order globally and keep the same stable UID tie break.
+        MailListResponse s0 = mailService.listMails(perfUser, 100L, "INBOX", 0, 20,
+                "Thông báo kiểm thử hiệu năng số #1", null, null, null, null);
+        MailListResponse s1 = mailService.listMails(perfUser, 100L, "INBOX", 1, 20,
+                "Thông báo kiểm thử hiệu năng số #1", null, null, null, null);
+        assertEquals(112, s0.total());
+        assertEquals(s0.total(), s1.total());
+        Set<Long> ids = new HashSet<>();
+        s0.items().forEach(item -> assertTrue(ids.add(item.uid())));
+        s1.items().forEach(item -> assertTrue(ids.add(item.uid())));
+        assertEquals(40, ids.size());
     }
 
     @Test

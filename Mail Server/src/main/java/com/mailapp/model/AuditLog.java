@@ -23,17 +23,22 @@ public class AuditLog {
     @JoinColumn(name = "user_id")
     private User user;
 
-    @Column(nullable = false, length = 50)
+    @Column(nullable = false, length = 64)
     private String action;
 
-    @Column(length = 500)
+    @Column(columnDefinition = "TEXT")
     private String detail;
 
-    @Column(name = "ip_address", length = 45)
+    @Column(name = "ip_address", length = 64)
     private String ipAddress;
 
     @Column(name = "created_at")
     private LocalDateTime createdAt;
+
+    @Column(name = "mail_event_id", length = 36, unique = true)
+    private String mailEventId;
+    @Column(name = "mail_actor_id")
+    private Long mailActorId;
 
     public AuditLog() {}
 
@@ -69,5 +74,9 @@ public class AuditLog {
 
     public LocalDateTime getCreatedAt() { return createdAt; }
     public void setCreatedAt(LocalDateTime createdAt) { this.createdAt = createdAt; }
+    public String getMailEventId() { return mailEventId; }
+    public void setMailEventId(String mailEventId) { this.mailEventId = mailEventId; }
+    public Long getMailActorId() { return mailActorId; }
+    public void setMailActorId(Long mailActorId) { this.mailActorId = mailActorId; }
 }
 

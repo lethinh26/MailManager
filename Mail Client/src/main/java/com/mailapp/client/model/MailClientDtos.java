@@ -1,6 +1,8 @@
 package com.mailapp.client.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
 
 import java.util.List;
 
@@ -59,6 +61,20 @@ public final class MailClientDtos {
             long uidValidity
     ) {}
 
+    public enum AttachmentSizeAccuracy {
+        EXACT, ESTIMATED, UNKNOWN;
+
+        @JsonCreator(mode = JsonCreator.Mode.DELEGATING)
+        public static AttachmentSizeAccuracy fromWire(String value) {
+            if (value == null) return null;
+            try {
+                return valueOf(value);
+            } catch (IllegalArgumentException ex) {
+                return UNKNOWN;
+            }
+        }
+    }
+
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record MailAttachmentDto(
             int index,
@@ -66,8 +82,45 @@ public final class MailClientDtos {
             String contentType,
             long size,
             boolean inline,
-            String contentId
-    ) {}
+            String contentId,
+            AttachmentSizeAccuracy sizeAccuracy
+    ) {
+        public MailAttachmentDto {
+            // Older servers did not distinguish a genuinely empty attachment
+            // from unknown size (often encoded as zero). Never label that
+            // ambiguous metadata exact.
+            if (size < 0) sizeAccuracy = AttachmentSizeAccuracy.UNKNOWN;
+            else if (sizeAccuracy == null) sizeAccuracy = size > 0
+                    ? AttachmentSizeAccuracy.ESTIMATED : AttachmentSizeAccuracy.UNKNOWN;
+        }
+
+        public MailAttachmentDto(int index, String filename, String contentType,
+                                 long size, boolean inline, String contentId) {
+            this(index, filename, contentType, size, inline, contentId, null);
+        }
+
+        @JsonCreator
+        public static MailAttachmentDto fromWire(
+                @JsonProperty("index") int index,
+                @JsonProperty("filename") String filename,
+                @JsonProperty("fileName") String fileName,
+                @JsonProperty("contentType") String contentType,
+                @JsonProperty("size") Long size,
+                @JsonProperty("sizeBytes") Long sizeBytes,
+                @JsonProperty("inline") boolean inline,
+                @JsonProperty("contentId") String contentId,
+                @JsonProperty("sizeAccuracy") AttachmentSizeAccuracy sizeAccuracy) {
+            long bytes = size != null ? size : sizeBytes != null ? sizeBytes : -1L;
+            return new MailAttachmentDto(index, filename != null ? filename : fileName,
+                    contentType, bytes, inline, contentId, sizeAccuracy);
+        }
+
+        @JsonProperty("fileName")
+        public String fileName() { return filename; }
+
+        @JsonProperty("sizeBytes")
+        public long sizeBytes() { return size; }
+    }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record MailDetailResponse(

@@ -44,7 +44,9 @@ COPY entrypoint.sh /app/entrypoint.sh
 
 # Cấp quyền thực thi và sở hữu cho mailapp user
 RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh \
-    && mkdir -p /app/logs && chown -R mailapp:mailapp /app
+    && mkdir -p /app/logs /app/data/mail-audit-receipts \
+    && chmod 700 /app/data/mail-audit-receipts \
+    && chown -R mailapp:mailapp /app
 
 # Cài đặt curl phục vụ healthcheck trong container
 RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*

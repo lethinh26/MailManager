@@ -1,153 +1,73 @@
-### ==============================================================================
-### Java Mail App — HTTP Client Requests: Authentication (EP-A2: POST /api/auth/login)
-### Tương thích với IntelliJ IDEA HTTP Client & VS Code REST Client
-### Base URL: https://localhost:8443 (hoặc http://localhost:8080 nếu chạy không SSL)
-### ==============================================================================
+### Fixture disposable HTTPS only — examples, not a runnable bulk suite.
+### Supply {{fixtureBaseUrl}} (random loopback port, never 8443), fixture-only tokens
+### and random passwords from an isolated process. Trust that fixture's certificate.
+### Do not persist variables, responses, history or secrets in a Postman/IDE profile.
+### Use scripts/manual-http.cjs as documented in README.acceptance.md for actual observations.
+### Do not send X-Forwarded-For or use real accounts; select each request individually.
 
-@baseUrl = {{host}}
-@clientIp = 127.0.0.1
-
-### ------------------------------------------------------------------------------
-### 1. Đăng nhập thành công với tài khoản Quản trị viên (ADMIN)
-### Kỳ vọng: HTTP 200 OK, trả accessToken JWT (exp +24h), role = ADMIN
-### ------------------------------------------------------------------------------
-POST {{baseUrl}}/api/auth/login
+### Login ADMIN — 200 Bearer, ADMIN (bootstrap forced change must already be completed)
+POST {{fixtureBaseUrl}}/api/auth/login
 Content-Type: application/json
 Accept: application/json
-X-Forwarded-For: {{clientIp}}
 
 {
-  "username": "admin",
-  "password": "AdminPassword123!"
+  "username": "{{fixtureAdminUsername}}",
+  "password": "{{fixtureAdminPassword}}"
 }
 
-> {%
-    client.test("Status code is 200", function() {
-        client.assert(response.status === 200, "Response status should be 200");
-    });
-    client.test("Contains Bearer accessToken", function() {
-        client.assert(response.body.accessToken !== undefined, "accessToken should exist");
-        client.assert(response.body.tokenType === "Bearer", "tokenType should be Bearer");
-        client.assert(response.body.user.role === "ADMIN", "Role should be ADMIN");
-    });
-    client.global.set("adminToken", response.body.accessToken);
-%}
-
-### ------------------------------------------------------------------------------
-### 2. Đăng nhập thành công với tài khoản Người dùng (USER)
-### Kỳ vọng: HTTP 200 OK, trả accessToken JWT, role = USER
-### ------------------------------------------------------------------------------
-POST {{baseUrl}}/api/auth/login
+### Login USER — 200 Bearer, USER
+POST {{fixtureBaseUrl}}/api/auth/login
 Content-Type: application/json
 Accept: application/json
-X-Forwarded-For: {{clientIp}}
 
 {
-  "username": "lethanhcuong",
-  "password": "UserPassword123!"
+  "username": "{{fixtureUserUsername}}",
+  "password": "{{fixtureUserPassword}}"
 }
 
-> {%
-    client.test("Status code is 200", function() {
-        client.assert(response.status === 200, "Response status should be 200");
-    });
-    client.test("Role is USER", function() {
-        client.assert(response.body.user.role === "USER", "Role should be USER");
-    });
-    client.global.set("userToken", response.body.accessToken);
-%}
-
-### ------------------------------------------------------------------------------
-### 3. Đăng nhập thất bại: Sai mật khẩu (INVALID_CREDENTIALS)
-### Kỳ vọng: HTTP 401 Unauthorized, code = INVALID_CREDENTIALS
-### ------------------------------------------------------------------------------
-POST {{baseUrl}}/api/auth/login
+### Wrong password — 401 UNAUTHORIZED; never distinguish unknown user
+POST {{fixtureBaseUrl}}/api/auth/login
 Content-Type: application/json
 Accept: application/json
-X-Forwarded-For: {{clientIp}}
 
 {
-  "username": "lethanhcuong",
-  "password": "WrongPassword123!"
+  "username": "{{fixtureUserUsername}}",
+  "password": "{{fixtureWrongPassword}}"
 }
 
-> {%
-    client.test("Status code is 401", function() {
-        client.assert(response.status === 401, "Response status should be 401");
-        client.assert(response.body.code === "INVALID_CREDENTIALS", "Code should be INVALID_CREDENTIALS");
-    });
-%}
-
-### ------------------------------------------------------------------------------
-### 4. Đăng nhập thất bại: Người dùng không tồn tại (Constant-time dummy BCrypt)
-### Kỳ vọng: HTTP 401 Unauthorized, code = INVALID_CREDENTIALS, message chung không lộ username
-### ------------------------------------------------------------------------------
-POST {{baseUrl}}/api/auth/login
+### Unknown fixture user — 401 UNAUTHORIZED
+POST {{fixtureBaseUrl}}/api/auth/login
 Content-Type: application/json
 Accept: application/json
-X-Forwarded-For: {{clientIp}}
 
 {
-  "username": "non_existent_user",
-  "password": "SomePassword123!"
+  "username": "{{fixtureNonexistentUsername}}",
+  "password": "{{fixtureWrongPassword}}"
 }
 
-> {%
-    client.test("Status code is 401", function() {
-        client.assert(response.status === 401, "Response status should be 401");
-        client.assert(response.body.code === "INVALID_CREDENTIALS", "Code should be INVALID_CREDENTIALS");
-    });
-%}
-
-### ------------------------------------------------------------------------------
-### 5. Đăng nhập thất bại: Tài khoản bị khóa (ACCOUNT_LOCKED)
-### Điều kiện: User nhập đúng mật khẩu nhưng enabled = false
-### Kỳ vọng: HTTP 403 Forbidden, code = ACCOUNT_LOCKED
-### ------------------------------------------------------------------------------
-POST {{baseUrl}}/api/auth/login
+### Correct password of explicitly locked disposable target — 403 ACCOUNT_DISABLED
+POST {{fixtureBaseUrl}}/api/auth/login
 Content-Type: application/json
 Accept: application/json
-X-Forwarded-For: {{clientIp}}
 
 {
-  "username": "locked_user",
-  "password": "LockedUserPassword123!"
+  "username": "{{fixtureLockedUsername}}",
+  "password": "{{fixtureLockedPassword}}"
 }
 
-> {%
-    client.test("Status code is 403", function() {
-        client.assert(response.status === 403, "Response status should be 403");
-        client.assert(response.body.code === "ACCOUNT_LOCKED", "Code should be ACCOUNT_LOCKED");
-    });
-%}
-
-### ------------------------------------------------------------------------------
-### 6. Thử nghiệm Brute-force: Nhập sai 6 lần liên tiếp
-### Kỳ vọng: Đến lần thứ 6 trả về HTTP 429 Too Many Requests, kèm header Retry-After
-### ------------------------------------------------------------------------------
-POST {{baseUrl}}/api/auth/login
+### Rate limit: repeat only on a separate disposable user up to configured threshold;
+### observe 429 TOO_MANY_ATTEMPTS and Retry-After, then stop. No automatic loop.
+POST {{fixtureBaseUrl}}/api/auth/login
 Content-Type: application/json
 Accept: application/json
-X-Forwarded-For: 192.168.1.100
 
 {
-  "username": "bruteforce_target",
-  "password": "wrong_attempt_6"
+  "username": "{{fixtureRateLimitUsername}}",
+  "password": "{{fixtureWrongPassword}}"
 }
 
-> {%
-    client.test("Status code is 429 when rate limited", function() {
-        client.assert(response.status === 429, "Response status should be 429");
-        client.assert(response.body.code === "TOO_MANY_ATTEMPTS", "Code should be TOO_MANY_ATTEMPTS");
-        client.assert(response.headers.valueOf("Retry-After") !== null, "Retry-After header must exist");
-    });
-%}
-
-### ------------------------------------------------------------------------------
-### 7. Lỗi xác thực dữ liệu đầu vào (VALIDATION_ERROR)
-### Kỳ vọng: HTTP 400 Bad Request, code = VALIDATION_ERROR
-### ------------------------------------------------------------------------------
-POST {{baseUrl}}/api/auth/login
+### Invalid body — 400 VALIDATION_ERROR
+POST {{fixtureBaseUrl}}/api/auth/login
 Content-Type: application/json
 Accept: application/json
 
@@ -156,138 +76,143 @@ Accept: application/json
   "password": ""
 }
 
-> {%
-    client.test("Status code is 400", function() {
-        client.assert(response.status === 400, "Response status should be 400");
-        client.assert(response.body.code === "VALIDATION_ERROR", "Code should be VALIDATION_ERROR");
-    });
-%}
-
-### ------------------------------------------------------------------------------
-### 8. Lấy danh sách Gmail của user khi CHƯA có token (Expect 401 UNAUTHORIZED)
-### ------------------------------------------------------------------------------
-GET {{baseUrl}}/api/gmail-accounts
+### No bearer — 401 UNAUTHORIZED
+GET {{fixtureBaseUrl}}/api/auth/me
 Accept: application/json
 
-### ------------------------------------------------------------------------------
-### 9. Lấy danh sách Gmail của user với Bearer Token (Expect 200 OK)
-### ------------------------------------------------------------------------------
-GET {{baseUrl}}/api/gmail-accounts
-Authorization: Bearer {{userToken}}
+### Correct bearer — 200, no password hash
+GET {{fixtureBaseUrl}}/api/auth/me
+Authorization: Bearer {{fixtureUserToken}}
 Accept: application/json
 
-### ------------------------------------------------------------------------------
-### 10. Lấy URL ủy quyền Google OAuth2 với PKCE và State (Expect 200 OK)
-### ------------------------------------------------------------------------------
-GET {{baseUrl}}/api/oauth2/authorize-url
-Authorization: Bearer {{userToken}}
+### Public config — 200 without token
+GET {{fixtureBaseUrl}}/api/public/config
 Accept: application/json
 
-### ------------------------------------------------------------------------------
-### 11. Google Callback với state sai / hết hạn (Expect 200 OK + HTML thông báo lỗi đẹp)
-### ------------------------------------------------------------------------------
-GET {{baseUrl}}/api/oauth2/callback?code=mock_code&state=invalid_or_expired_state
-Accept: text/html
-
-### ------------------------------------------------------------------------------
-### 12. Admin/Dev: Tạm tắt cờ liên kết OAuth2 (ALLOW_OAUTH2_LINK = false) — bắt buộc JWT ADMIN
-### ------------------------------------------------------------------------------
-POST {{baseUrl}}/api/dev/setting?key=ALLOW_OAUTH2_LINK&value=false
-Authorization: Bearer {{adminToken}}
-
-### ------------------------------------------------------------------------------
-### 13. Lấy URL ủy quyền khi cờ ALLOW_OAUTH2_LINK bị tắt (Expect 403 FEATURE_DISABLED)
-### ------------------------------------------------------------------------------
-GET {{baseUrl}}/api/oauth2/authorize-url
-Authorization: Bearer {{userToken}}
-Accept: application/json
-
-### ------------------------------------------------------------------------------
-### 14. Admin/Dev: Bật lại cờ ALLOW_OAUTH2_LINK = true — bắt buộc JWT ADMIN
-### ------------------------------------------------------------------------------
-POST {{baseUrl}}/api/dev/setting?key=ALLOW_OAUTH2_LINK&value=true
-Authorization: Bearer {{adminToken}}
-
-### ------------------------------------------------------------------------------
-### 15. Xóa Gmail với ID không tồn tại (Expect 404 ACCOUNT_NOT_FOUND)
-### ------------------------------------------------------------------------------
-DELETE {{baseUrl}}/api/gmail-accounts/9999
-Authorization: Bearer {{userToken}}
-Accept: application/json
-
-### ------------------------------------------------------------------------------
-### 16. EP-P1: Lấy cấu hình hệ thống an toàn công khai (Expect 200 OK)
-### Không cần Bearer Token. Không lộ bất kỳ secret nào.
-### ------------------------------------------------------------------------------
-GET {{baseUrl}}/api/public/config
-Accept: application/json
-
-### ------------------------------------------------------------------------------
-### 17. EP-A1: Đăng ký tài khoản mới khi ALLOW_REGISTRATION=true (Expect 201 Created)
-### Lưu ý: Role luôn bị ép về USER dù client gửi role=ADMIN
-### ------------------------------------------------------------------------------
-POST {{baseUrl}}/api/auth/register
+### Register — 201 USER regardless of supplied role; valid fresh disposable username/email
+POST {{fixtureBaseUrl}}/api/auth/register
 Content-Type: application/json
 Accept: application/json
-X-Forwarded-For: {{clientIp}}
 
 {
-  "username": "newuser",
-  "password": "NewUserPassword123!",
-  "fullName": "Người Dùng Mới",
-  "email": "newuser@example.com",
+  "username": "{{fixtureNewUsername}}",
+  "password": "{{fixtureNewPassword}}",
+  "fullName": "Disposable example",
+  "email": "{{fixtureNewEmail}}",
   "role": "ADMIN"
 }
 
-### ------------------------------------------------------------------------------
-### 18. EP-A1: Đăng ký trùng tên người dùng (Expect 409 USERNAME_TAKEN)
-### ------------------------------------------------------------------------------
-POST {{baseUrl}}/api/auth/register
-Content-Type: application/json
-Accept: application/json
-X-Forwarded-For: {{clientIp}}
-
-{
-  "username": "newuser",
-  "password": "NewUserPassword123!",
-  "fullName": "Người Dùng Trùng Tên",
-  "email": "another@example.com"
-}
-
-### ------------------------------------------------------------------------------
-### 19. EP-A3: Lấy thông tin tài khoản hiện tại /api/auth/me (Expect 200 OK)
-### Không trả hash mật khẩu trong JSON
-### ------------------------------------------------------------------------------
-GET {{baseUrl}}/api/auth/me
-Authorization: Bearer {{userToken}}
-Accept: application/json
-
-### ------------------------------------------------------------------------------
-### 20. EP-A4: Đổi mật khẩu cá nhân (Expect 200 OK kèm JWT mới)
-### Cập nhật must_change_password=false và ghi audit log CHANGE_PASSWORD
-### ------------------------------------------------------------------------------
-POST {{baseUrl}}/api/auth/change-password
-Authorization: Bearer {{userToken}}
+### Register duplicate — 409 USERNAME_TAKEN (same username, distinct email)
+POST {{fixtureBaseUrl}}/api/auth/register
 Content-Type: application/json
 Accept: application/json
 
 {
-  "currentPassword": "UserPassword123!",
-  "newPassword": "NewStrongUserPassword456!"
+  "username": "{{fixtureNewUsername}}",
+  "password": "{{fixtureNewPassword}}",
+  "fullName": "Disposable duplicate",
+  "email": "{{fixtureOtherNewEmail}}"
 }
 
-### ------------------------------------------------------------------------------
-### 21. EP-A4: Đổi mật khẩu với mật khẩu hiện tại sai (Expect 400 INVALID_CREDENTIALS)
-### ------------------------------------------------------------------------------
-POST {{baseUrl}}/api/auth/change-password
-Authorization: Bearer {{userToken}}
+### Change password — 200, new JWT, mustChangePassword=false
+POST {{fixtureBaseUrl}}/api/auth/change-password
+Authorization: Bearer {{fixtureUserToken}}
 Content-Type: application/json
 Accept: application/json
 
 {
-  "currentPassword": "WrongCurrentPassword123!",
-  "newPassword": "AnotherPassword789!"
+  "currentPassword": "{{fixtureUserPassword}}",
+  "newPassword": "{{fixtureNewUserPassword}}"
 }
 
+### Wrong current password — 400 VALIDATION_ERROR
+POST {{fixtureBaseUrl}}/api/auth/change-password
+Authorization: Bearer {{fixtureUserToken}}
+Content-Type: application/json
+Accept: application/json
 
+{
+  "currentPassword": "{{fixtureWrongPassword}}",
+  "newPassword": "{{fixtureNewUserPassword}}"
+}
 
+### Owner's Gmail list — 200, no credentials
+GET {{fixtureBaseUrl}}/api/gmail-accounts
+Authorization: Bearer {{fixtureUserToken}}
+Accept: application/json
+
+### OAuth authorize — 200 URL + poll token, CREATE default
+### Do not follow real Google URL in local fixture. Use manual-http.cjs callback mode.
+GET {{fixtureBaseUrl}}/api/oauth2/authorize-url
+Authorization: Bearer {{fixtureUserToken}}
+Accept: application/json
+
+### Poll one local fixture session — 202 PENDING / 200 terminal / 410 consumed
+### Never persist or display poll token.
+GET {{fixtureBaseUrl}}/api/oauth2/link/poll?pollToken={{fixturePollToken}}
+Authorization: Bearer {{fixtureUserToken}}
+Accept: application/json
+
+### Invalid synthetic callback — 200 HTML failure, not JSON
+GET {{fixtureBaseUrl}}/api/oauth2/callback?code=mock_code&state=invalid_or_expired_state
+Accept: text/html
+
+### Incompatible media — expected 406 NOT_ACCEPTABLE in fixed source
+GET {{fixtureBaseUrl}}/api/oauth2/callback?code=mock_code&state=invalid_or_expired_state
+Accept: application/json
+
+### Change settings only on isolated fixture; snapshot original values first.
+### Disable OAuth and keep App Password enabled — 200
+PUT {{fixtureBaseUrl}}/api/admin/settings
+Authorization: Bearer {{fixtureAdminToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "settings": {
+    "ALLOW_OAUTH2_LINK": "false",
+    "ALLOW_APP_PASSWORD_LINK": "true"
+  }
+}
+
+### Now verify public config, then OAuth authorize — 403 FEATURE_DISABLED
+GET {{fixtureBaseUrl}}/api/public/config
+Accept: application/json
+
+###
+GET {{fixtureBaseUrl}}/api/oauth2/authorize-url
+Authorization: Bearer {{fixtureUserToken}}
+Accept: application/json
+
+### Restore saved fixture values (do not assume defaults on existing service)
+PUT {{fixtureBaseUrl}}/api/admin/settings
+Authorization: Bearer {{fixtureAdminToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "settings": {
+    "ALLOW_OAUTH2_LINK": "{{fixtureOriginalOAuthFlag}}",
+    "ALLOW_APP_PASSWORD_LINK": "{{fixtureOriginalAppPasswordFlag}}"
+  }
+}
+
+### Register-disabled case: set ALLOW_REGISTRATION=false using admin settings,
+### confirm public config, then send VALID fresh body (not missing body). Expect 403.
+POST {{fixtureBaseUrl}}/api/auth/register
+Content-Type: application/json
+Accept: application/json
+
+{
+  "username": "{{fixtureDisabledRegisterUsername}}",
+  "password": "{{fixtureNewPassword}}",
+  "fullName": "Disposable disabled register probe",
+  "email": "{{fixtureDisabledRegisterEmail}}"
+}
+
+### Missing link ID — 404 NOT_FOUND; never guess an existing user's mailbox ID
+DELETE {{fixtureBaseUrl}}/api/gmail-accounts/{{fixtureNonexistentGmailId}}
+Authorization: Bearer {{fixtureUserToken}}
+Accept: application/json
+
+### Restore the exact original fixture setting values and stop the harness after observations.

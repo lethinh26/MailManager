@@ -5,6 +5,7 @@ package com.mailapp.model;
  */
 public enum AccountStatus {
     ACTIVE,
-    NEEDS_REAUTH
+    NEEDS_REAUTH,
+    ERROR
 }
 

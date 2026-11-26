@@ -32,37 +32,36 @@ public final class FolderCountReader {
     public record FolderCounts(int total, int unread) {}
 
     /**
-     * @return số thư tổng / chưa đọc, trả 0 nếu máy chủ từ chối STATUS
+     * @return số thư tổng / chưa đọc; không biến lỗi kết nối thành số 0 giả.
      */
-    public static FolderCounts read(Folder folder) {
+    public static FolderCounts read(Folder folder) throws MessagingException {
         if (folder instanceof IMAPFolder imapFolder) {
             try {
                 Status status = (Status) imapFolder.doCommand(protocol ->
                         protocol.status(imapFolder.getFullName(), new String[]{"MESSAGES", "UNSEEN"}));
-                if (status != null) {
-                    return new FolderCounts(Math.max(0, status.total), Math.max(0, (int) status.unseen));
+                if (status != null && status.total >= 0 && status.unseen >= 0) {
+                    return new FolderCounts(status.total, (int) status.unseen);
                 }
             } catch (Exception e) {
-                log.debug("STATUS gộp thất bại cho {}, fallback sang API chuẩn: {}",
-                        safeName(folder), e.getMessage());
+                log.debug("STATUS gộp thất bại, fallback sang API chuẩn: {}",
+                        e.getClass().getSimpleName());
             }
         }
 
+        int total = folder.getMessageCount();
+        int unread = folder.getUnreadMessageCount();
+        if (total >= 0 && unread >= 0) return new FolderCounts(total, unread);
+        boolean openedHere = !folder.isOpen();
+        if (openedHere) folder.open(Folder.READ_ONLY);
         try {
-            return new FolderCounts(
-                    Math.max(0, folder.getMessageCount()),
-                    Math.max(0, folder.getUnreadMessageCount()));
-        } catch (MessagingException e) {
-            log.debug("Không đọc được số thư của {}: {}", safeName(folder), e.getMessage());
-            return new FolderCounts(0, 0);
-        }
-    }
-
-    private static String safeName(Folder folder) {
-        try {
-            return folder.getFullName();
-        } catch (Exception e) {
-            return "<unknown>";
+            total = folder.getMessageCount();
+            unread = folder.getUnreadMessageCount();
+            if (total < 0 || unread < 0) {
+                throw new MessagingException("IMAP folder counts unavailable");
+            }
+            return new FolderCounts(total, unread);
+        } finally {
+            if (openedHere && folder.isOpen()) folder.close(false);
         }
     }
 
@@ -103,7 +102,7 @@ public final class FolderCountReader {
                 try {
                     batchResult = futures.get(i).get();
                 } catch (Exception e) {
-                    log.debug("Đọc số thư theo lô thất bại, dùng 0: {}", e.getMessage());
+                    log.debug("Đọc số thư theo lô thất bại, dùng 0: {}", e.getClass().getSimpleName());
                     batchResult = Map.of();
                 }
                 for (T name : batches.get(i)) {

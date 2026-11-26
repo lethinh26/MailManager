@@ -112,4 +112,14 @@ class GmailFolderResolverTest {
             resolver.resolve(store, GmailFolderResolver.SpecialFolder.SPAM)
         );
     }
+
+    @Test
+    void listFailureIsNotTreatedAsMissingSpecialFolder() throws Exception {
+        when(store.getDefaultFolder()).thenReturn(defaultFolder);
+        MessagingException failure = new MessagingException("connection lost");
+        when(defaultFolder.list("*")).thenThrow(failure);
+        assertSame(failure, assertThrows(MessagingException.class,
+                () -> resolver.resolve(store, GmailFolderResolver.SpecialFolder.TRASH)));
+        verify(store, never()).getFolder(anyString());
+    }
 }

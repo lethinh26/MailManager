@@ -35,6 +35,9 @@ public class GoogleOAuthConfig {
     @Value("${google.oauth2.userinfo-url:https://www.googleapis.com/oauth2/v2/userinfo}")
     private String userinfoUrl;
 
+    @Value("${google.oauth2.profile-url:https://gmail.googleapis.com/gmail/v1/users/me/profile}")
+    private String profileUrl;
+
     @Value("${google.oauth2.revoke-url:https://oauth2.googleapis.com/revoke}")
     private String revokeUrl;
 
@@ -57,6 +60,7 @@ public class GoogleOAuthConfig {
     public String getRedirectUri() { return redirectUri; }
     public String getTokenUrl() { return tokenUrl; }
     public String getUserinfoUrl() { return userinfoUrl; }
+    public String getProfileUrl() { return profileUrl; }
     public String getRevokeUrl() { return revokeUrl; }
     public String getAuthUrl() { return authUrl; }
 

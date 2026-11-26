@@ -25,14 +25,18 @@ public class MailConnectionProperties {
     @Value("${mail.gmail.smtp.port:587}")
     private int smtpPort = 587;
 
-    @Value("${mail.gmail.connection-timeout-ms:12000}")
-    private int connectionTimeoutMs = 12000;
+    @Value("${mail.gmail.connection-timeout-ms:10000}")
+    private int connectionTimeoutMs = 10000;
 
-    @Value("${mail.gmail.timeout-ms:35000}")
-    private int timeoutMs = 35000;
+    @Value("${mail.gmail.timeout-ms:15000}")
+    private int timeoutMs = 15000;
 
-    @Value("${mail.gmail.write-timeout-ms:35000}")
-    private int writeTimeoutMs = 35000;
+    @Value("${mail.gmail.write-timeout-ms:30000}")
+    private int writeTimeoutMs = 30000;
+
+    /** Only for disposable in-process GreenMail fixtures; never enable for real credentials. */
+    @Value("${mail.gmail.local-test-transport:false}")
+    private boolean localTestTransport;
 
     @Value("${mail.gmail.retry.enabled:true}")
     private boolean retryEnabled = true;
@@ -78,6 +82,9 @@ public class MailConnectionProperties {
 
     public int getWriteTimeoutMs() { return writeTimeoutMs; }
     public void setWriteTimeoutMs(int writeTimeoutMs) { this.writeTimeoutMs = writeTimeoutMs; }
+
+    public boolean isLocalTestTransport() { return localTestTransport; }
+    public void setLocalTestTransport(boolean localTestTransport) { this.localTestTransport = localTestTransport; }
 
     public boolean isRetryEnabled() { return retryEnabled; }
     public void setRetryEnabled(boolean retryEnabled) { this.retryEnabled = retryEnabled; }

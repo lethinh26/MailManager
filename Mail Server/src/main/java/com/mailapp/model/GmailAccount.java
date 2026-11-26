@@ -19,17 +19,23 @@ public class GmailAccount {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
+    // An in-flight refresh/probe must not restore a method that another
+    // request removed or overwrite a newly linked grant via a stale save.
+    @Version
+    @Column(name = "revision", nullable = false)
+    private Long revision;
+
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "user_id", nullable = false)
     private User user;
 
-    @Column(nullable = false, length = 100)
+    @Column(nullable = false, length = 255)
     private String email;
 
-    @Column(name = "email_key", nullable = false, length = 120)
+    @Column(name = "email_key", nullable = false, length = 255)
     private String emailKey;
 
-    @Column(name = "display_name", length = 100)
+    @Column(name = "display_name", length = 255)
     private String displayName;
 
     @Column(name = "avatar_url", length = 512)
@@ -126,6 +132,26 @@ public class GmailAccount {
 
     public Long getId() { return id; }
     public void setId(Long id) { this.id = id; }
+
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    public Long getRevision() { return revision; }
+
+    /**
+     * A repository save of a detached entity merges into a different instance.
+     * Carry forward ONLY the revision returned by that save, never the revision
+     * of a separately reloaded row (which would defeat optimistic locking).
+     */
+    public void acceptOwnSave(GmailAccount saved) {
+        if (saved == this) return;
+        if (saved == null || !java.util.Objects.equals(id, saved.id)
+                || revision == null || saved.revision == null
+                || (saved.revision.longValue() != revision.longValue()
+                    && saved.revision.longValue() != revision.longValue() + 1)) {
+            throw new IllegalStateException("Invalid saved mailbox revision");
+        }
+        revision = saved.revision;
+        updatedAt = saved.updatedAt;
+    }
 
     public User getUser() { return user; }
     public void setUser(User user) { this.user = user; }

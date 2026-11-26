@@ -27,19 +27,35 @@ public interface MailService {
                                String from,
                                String since);
 
+    default MailDetailResponse getMailDetail(User currentUser,
+                                     Long gmailId,
+                                     String folder,
+                                     long uid,
+                                     boolean loadRemote,
+                                     Long expectedUidValidity) {
+        return getMailDetail(currentUser, gmailId, folder, uid, loadRemote, expectedUidValidity, true);
+    }
+
     MailDetailResponse getMailDetail(User currentUser,
                                      Long gmailId,
                                      String folder,
                                      long uid,
                                      boolean loadRemote,
-                                     Long expectedUidValidity);
+                                     Long expectedUidValidity,
+                                     boolean markSeen);
 
     record AttachmentDownloadHandle(
             String sanitizedFilename,
             String contentType,
             long estimatedSize,
-            AttachmentStreamer streamer
-    ) {}
+            AttachmentStreamer streamer,
+            Runnable cleanup
+    ) implements AutoCloseable {
+        @Override
+        public void close() {
+            cleanup.run();
+        }
+    }
 
     @FunctionalInterface
     interface AttachmentStreamer {
@@ -66,11 +82,21 @@ public interface MailService {
                                    Long expectedUidValidity,
                                    String clientIp);
 
+    default MailFlagsDto updateFlags(User currentUser,
+                             Long gmailId,
+                             String folder,
+                             long uid,
+                             UpdateFlagsRequest request,
+                             Long expectedUidValidity) {
+        return updateFlags(currentUser, gmailId, folder, uid, request, expectedUidValidity, null);
+    }
+
     MailFlagsDto updateFlags(User currentUser,
                              Long gmailId,
                              String folder,
                              long uid,
                              UpdateFlagsRequest request,
-                             Long expectedUidValidity);
+                             Long expectedUidValidity,
+                             String clientIp);
 }
 

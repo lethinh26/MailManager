@@ -9,6 +9,9 @@ import com.mailapp.client.ui.theme.AvatarUtil;
 import com.mailapp.client.ui.theme.Theme;
 import com.mailapp.client.util.ClientConfig;
 import com.mailapp.client.util.EmailNormalizer;
+import com.mailapp.client.util.SessionStore;
+import com.mailapp.client.util.ClientSafetyUtil;
+import com.mailapp.client.util.FeatureAdmission;
 
 import javax.swing.*;
 import javax.swing.border.CompoundBorder;
@@ -21,6 +24,8 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.function.Consumer;
 
 /**
  * Trình quản lý tài khoản Gmail (hỗ trợ đa phương thức đăng nhập Google OAuth2 + App Password trên cùng 1 hộp thư):
@@ -33,24 +38,37 @@ import java.util.Map;
 public class GmailManagerDialog extends JDialog {
 
     private final ApiClient apiClient;
-    private final PublicConfigDto publicConfig;
-    private final Runnable onStartOAuth2;
+    private PublicConfigDto publicConfig;
+    private final FeatureAdmission appPasswordAdmission;
+    private final Consumer<Long> onStartOAuth2;
     private final Runnable onChangedCallback;
 
     private JPanel listContainer;
     private JLabel statusLabel;
+    private JButton oauthBtn;
+    private JButton appPassBtn;
+    private JLabel disabledNotice;
     private List<GmailAccountDto> currentAccounts = List.of();
+    private Runnable updateWizardFlags;
+    private long accountsGeneration;
+    private boolean accountsReady;
+    private boolean operationPending;
+    private Runnable onSessionExpired;
+    private volatile boolean disposed;
+    private final long sessionGeneration;
 
     public record AppPasswordPrecheckResult(boolean matchedExisting, String bannerMessage, String buttonLabel) {}
 
     public GmailManagerDialog(Frame owner,
                               ApiClient apiClient,
                               PublicConfigDto publicConfig,
-                              Runnable onStartOAuth2,
+                              Consumer<Long> onStartOAuth2,
                               Runnable onChangedCallback) {
         super(owner, "Quản lý Tài khoản Gmail — " + AppIcons.BRAND_FULL, true);
         this.apiClient = apiClient;
+        this.sessionGeneration = SessionStore.getInstance().getGeneration();
         this.publicConfig = publicConfig;
+        this.appPasswordAdmission = new FeatureAdmission(publicConfig != null && publicConfig.appPasswordLinkEnabled());
         this.onStartOAuth2 = onStartOAuth2;
         this.onChangedCallback = onChangedCallback;
 
@@ -58,6 +76,7 @@ public class GmailManagerDialog extends JDialog {
         setSize(820, 580);
         setMinimumSize(new Dimension(660, 460));
         setLocationRelativeTo(owner);
+        setDefaultCloseOperation(DISPOSE_ON_CLOSE);
 
         initUI();
         refreshAccounts();
@@ -158,25 +177,19 @@ public class GmailManagerDialog extends JDialog {
         JPanel linkBtns = Theme.createWrapPanel(Theme.SP_2, Theme.SP_1);
         linkBtns.setAlignmentX(Component.LEFT_ALIGNMENT);
 
-        boolean allowOAuth = publicConfig == null || publicConfig.oauth2LinkEnabled();
-        boolean allowAppPass = publicConfig == null || publicConfig.appPasswordLinkEnabled();
-
-        if (allowOAuth) {
-            JButton oauthBtn = Theme.primaryButton("Đăng nhập Google (OAuth2)",
+        oauthBtn = Theme.primaryButton("Đăng nhập Google (OAuth2)",
                     AppIcons.vectorIcon(AppIcons.Glyph.SHIELD, 16, Color.WHITE));
-            oauthBtn.addActionListener(e -> {
-                dispose();
-                if (onStartOAuth2 != null) onStartOAuth2.run();
-            });
-            linkBtns.add(oauthBtn);
-        }
-
-        if (allowAppPass) {
-            JButton appPassBtn = Theme.successButton("Dùng App Password (3 bước)",
+        oauthBtn.addActionListener(e -> startOAuth2(null));
+        linkBtns.add(oauthBtn);
+        appPassBtn = Theme.successButton("Dùng App Password (3 bước)",
                     AppIcons.vectorIcon(AppIcons.Glyph.PLUS, 16, Color.WHITE));
-            appPassBtn.addActionListener(e -> openAppPasswordWizard(null, null, false));
-            linkBtns.add(appPassBtn);
-        }
+        appPassBtn.addActionListener(e -> openAppPasswordWizard(null, null, false));
+        linkBtns.add(appPassBtn);
+        disabledNotice = new JLabel();
+        disabledNotice.setForeground(Theme.warning());
+        disabledNotice.setFont(Theme.fontTiny());
+        disabledNotice.setAlignmentX(Component.LEFT_ALIGNMENT);
+        updateLinkButtons();
 
         JButton reloadBtn = Theme.secondaryButton("Làm mới",
                 AppIcons.vectorIcon(AppIcons.Glyph.REFRESH, 15, Theme.textPrimary()));
@@ -188,6 +201,7 @@ public class GmailManagerDialog extends JDialog {
         top.add(subtitle);
         top.add(Box.createVerticalStrut(Theme.SP_2));
         top.add(linkBtns);
+        top.add(disabledNotice);
         main.add(top, BorderLayout.NORTH);
 
         listContainer = new ScrollableListPanel();
@@ -216,7 +230,50 @@ public class GmailManagerDialog extends JDialog {
         setContentPane(outer);
     }
 
+    private boolean allowOAuth() {
+        return publicConfig != null && publicConfig.oauth2LinkEnabled();
+    }
+
+    private boolean allowAppPassword() {
+        return appPasswordAdmission.isAllowed();
+    }
+
+    private void updateLinkButtons() {
+        oauthBtn.setVisible(allowOAuth());
+        appPassBtn.setVisible(allowAppPassword());
+        oauthBtn.setEnabled(accountsReady && !operationPending);
+        appPassBtn.setEnabled(accountsReady && !operationPending);
+        disabledNotice.setText(publicConfig == null ? "Chưa tải được cấu hình liên kết."
+                : (!allowOAuth() ? "Google OAuth2 đã bị tắt. " : "")
+                + (!allowAppPassword() ? "App Password đã bị tắt." : ""));
+        disabledNotice.setVisible(!allowOAuth() || !allowAppPassword());
+    }
+
+    public void applyPublicConfig(PublicConfigDto config) {
+        if (!currentDialog()) return;
+        boolean allowed = config != null && config.appPasswordLinkEnabled();
+        if (Objects.equals(publicConfig, config) && appPasswordAdmission.isAllowed() == allowed) return;
+        publicConfig = config;
+        appPasswordAdmission.update(allowed);
+        updateLinkButtons();
+        if (updateWizardFlags != null) updateWizardFlags.run();
+        renderAccounts(currentAccounts);
+        revalidate();
+        repaint();
+    }
+
+    private void startOAuth2(Long accountId) {
+        if (!currentDialog() || !accountsReady || operationPending || !allowOAuth()) return;
+        if (accountId != null && currentAccounts.stream().noneMatch(a -> Objects.equals(a.id(), accountId))) return;
+        dispose();
+        if (onStartOAuth2 != null) onStartOAuth2.accept(accountId);
+    }
+
     private void refreshAccounts() {
+        if (!currentDialog() || operationPending) return;
+        accountsReady = false;
+        updateActionAvailability();
+        final long generation = ++accountsGeneration;
         statusLabel.setText("Đang tải danh sách tài khoản Gmail...");
         SwingWorker<List<GmailAccountDto>, Void> worker = new SwingWorker<>() {
             @Override
@@ -226,17 +283,91 @@ public class GmailManagerDialog extends JDialog {
 
             @Override
             protected void done() {
+                if (!currentDialog() || generation != accountsGeneration) return;
                 try {
                     List<GmailAccountDto> list = get();
                     currentAccounts = list != null ? list : List.of();
+                    accountsReady = true;
                     renderAccounts(currentAccounts);
                     statusLabel.setText("Đã cập nhật danh sách (" + currentAccounts.size() + " hộp thư).");
                 } catch (Exception ex) {
-                    statusLabel.setText("Lỗi tải danh sách: " + ex.getMessage());
+                    if (notifySessionExpired(ex)) return;
+                    statusLabel.setText("Lỗi tải danh sách: " + ClientSafetyUtil.toFriendlyVietnameseError(ex));
                 }
+                updateActionAvailability();
+                if (updateWizardFlags != null) updateWizardFlags.run();
             }
         };
         worker.execute();
+    }
+
+    @Override public void dispose() {
+        disposed = true;
+        accountsGeneration++;
+        super.dispose();
+    }
+
+    private boolean currentDialog() {
+        return !disposed && sessionGeneration == SessionStore.getInstance().getGeneration();
+    }
+
+    public void setOnSessionExpired(Runnable callback) {
+        onSessionExpired = callback;
+    }
+
+    private boolean notifySessionExpired(Throwable error) {
+        Throwable cause = error instanceof java.util.concurrent.ExecutionException && error.getCause() != null
+                ? error.getCause() : error;
+        if (currentDialog() && cause instanceof ApiException ae && ae.getStatusCode() == 401
+                && onSessionExpired != null) {
+            onSessionExpired.run();
+            return true;
+        }
+        return false;
+    }
+
+    private boolean canActOn(GmailAccountDto account) {
+        return currentDialog() && accountsReady && !operationPending && currentAccounts.contains(account);
+    }
+
+    private boolean beginAccountOperation(GmailAccountDto account) {
+        if (!canActOn(account)) return false;
+        operationPending = true;
+        updateActionAvailability();
+        return true;
+    }
+
+    private void updateActionAvailability() {
+        updateLinkButtons();
+        if (listContainer != null) setRowButtonsEnabled(listContainer, accountsReady && !operationPending);
+    }
+
+    private static void setRowButtonsEnabled(Container parent, boolean enabled) {
+        for (Component component : parent.getComponents()) {
+            if (component instanceof JButton button) button.setEnabled(enabled);
+            if (component instanceof Container child) setRowButtonsEnabled(child, enabled);
+        }
+    }
+
+    private void finishAccountOperation() {
+        operationPending = false;
+        if (currentDialog()) refreshAccounts();
+    }
+
+    private void requireCurrentDialog() throws InterruptedException {
+        if (!currentDialog()) throw new InterruptedException("Dialog or session no longer current.");
+    }
+
+    private void refreshAfterConflict(Throwable cause) {
+        if (currentDialog() && cause instanceof ApiException ae
+                && "GMAIL_ACCOUNT_CHANGED".equals(ae.getCode())) {
+            refreshAccounts();
+            if (onChangedCallback != null) onChangedCallback.run();
+        }
+    }
+
+    public static boolean bothMailProtocolsVerified(Map<String, Object> result) {
+        return result != null && Boolean.TRUE.equals(result.get("imapOk")) && Boolean.TRUE.equals(result.get("smtpOk"));
     }
 
     private void renderAccounts(List<GmailAccountDto> accounts) {
@@ -255,10 +386,12 @@ public class GmailManagerDialog extends JDialog {
         }
         listContainer.revalidate();
         listContainer.repaint();
+        updateActionAvailability();
     }
 
     private JPanel createAccountRow(GmailAccountDto acc) {
         boolean needsReauth = "NEEDS_REAUTH".equalsIgnoreCase(acc.status());
+        boolean failed = "ERROR".equalsIgnoreCase(acc.status());
         boolean fallbackActive = acc.isFallbackActive();
         boolean hasOAuth = acc.hasOAuth();
         boolean hasAppPass = acc.hasAppPassword();
@@ -274,9 +407,9 @@ public class GmailManagerDialog extends JDialog {
             }
         };
         card.setBackground(Theme.bgSurface());
-        Color borderColor = (fallbackActive || needsReauth) ? Theme.warning() : Theme.border();
+        Color borderColor = fallbackActive ? Theme.warning() : ((needsReauth || failed) ? Theme.danger() : Theme.border());
         card.setBorder(new CompoundBorder(
-                BorderFactory.createLineBorder(borderColor, (fallbackActive || needsReauth) ? 2 : 1),
+                BorderFactory.createLineBorder(borderColor, (fallbackActive || needsReauth || failed) ? 2 : 1),
                 new EmptyBorder(Theme.SP_3, Theme.SP_3, Theme.SP_2, Theme.SP_3)
         ));
         card.setAlignmentX(Component.LEFT_ALIGNMENT);
@@ -334,7 +467,8 @@ public class GmailManagerDialog extends JDialog {
         JLabel statusBadge = fallbackActive
                 ? Theme.badge("DỰ PHÒNG", Theme.warningSoft(), Theme.warning())
                 : (needsReauth
-                ? Theme.badge("CẦN CẤP LẠI QUYỀN", Theme.warningSoft(), Theme.warning())
+                ? Theme.badge("CẦN CẤP LẠI QUYỀN", Theme.dangerSoft(), Theme.danger())
+                : failed ? Theme.badge("LỖI KẾT NỐI", Theme.dangerSoft(), Theme.danger())
                 : Theme.badge("HOẠT ĐỘNG", Theme.successSoft(), Theme.success()));
 
         nameRow.add(googleBadge);
@@ -376,14 +510,12 @@ public class GmailManagerDialog extends JDialog {
             warnText.setFont(Theme.fontSmall().deriveFont(Font.BOLD));
             warnText.setForeground(Theme.warning());
 
-            JButton reauthBtn = Theme.primaryButton("Cấp lại quyền", null);
-            reauthBtn.addActionListener(e -> {
-                dispose();
-                if (onStartOAuth2 != null) onStartOAuth2.run();
-            });
-
             fallbackStrip.add(warnText, BorderLayout.CENTER);
-            fallbackStrip.add(reauthBtn, BorderLayout.EAST);
+            if (hasOAuth && allowOAuth()) {
+                JButton reauthBtn = Theme.primaryButton("Cấp lại quyền", null);
+                reauthBtn.addActionListener(e -> startOAuth2(acc.id()));
+                fallbackStrip.add(reauthBtn, BorderLayout.EAST);
+            }
             info.add(Box.createVerticalStrut(6));
             info.add(fallbackStrip);
         }
@@ -399,8 +531,8 @@ public class GmailManagerDialog extends JDialog {
                 new EmptyBorder(6, 0, 0, 0)
         ));
 
-        boolean allowOAuth = publicConfig == null || publicConfig.oauth2LinkEnabled();
-        boolean allowAppPass = publicConfig == null || publicConfig.appPasswordLinkEnabled();
+        boolean allowOAuth = allowOAuth();
+        boolean allowAppPass = allowAppPassword();
 
         // Nút "Thêm phương thức đăng nhập" khi hộp thư mới có 1 phương thức
         if ((!hasOAuth && allowOAuth) || (!hasAppPass && allowAppPass)) {
@@ -432,12 +564,9 @@ public class GmailManagerDialog extends JDialog {
         testBtn.addActionListener(e -> testConnection(acc, testBtn));
         actions.add(testBtn);
 
-        if (needsReauth && !fallbackActive) {
+        if (needsReauth && !fallbackActive && hasOAuth && allowOAuth) {
             JButton reauthBtn = Theme.primaryButton("Cấp lại quyền", null);
-            reauthBtn.addActionListener(e -> {
-                dispose();
-                if (onStartOAuth2 != null) onStartOAuth2.run();
-            });
+            reauthBtn.addActionListener(e -> startOAuth2(acc.id()));
             actions.add(reauthBtn);
         }
 
@@ -451,34 +580,40 @@ public class GmailManagerDialog extends JDialog {
     }
 
     private void handleAddMethod(GmailAccountDto acc) {
-        if (!acc.hasAppPassword()) {
+        if (!canActOn(acc)) return;
+        if (!acc.hasAppPassword() && allowAppPassword()) {
             openAppPasswordWizard(acc.email(), acc.displayName(), true);
-        } else if (!acc.hasOAuth()) {
-            dispose();
-            if (onStartOAuth2 != null) onStartOAuth2.run();
+        } else if (!acc.hasOAuth() && allowOAuth()) {
+            startOAuth2(acc.id());
         }
     }
 
     private void setPreferredMethod(GmailAccountDto acc, String targetMethod) {
+        if (!beginAccountOperation(acc)) return;
         statusLabel.setText("Đang đổi phương thức chính cho " + acc.email() + "...");
         SwingWorker<GmailAccountDto, Void> w = new SwingWorker<>() {
             @Override protected GmailAccountDto doInBackground() throws Exception {
+                requireCurrentDialog();
                 return apiClient.setPreferredGmailMethod(acc.id(), targetMethod);
             }
             @Override protected void done() {
+                if (!currentDialog()) return;
                 try {
                     GmailAccountDto updated = get();
                     String msg = (updated != null && updated.message() != null)
                             ? updated.message()
                             : "Đã đổi phương thức đăng nhập chính thành công.";
                     statusLabel.setText(msg);
-                    refreshAccounts();
                     if (onChangedCallback != null) onChangedCallback.run();
                 } catch (Exception ex) {
+                    if (notifySessionExpired(ex)) return;
                     Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+                    refreshAfterConflict(cause);
                     JOptionPane.showMessageDialog(GmailManagerDialog.this,
-                            "Không thể đổi phương thức chính: " + cause.getMessage(),
+                            "Không thể đổi phương thức chính: " + ClientSafetyUtil.toFriendlyVietnameseError(cause),
                             "Thông báo", JOptionPane.WARNING_MESSAGE);
+                } finally {
+                    finishAccountOperation();
                 }
             }
         };
@@ -486,6 +621,7 @@ public class GmailManagerDialog extends JDialog {
     }
 
     private void handleRemoveMethod(GmailAccountDto acc) {
+        if (!canActOn(acc)) return;
         List<String> options = new ArrayList<>();
         if (acc.hasOAuth()) options.add("Google (OAUTH2)");
         if (acc.hasAppPassword()) options.add("App Password (APP_PASSWORD)");
@@ -519,14 +655,16 @@ public class GmailManagerDialog extends JDialog {
 
         int ok = JOptionPane.showConfirmDialog(this, confirmMsg, "Xác nhận gỡ phương thức",
                 JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
-        if (ok != JOptionPane.YES_OPTION) return;
+        if (ok != JOptionPane.YES_OPTION || !beginAccountOperation(acc)) return;
 
         statusLabel.setText("Đang gỡ phương thức " + methodCode + "...");
         SwingWorker<Map<String, Object>, Void> w = new SwingWorker<>() {
             @Override protected Map<String, Object> doInBackground() throws Exception {
+                requireCurrentDialog();
                 return apiClient.removeGmailMethod(acc.id(), methodCode, isLastMethod);
             }
             @Override protected void done() {
+                if (!currentDialog()) return;
                 try {
                     Map<String, Object> res = get();
                     String msg = res != null && res.get("message") != null
@@ -535,13 +673,16 @@ public class GmailManagerDialog extends JDialog {
                     statusLabel.setText(msg);
                     JOptionPane.showMessageDialog(GmailManagerDialog.this, msg,
                             "Hoàn tất", JOptionPane.INFORMATION_MESSAGE);
-                    refreshAccounts();
-                    if (onChangedCallback != null) onChangedCallback.run();
+                    if (currentDialog() && onChangedCallback != null) onChangedCallback.run();
                 } catch (Exception ex) {
+                    if (notifySessionExpired(ex)) return;
                     Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+                    refreshAfterConflict(cause);
                     JOptionPane.showMessageDialog(GmailManagerDialog.this,
-                            "Không thể gỡ phương thức: " + cause.getMessage(),
+                            "Không thể gỡ phương thức: " + ClientSafetyUtil.toFriendlyVietnameseError(cause),
                             "Thông báo", JOptionPane.ERROR_MESSAGE);
+                } finally {
+                    finishAccountOperation();
                 }
             }
         };
@@ -558,20 +699,26 @@ public class GmailManagerDialog extends JDialog {
     }
 
     private void renameAccount(GmailAccountDto acc) {
+        if (!canActOn(acc)) return;
         String newName = JOptionPane.showInputDialog(this, "Nhập tên hiển thị mới cho " + acc.email() + ":", acc.displayName());
-        if (newName == null || newName.isBlank()) return;
+        if (newName == null || newName.isBlank() || !beginAccountOperation(acc)) return;
 
         SwingWorker<GmailAccountDto, Void> w = new SwingWorker<>() {
             @Override protected GmailAccountDto doInBackground() throws Exception {
+                requireCurrentDialog();
                 return apiClient.patchGmailDisplayName(acc.id(), newName.trim());
             }
             @Override protected void done() {
+                if (!currentDialog()) return;
                 try {
                     get();
-                    refreshAccounts();
                     if (onChangedCallback != null) onChangedCallback.run();
                 } catch (Exception ex) {
-                    JOptionPane.showMessageDialog(GmailManagerDialog.this, "Lỗi đổi tên: " + ex.getMessage(), "Lỗi", JOptionPane.ERROR_MESSAGE);
+                    if (notifySessionExpired(ex)) return;
+                    refreshAfterConflict(ex.getCause());
+                    JOptionPane.showMessageDialog(GmailManagerDialog.this, "Lỗi đổi tên: " + ClientSafetyUtil.toFriendlyVietnameseError(ex), "Lỗi", JOptionPane.ERROR_MESSAGE);
+                } finally {
+                    finishAccountOperation();
                 }
             }
         };
@@ -579,36 +726,36 @@ public class GmailManagerDialog extends JDialog {
     }
 
     private void testConnection(GmailAccountDto acc, JButton btn) {
+        if (!beginAccountOperation(acc)) return;
         btn.setEnabled(false);
         SwingWorker<Map<String, Object>, Void> w = new SwingWorker<>() {
             @Override protected Map<String, Object> doInBackground() throws Exception {
+                requireCurrentDialog();
                 return apiClient.testGmailConnection(acc.id());
             }
             @Override protected void done() {
+                if (!currentDialog()) return;
                 try {
                     Map<String, Object> res = get();
-                    btn.setEnabled(true);
                     String active = res.get("activeMethod") != null ? String.valueOf(res.get("activeMethod")) : "";
                     boolean fb = Boolean.TRUE.equals(res.get("fallbackActive"));
+                    boolean verified = bothMailProtocolsVerified(res);
                     JOptionPane.showMessageDialog(GmailManagerDialog.this,
-                            "Kết nối thành công!\n• IMAP: " + res.get("imapOk")
+                            (verified ? "Kết nối thành công!" : "Chưa xác minh thành công cả IMAP và SMTP.") + "\n• IMAP: " + res.get("imapOk")
                                     + " (INBOX: " + res.get("inboxCount") + " thư)"
                                     + "\n• SMTP: " + res.get("smtpOk")
                                     + (active.isBlank() ? "" : "\n• Phương thức đang dùng: " + methodLabel(active) + (fb ? " (dự phòng)" : ""))
                                     + "\n• Độ trễ: " + res.get("durationMs") + " ms",
-                            "Kiểm tra kết nối Gmail", JOptionPane.INFORMATION_MESSAGE);
-                    refreshAccounts();
+                            "Kiểm tra kết nối Gmail", verified ? JOptionPane.INFORMATION_MESSAGE : JOptionPane.WARNING_MESSAGE);
+                    if (currentDialog() && onChangedCallback != null) onChangedCallback.run();
                 } catch (Exception ex) {
+                    if (notifySessionExpired(ex)) return;
                     Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
-                    if (cause instanceof ApiException ae && ae.getStatusCode() == 404) {
-                        btn.setEnabled(false);
-                        btn.setToolTipText("Chỉ khả dụng trong môi trường phát triển (dev)");
-                        statusLabel.setText("Endpoint selftest chỉ khả dụng trong profile dev.");
-                    } else {
-                        btn.setEnabled(true);
-                        JOptionPane.showMessageDialog(GmailManagerDialog.this,
-                                "Kiểm tra kết nối thất bại: " + cause.getMessage(), "Lỗi", JOptionPane.ERROR_MESSAGE);
-                    }
+                    refreshAfterConflict(cause);
+                    JOptionPane.showMessageDialog(GmailManagerDialog.this,
+                            "Kiểm tra kết nối thất bại: " + ClientSafetyUtil.toFriendlyVietnameseError(cause), "Lỗi", JOptionPane.ERROR_MESSAGE);
+                } finally {
+                    finishAccountOperation();
                 }
             }
         };
@@ -616,23 +763,29 @@ public class GmailManagerDialog extends JDialog {
     }
 
     private void unlinkAccount(GmailAccountDto acc) {
+        if (!canActOn(acc)) return;
         int c = JOptionPane.showConfirmDialog(this,
                 "Bạn có chắc chắn muốn hủy liên kết tài khoản " + acc.email() + "?\n(Nếu có OAuth2, token trên Google cũng sẽ được thu hồi.)",
                 "Xác nhận hủy liên kết", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
-        if (c != JOptionPane.YES_OPTION) return;
+        if (c != JOptionPane.YES_OPTION || !beginAccountOperation(acc)) return;
 
         SwingWorker<Void, Void> w = new SwingWorker<>() {
             @Override protected Void doInBackground() throws Exception {
+                requireCurrentDialog();
                 apiClient.deleteGmailAccount(acc.id());
                 return null;
             }
             @Override protected void done() {
+                if (!currentDialog()) return;
                 try {
                     get();
-                    refreshAccounts();
                     if (onChangedCallback != null) onChangedCallback.run();
                 } catch (Exception ex) {
-                    JOptionPane.showMessageDialog(GmailManagerDialog.this, "Lỗi hủy liên kết: " + ex.getMessage(), "Lỗi", JOptionPane.ERROR_MESSAGE);
+                    if (notifySessionExpired(ex)) return;
+                    refreshAfterConflict(ex.getCause());
+                    JOptionPane.showMessageDialog(GmailManagerDialog.this, "Lỗi hủy liên kết: " + ClientSafetyUtil.toFriendlyVietnameseError(ex), "Lỗi", JOptionPane.ERROR_MESSAGE);
+                } finally {
+                    finishAccountOperation();
                 }
             }
         };
@@ -644,7 +797,9 @@ public class GmailManagerDialog extends JDialog {
      * Kiểm tra ngay email đã có theo email_key (dùng EmailNormalizer) ngay trên form trước khi gọi mạng.
      */
     private void openAppPasswordWizard(String prefillEmail, String prefillDisplayName, boolean jumpToStep2) {
+        if (!currentDialog() || !accountsReady || operationPending || !allowAppPassword()) return;
         JDialog wiz = new JDialog(this, "Liên kết Gmail bằng App Password — Hướng dẫn 3 bước", true);
+        java.util.concurrent.atomic.AtomicBoolean wizardOpen = new java.util.concurrent.atomic.AtomicBoolean(true);
         wiz.setIconImages(AppIcons.getWindowIcons());
         wiz.setSize(640, 460);
         wiz.setMinimumSize(new Dimension(560, 410));
@@ -793,6 +948,21 @@ public class GmailManagerDialog extends JDialog {
         JButton back2Btn = Theme.secondaryButton("← Bước 1", null);
         back2Btn.addActionListener(e -> cl.show(cards, "STEP1"));
         JButton verifyBtn = Theme.successButton("Kiểm tra IMAP & Liên kết →", null);
+        updateWizardFlags = () -> {
+            boolean allowed = allowAppPassword() && !operationPending && accountsReady;
+            emailField.setEnabled(allowed);
+            passField.setEnabled(allowed);
+            nameField.setEnabled(allowed);
+            verifyBtn.setEnabled(allowed);
+            next1Btn.setEnabled(allowed);
+            if (!allowed) {
+                passField.setText("");
+                step2Err.setText("Liên kết App Password đã bị tắt bởi Admin.");
+            } else if ("Liên kết App Password đã bị tắt bởi Admin.".equals(step2Err.getText())) {
+                step2Err.setText(" ");
+            }
+        };
+        updateWizardFlags.run();
 
         Runnable updatePrecheck = () -> {
             AppPasswordPrecheckResult res = evaluateAppPasswordPrecheck(emailField.getText(), currentAccounts);
@@ -822,10 +992,17 @@ public class GmailManagerDialog extends JDialog {
         updatePrecheck.run();
 
         verifyBtn.addActionListener(e -> {
+            if (!currentDialog() || !wizardOpen.get() || operationPending || !accountsReady) return;
+            if (!allowAppPassword()) {
+                verifyBtn.setEnabled(false);
+                step2Err.setText("Liên kết App Password đã bị tắt bởi Admin.");
+                return;
+            }
+            FeatureAdmission.Ticket admission = appPasswordAdmission.capture();
             String email = emailField.getText().trim();
             String disp = nameField.getText().trim();
             char[] pwChars = passField.getPassword();
-            if (email.isEmpty() || pwChars.length == 0) {
+            if (!com.mailapp.client.util.ComposeValidation.isEmail(email) || pwChars.length == 0) {
                 Arrays.fill(pwChars, '\0');
                 step2Err.setText("Vui lòng nhập đầy đủ Email và App Password.");
                 return;
@@ -834,6 +1011,9 @@ public class GmailManagerDialog extends JDialog {
             Arrays.fill(pwChars, '\0'); // Xóa mảng char[] khỏi RAM ngay sau khi sử dụng
             passField.setText("");
 
+            operationPending = true;
+            updateActionAvailability();
+            updateWizardFlags.run();
             cl.show(cards, "STEP3");
             s3Bar.setVisible(true);
             s3BackBtn.setEnabled(false);
@@ -842,21 +1022,47 @@ public class GmailManagerDialog extends JDialog {
 
             SwingWorker<GmailAccountDto, Void> w = new SwingWorker<>() {
                 @Override protected GmailAccountDto doInBackground() throws Exception {
+                    requireCurrentDialog();
+                    if (!wizardOpen.get()) throw new InterruptedException("Wizard closed");
+                    PublicConfigDto latest = apiClient.getPublicConfig();
+                    requireCurrentDialog();
+                    if (!wizardOpen.get()) throw new InterruptedException("Wizard closed");
+                    requireAppPasswordAdmission(admission);
+                    if (latest == null) {
+                        throw new ApiException(503, "CONFIG_UNAVAILABLE", "Chưa tải được cấu hình liên kết Gmail.");
+                    }
+                    if (!latest.appPasswordLinkEnabled()) {
+                        throw new ApiException(403, "FEATURE_DISABLED", "Liên kết App Password đã bị tắt bởi Admin.");
+                    }
+                    requireCurrentDialog();
+                    if (!wizardOpen.get()) throw new InterruptedException("Wizard closed");
+                    requireAppPasswordAdmission(admission);
                     return apiClient.linkGmailWithAppPassword(email, appPass, disp);
                 }
                 @Override protected void done() {
-                    s3Bar.setVisible(false);
+                    if (!currentDialog()) return;
                     try {
                         GmailAccountDto linked = get();
-                        s3Log.setText(formatLinkOutcomeMessage(linked));
-                        s3DoneBtn.setEnabled(true);
-                        refreshAccounts();
+                        if (wizardOpen.get() && wiz.isDisplayable()) {
+                            s3Bar.setVisible(false);
+                            s3Log.setText(formatLinkOutcomeMessage(linked));
+                            s3DoneBtn.setEnabled(true);
+                        }
                         if (onChangedCallback != null) onChangedCallback.run();
                     } catch (Exception ex) {
+                        if (notifySessionExpired(ex) || !wizardOpen.get() || !wiz.isDisplayable()) return;
+                        s3Bar.setVisible(false);
                         s3BackBtn.setEnabled(true);
                         Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
-                        String detail = cause.getMessage();
+                        String detail = ClientSafetyUtil.toFriendlyVietnameseError(cause);
                         if (cause instanceof ApiException ae) {
+                            if (appPasswordAdmission.isCurrent(admission)
+                                    && ("FEATURE_DISABLED".equalsIgnoreCase(ae.getCode())
+                                    || "CONFIG_UNAVAILABLE".equalsIgnoreCase(ae.getCode()))) {
+                                appPasswordAdmission.update(false);
+                                updateLinkButtons();
+                                renderAccounts(currentAccounts);
+                            }
                             detail = switch (ae.getCode()) {
                                 case "GMAIL_AUTH_FAILED" -> "✗ SAI MẬT KHẨU HOẶC EMAIL:\n" + ae.getMessage();
                                 case "IMAP_DISABLED" -> "✗ IMAP CHƯA ĐƯỢC BẬT TRÊN GMAIL:\n" + ae.getMessage();
@@ -865,6 +1071,9 @@ public class GmailManagerDialog extends JDialog {
                             };
                         }
                         s3Log.setText(detail);
+                    } finally {
+                        finishAccountOperation();
+                        if (currentDialog() && updateWizardFlags != null) updateWizardFlags.run();
                     }
                 }
             };
@@ -886,11 +1095,25 @@ public class GmailManagerDialog extends JDialog {
         if (jumpToStep2) {
             cl.show(cards, "STEP2");
         }
-        wiz.setVisible(true);
+        try {
+            wiz.setVisible(true);
+        } finally {
+            wizardOpen.set(false);
+            updateWizardFlags = null;
+            passField.setText("");
+            wiz.dispose();
+        }
     }
 
     private String shortTime(String iso) {
         if (iso == null || iso.isBlank()) return "Chưa có";
         return iso.length() > 19 ? iso.substring(0, 19).replace('T', ' ') : iso.replace('T', ' ');
+    }
+
+    private void requireAppPasswordAdmission(FeatureAdmission.Ticket admission) {
+        if (!appPasswordAdmission.isCurrent(admission)) {
+            throw new ApiException(400, "FORM_INVALIDATED",
+                    "Cấu hình liên kết đã thay đổi. Vui lòng quay lại và nhập App Password mới.");
+        }
     }
 }

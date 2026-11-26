@@ -23,7 +23,7 @@ import java.util.UUID;
 /**
  * Cung cấp tiện ích sinh, phân tích và kiểm tra tính hợp lệ của JWT Access Token.
  * Sử dụng thuật toán HS256 với khóa bí mật >= 256 bits từ biến môi trường JWT_SECRET.
- * Claims gồm: sub (userId), username, role, jti, iat, exp.
+ * Claims gồm: sub (username), uid (stable user ID), username, role, jti, iat, exp.
  *
  * Quy tắc bảo mật:
  * 1. Khóa bí mật không bao giờ dùng hằng số cố định.
@@ -41,14 +41,14 @@ public class JwtProvider {
     private final long expirationMs;
 
     public JwtProvider(
-            @Value("${mailapp.jwt.secret:${JWT_SECRET:}}") String secret,
+            @Value("${mailapp.jwt.secret:${MAILAPP_JWT_SECRET:${JWT_SECRET:}}}") String secret,
             @Value("${mailapp.jwt.expiration-ms:86400000}") long expirationMs) {
         this(secret, expirationMs, null);
     }
 
     @Autowired
     public JwtProvider(
-            @Value("${mailapp.jwt.secret:${JWT_SECRET:}}") String secret,
+            @Value("${mailapp.jwt.secret:${MAILAPP_JWT_SECRET:${JWT_SECRET:}}}") String secret,
             @Value("${mailapp.jwt.expiration-ms:86400000}") long expirationMs,
             @Nullable Environment env) {
 
@@ -85,7 +85,9 @@ public class JwtProvider {
         String jti = UUID.randomUUID().toString();
 
         return Jwts.builder()
-                .subject(String.valueOf(user.getId()))
+                .subject(user.getUsername())
+                .claim("uid", user.getId())
+                .claim("identityVersion", 2)
                 .claim("username", user.getUsername())
                 .claim("role", user.getRole().name())
                 .id(jti)
@@ -99,11 +101,14 @@ public class JwtProvider {
      * Phân tích Claims từ token. Ném exception nếu token không hợp lệ hoặc hết hạn.
      */
     public Claims parseClaims(String token) {
-        return Jwts.parser()
+        var jwt = Jwts.parser()
                 .verifyWith(signingKey)
                 .build()
-                .parseSignedClaims(token)
-                .getPayload();
+                .parseSignedClaims(token);
+        if (!"HS256".equals(jwt.getHeader().getAlgorithm()) || jwt.getPayload().getExpiration() == null) {
+            throw new IllegalArgumentException("Invalid JWT algorithm or expiration");
+        }
+        return jwt.getPayload();
     }
 
     /**
@@ -111,16 +116,47 @@ public class JwtProvider {
      */
     public boolean validateToken(String token) {
         try {
-            parseClaims(token);
+            resolveUserId(parseClaims(token));
             return true;
         } catch (Exception e) {
-            log.debug("JWT token không hợp lệ hoặc đã hết hạn: {}", e.getMessage());
+            log.debug("JWT token không hợp lệ hoặc đã hết hạn: {}", e.getClass().getSimpleName());
             return false;
         }
     }
 
     public Long getUserId(String token) {
-        return Long.parseLong(parseClaims(token).getSubject());
+        return resolveUserId(parseClaims(token));
+    }
+
+    public Long resolveUserId(Claims claims) {
+        Object version = claims.get("identityVersion");
+        String subject = claims.getSubject();
+        Object rawUid = claims.get("uid");
+        Long uid = rawUid == null ? null : positiveId(rawUid);
+        if (version == null) {
+            // Previously issued tokens had the numeric user ID as subject.
+            long legacyId = positiveId(subject);
+            if (uid != null && uid != legacyId) {
+                throw new IllegalArgumentException("Conflicting JWT user identifiers");
+            }
+            return legacyId;
+        }
+        if (!(version instanceof Integer || version instanceof Long)
+                || ((Number) version).longValue() != 2L || uid == null
+                || !(rawUid instanceof Integer || rawUid instanceof Long)
+                || subject == null || subject.isBlank()
+                || !subject.equals(claims.get("username"))) {
+            throw new IllegalArgumentException("Invalid JWT identity claims");
+        }
+        return uid;
+    }
+
+    private static long positiveId(Object value) {
+        if (!(value instanceof String || value instanceof Integer || value instanceof Long)
+                || !value.toString().matches("[1-9][0-9]*")) {
+            throw new IllegalArgumentException("Invalid JWT user ID");
+        }
+        return Long.parseLong(value.toString());
     }
 
     public String getUsername(String token) {

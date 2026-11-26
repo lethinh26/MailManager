@@ -93,8 +93,11 @@ public class AdminController {
     public ResponseEntity<AdminResetPasswordResponse> resetPassword(
             @AuthenticationPrincipal User adminActor,
             @PathVariable Long id,
+            @Valid @RequestBody(required = false) AdminResetPasswordRequest request,
             HttpServletRequest httpRequest) {
-        AdminResetPasswordResponse res = adminService.resetPassword(adminActor, id, extractIp(httpRequest));
+        AdminResetPasswordResponse res = request == null
+                ? adminService.resetPassword(adminActor, id, extractIp(httpRequest))
+                : adminService.resetPassword(adminActor, id, request.newPassword(), extractIp(httpRequest));
         return ResponseEntity.ok()
                 .cacheControl(CacheControl.noStore())
                 .body(res);

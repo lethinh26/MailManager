@@ -1,6 +1,8 @@
 services:
   mysql:
     image: mysql:8.0
+    # New databases/tables inherit these defaults. Existing volumes are not rewritten.
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
     container_name: mailapp-mysql
     restart: always
     environment:
@@ -53,6 +55,7 @@ services:
       - "${SERVER_PORT:-8443}:8443"
     volumes:
       - ./certs:/app/certs
+      - mail_audit_receipts:/app/data/mail-audit-receipts
     healthcheck:
       test: ["CMD-SHELL", "curl -k -f https://localhost:8443/actuator/health || exit 1"]
       interval: 15s
@@ -64,6 +67,7 @@ services:
 
 volumes:
   mysql_data:
+  mail_audit_receipts:
 
 networks:
   mailapp-net:

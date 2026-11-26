@@ -6,6 +6,7 @@ import com.mailapp.dto.RegisterRequest;
 import com.mailapp.model.Role;
 import com.mailapp.model.User;
 import com.mailapp.repository.UserRepository;
+import com.mailapp.repository.AuditLogRepository;
 import com.mailapp.security.JwtProvider;
 import com.mailapp.service.SystemSettingService;
 import org.junit.jupiter.api.BeforeEach;
@@ -39,6 +40,9 @@ class AuthRegisterAndChangePasswordTest {
     private UserRepository userRepository;
 
     @Autowired
+    private AuditLogRepository auditLogRepository;
+
+    @Autowired
     private PasswordEncoder passwordEncoder;
 
     @Autowired
@@ -46,6 +50,35 @@ class AuthRegisterAndChangePasswordTest {
 
     @Autowired
     private SystemSettingService systemSettingService;
+
+    @Test
+    void rejectedLoginAuditPersistsAndRateLimitTracksSettings() throws Exception {
+        String name = "rate_" + java.util.UUID.randomUUID().toString().replace("-", "");
+        String body = objectMapper.writeValueAsString(java.util.Map.of("username", name, "password", "WrongPassword123"));
+        long previous = auditLogRepository.findByActionOrderByCreatedAtDesc("LOGIN_FAILED").stream()
+                .filter(l -> "UNKNOWN_USER".equals(l.getDetail())).count();
+        systemSettingService.updateSetting("LOGIN_MAX_FAILED_ATTEMPTS", "3");
+        try {
+            for (int i = 0; i < 3; i++) {
+                mockMvc.perform(post("/api/auth/login").contentType(MediaType.APPLICATION_JSON).content(body))
+                        .andExpect(status().isUnauthorized())
+                        .andExpect(jsonPath("$.code").value("UNAUTHORIZED"));
+            }
+            assertEquals(previous + 3, auditLogRepository.findByActionOrderByCreatedAtDesc("LOGIN_FAILED").stream()
+                    .filter(l -> "UNKNOWN_USER".equals(l.getDetail())).count());
+            assertTrue(auditLogRepository.findByActionOrderByCreatedAtDesc("LOGIN_FAILED").stream()
+                    .noneMatch(l -> l.getDetail() != null && l.getDetail().contains(name)),
+                    "Untrusted submitted identity must not be persisted in audit detail");
+            mockMvc.perform(post("/api/auth/login").contentType(MediaType.APPLICATION_JSON).content(body))
+                    .andExpect(status().isTooManyRequests())
+                    .andExpect(jsonPath("$.code").value("TOO_MANY_ATTEMPTS"));
+            systemSettingService.updateSetting("LOGIN_MAX_FAILED_ATTEMPTS", "5");
+            mockMvc.perform(post("/api/auth/login").contentType(MediaType.APPLICATION_JSON).content(body))
+                    .andExpect(status().isUnauthorized());
+        } finally {
+            systemSettingService.updateSetting("LOGIN_MAX_FAILED_ATTEMPTS", "5");
+        }
+    }
 
     @BeforeEach
     void setUp() {
@@ -69,7 +102,7 @@ class AuthRegisterAndChangePasswordTest {
     @Test
     @DisplayName("EP-A1: Đăng ký tài khoản thành công trả về 201 Created và UserDto")
     void testRegisterSuccess() throws Exception {
-        String username = "newuser_" + System.currentTimeMillis();
+        String username = "newuser_" + java.util.UUID.randomUUID().toString().replace("-", "") + "x".repeat(24);
         RegisterRequest request = new RegisterRequest(
                 username,
                 username + "@test.com",
@@ -84,7 +117,8 @@ class AuthRegisterAndChangePasswordTest {
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.username").value(username))
                 .andExpect(jsonPath("$.role").value("USER"))
-                .andExpect(jsonPath("$.mustChangePassword").value(false));
+                .andExpect(jsonPath("$.mustChangePassword").value(false))
+                .andExpect(jsonPath("$.createdAt").exists());
 
         assertTrue(userRepository.findByUsername(username).isPresent());
     }
@@ -115,7 +149,7 @@ class AuthRegisterAndChangePasswordTest {
     @DisplayName("EP-A1: Đăng ký thất bại với 409 USERNAME_TAKEN khi username đã tồn tại")
     void testRegisterUsernameDuplicate() throws Exception {
         RegisterRequest request = new RegisterRequest(
-                "auth_fixture_user",
+                "AUTH_FIXTURE_USER",
                 "duplicate@test.com",
                 "StrongPass123!",
                 "Duplicate User",
@@ -160,6 +194,7 @@ class AuthRegisterAndChangePasswordTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.username").value("auth_fixture_user"))
                 .andExpect(jsonPath("$.role").value("USER"))
+                .andExpect(jsonPath("$.createdAt").exists())
                 .andExpect(jsonPath("$.password").doesNotExist())
                 .andExpect(jsonPath("$.passwordHash").doesNotExist());
     }
@@ -215,7 +250,36 @@ class AuthRegisterAndChangePasswordTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.code").value("INVALID_CREDENTIALS"));
+                .andExpect(jsonPath("$.code").value("VALIDATION_ERROR"));
+    }
+
+    @Test
+    void utf8BcryptLimitAppliesToRegisterLoginAndChangePassword() throws Exception {
+        String username = "unicode_" + java.util.UUID.randomUUID().toString().replace("-", "");
+        String password = "Aa12" + "\u00e9".repeat(34); // exactly 72 UTF-8 bytes
+        String oversized = password + "x";
+        RegisterRequest bad = new RegisterRequest(username, username + "@test.com", oversized, "Unicode User", null);
+        mockMvc.perform(post("/api/auth/register").contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(bad)))
+                .andExpect(status().isBadRequest()).andExpect(jsonPath("$.code").value("VALIDATION_ERROR"));
+        assertFalse(userRepository.findByUsername(username).isPresent());
+        RegisterRequest valid = new RegisterRequest(username, username + "@test.com", password, "Unicode User", null);
+        mockMvc.perform(post("/api/auth/register").contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(valid)))
+                .andExpect(status().isCreated());
+        mockMvc.perform(post("/api/auth/login").contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(new com.mailapp.dto.LoginRequest(username, oversized))))
+                .andExpect(status().isUnauthorized()).andExpect(jsonPath("$.code").value("UNAUTHORIZED"));
+        mockMvc.perform(post("/api/auth/login").contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(new com.mailapp.dto.LoginRequest(username, password))))
+                .andExpect(status().isOk());
+        User user = userRepository.findByUsername(username).orElseThrow();
+        String token = jwtProvider.generateToken(user);
+        mockMvc.perform(post("/api/auth/change-password").header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(new ChangePasswordRequest(password, oversized))))
+                .andExpect(status().isBadRequest()).andExpect(jsonPath("$.code").value("VALIDATION_ERROR"));
+        assertTrue(passwordEncoder.matches(password, userRepository.findById(user.getId()).orElseThrow().getPasswordHash()));
     }
 
     @Test
@@ -258,6 +322,7 @@ class AuthRegisterAndChangePasswordTest {
                 .andExpect(jsonPath("$.maintenanceMode").isBoolean())
                 .andExpect(jsonPath("$.maxGmailPerUser").value(5))
                 .andExpect(jsonPath("$.maxAttachmentSizeMb").value(25))
+                .andExpect(jsonPath("$.mailPageSize").isNumber())
                 .andExpect(jsonPath("$.secret").doesNotExist())
                 .andExpect(jsonPath("$.jwtSecret").doesNotExist());
     }

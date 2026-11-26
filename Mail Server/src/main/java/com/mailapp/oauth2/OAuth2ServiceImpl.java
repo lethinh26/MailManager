@@ -8,16 +8,21 @@ import com.mailapp.dto.GmailAccountResponse.LinkOutcome;
 import com.mailapp.dto.LoginResponse;
 import com.mailapp.dto.UserDto;
 import com.mailapp.exception.AppException;
+import com.mailapp.exception.GmailAccountChangedException;
 import com.mailapp.exception.ReauthRequiredException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mailapp.mail.model.MailCredentials;
 import com.mailapp.model.AccountStatus;
 import com.mailapp.model.AuthType;
 import com.mailapp.model.GmailAccount;
+import com.mailapp.model.LinkIntent;
 import com.mailapp.model.Role;
 import com.mailapp.model.User;
 import com.mailapp.oauth2.dto.GoogleTokenResponse;
+import com.mailapp.oauth2.dto.GoogleGmailProfile;
 import com.mailapp.oauth2.dto.GoogleUserInfo;
 import com.mailapp.repository.GmailAccountRepository;
+import com.mailapp.repository.GmailAccountSnapshot;
 import com.mailapp.repository.UserRepository;
 import com.mailapp.security.AesCipher;
 import com.mailapp.security.JwtProvider;
@@ -32,7 +37,6 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.client.RestClient;
@@ -42,8 +46,8 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.LocalDateTime;
+import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Triển khai các nghiệp vụ liên quan đến Google OAuth2 và XOAUTH2.
@@ -60,7 +64,16 @@ public class OAuth2ServiceImpl implements OAuth2Service {
     private static final String GMAIL_SCOPES = "https://mail.google.com/ openid email profile";
     private static final int MAX_AVATAR_BYTES = 512 * 1024; // 512 KB
 
-    public record CachedToken(String token, Instant expiresAt) {}
+    // Cache entries belong to the exact linked grant, not just the row ID.
+    // A null token is a rejected-grant marker for concurrent stale snapshots.
+    private record CachedToken(String token, Instant expiresAt, String encryptedGrant, Long ownerId) {
+        boolean matches(GmailAccount account) {
+            return Objects.equals(encryptedGrant, account.getRefreshTokenEncrypted())
+                    && Objects.equals(ownerId, account.getUser() == null ? null : account.getUser().getId());
+        }
+        @Override public String toString() { return "CachedToken[redacted]"; }
+    }
+    private static final ObjectMapper ERROR_JSON = new ObjectMapper();
 
     private final GoogleOAuthConfig oAuthConfig;
     private final OAuth2StateStore stateStore;
@@ -86,7 +99,10 @@ public class OAuth2ServiceImpl implements OAuth2Service {
             .build();
 
     // Khóa đồng bộ theo từng ID tài khoản Gmail để tránh 2 request cùng refresh một lúc
-    private final ConcurrentHashMap<Long, Object> accountLocks = new ConcurrentHashMap<>();
+    private final Object[] accountLocks = new Object[256];
+    {
+        java.util.Arrays.setAll(accountLocks, ignored -> new Object());
+    }
 
     public OAuth2ServiceImpl(GoogleOAuthConfig oAuthConfig,
                              OAuth2StateStore stateStore,
@@ -148,17 +164,28 @@ public class OAuth2ServiceImpl implements OAuth2Service {
 
     @Override
     public AuthorizeUrlResponse getAuthorizeUrl(Long userId, Long existingAccountId) {
-        oAuthConfig.validateConfig();
+        return getAuthorizeUrl(userId, existingAccountId,
+                existingAccountId == null ? LinkIntent.CREATE : LinkIntent.UPSERT);
+    }
 
+    @Override
+    public AuthorizeUrlResponse getAuthorizeUrl(Long userId, Long existingAccountId, LinkIntent intent) {
+        if (existingAccountId != null && intent == LinkIntent.CREATE) {
+            throw new AppException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "CREATE không nhận accountId.");
+        }
         if (!systemSettingService.isOAuth2LinkEnabled()) {
             throw new AppException(HttpStatus.FORBIDDEN, "FEATURE_DISABLED",
                     "Tính năng liên kết Gmail bằng OAuth2 hiện đang bị tạm tắt bởi quản trị viên.");
         }
+        oAuthConfig.validateConfig();
 
         // Chỉ kiểm tra giới hạn MAX_GMAIL_PER_USER nếu không phải đang thêm/cấp lại quyền cho hộp thư đã tồn tại của user
         boolean forExisting = existingAccountId != null
                 && gmailAccountRepository.findByIdAndUserId(existingAccountId, userId).isPresent();
-        if (!forExisting) {
+        if (existingAccountId != null && !forExisting) {
+            throw new AppException(HttpStatus.NOT_FOUND, "ACCOUNT_NOT_FOUND", "Không tìm thấy tài khoản Gmail.");
+        }
+        if (!forExisting && intent != LinkIntent.UPSERT) {
             int maxGmail = systemSettingService.getMaxGmailPerUser();
             if (maxGmail > 0 && gmailAccountRepository.countByUserId(userId) >= maxGmail) {
                 throw new AppException(HttpStatus.CONFLICT, "GMAIL_LIMIT_REACHED",
@@ -170,8 +197,8 @@ public class OAuth2ServiceImpl implements OAuth2Service {
         String codeVerifier = PkceUtil.generateCodeVerifier();
         String codeChallenge = PkceUtil.generateCodeChallenge(codeVerifier);
 
-        // Sinh state ngẫu nhiên và lưu ánh xạ tới userId và codeVerifier trong Caffeine (TTL 10 phút)
-        String state = stateStore.generateState(userId, codeVerifier);
+        // Sinh state ngẫu nhiên và lưu ánh xạ tới userId và codeVerifier trong Caffeine (TTL 5 phút)
+        OAuth2StateStore.LinkStatePair pair = stateStore.generateLinkState(userId, codeVerifier, existingAccountId, intent);
 
         String encodedRedirectUri = URLEncoder.encode(oAuthConfig.getRedirectUri(), StandardCharsets.UTF_8);
         String encodedScope = URLEncoder.encode(GMAIL_SCOPES, StandardCharsets.UTF_8);
@@ -182,22 +209,32 @@ public class OAuth2ServiceImpl implements OAuth2Service {
                 oAuthConfig.getClientId(),
                 encodedRedirectUri,
                 encodedScope,
-                state,
+                pair.state(),
                 codeChallenge
         );
 
         log.info("Đã tạo Google OAuth2 authorize URL cho userId={} (PKCE S256)", userId);
-        return new AuthorizeUrlResponse(authorizeUrl);
+        return new AuthorizeUrlResponse(authorizeUrl, pair.pollToken());
+    }
+
+    @Override
+    public LinkPollResponse pollLink(String pollToken, Long userId) {
+        OAuth2StateStore.LinkPollEntry entry = stateStore.pollLinkSession(pollToken, userId)
+                .orElseThrow(() -> new AppException(HttpStatus.GONE, "LINK_SESSION_EXPIRED",
+                        "Phiên liên kết Gmail đã hết hạn hoặc đã được sử dụng."));
+        if (!java.util.Objects.equals(entry.userId(), userId)) {
+            throw new AppException(HttpStatus.NOT_FOUND, "LINK_SESSION_NOT_FOUND", "Không tìm thấy phiên liên kết.");
+        }
+        return new LinkPollResponse(entry.status().name(), entry.accountId(), entry.outcome(), entry.code(), entry.message());
     }
 
     @Override
     public GoogleLoginStartResponse startGoogleLogin() {
-        oAuthConfig.validateConfig();
-
         if (!systemSettingService.isOAuth2LinkEnabled()) {
             throw new AppException(HttpStatus.FORBIDDEN, "FEATURE_DISABLED",
                     "Tính năng đăng nhập bằng Google OAuth2 hiện đang bị tạm tắt bởi quản trị viên.");
         }
+        oAuthConfig.validateConfig();
 
         String codeVerifier = PkceUtil.generateCodeVerifier();
         String codeChallenge = PkceUtil.generateCodeChallenge(codeVerifier);
@@ -240,20 +277,14 @@ public class OAuth2ServiceImpl implements OAuth2Service {
     }
 
     @Override
-    @Transactional
     public String handleCallback(String code, String state, String error, String errorDescription) {
         if (error != null && !error.isBlank()) {
-            log.warn("Google OAuth2 callback trả về lỗi: error={}, desc={}", error, errorDescription);
-            String desc = (errorDescription != null && !errorDescription.isBlank()) ? errorDescription : error;
+            log.warn("Google OAuth2 callback bị từ chối hoặc trả lỗi.");
+            String message = "Bạn đã hủy hoặc từ chối cấp quyền truy cập tài khoản Google.";
             if (state != null && !state.isBlank()) {
-                stateStore.validateAndConsumeState(state).ifPresent(se -> {
-                    if (se.flowType() == OAuth2StateStore.FlowType.GOOGLE_LOGIN) {
-                        stateStore.completeGoogleLoginFailure(se.pollToken(), "OAUTH2_DENIED",
-                                "Bạn đã hủy hoặc từ chối đăng nhập Google (" + desc + ").");
-                    }
-                });
+                stateStore.validateAndConsumeState(state).ifPresent(se -> completeCallbackFailure(se, "OAUTH2_DENIED", message));
             }
-            return renderHtmlResult(false, null, "Bạn đã hủy hoặc từ chối cấp quyền truy cập tài khoản Google (" + desc + ").");
+            return renderHtmlResult(false, null, message);
         }
 
         if (state == null || state.isBlank()) {
@@ -272,9 +303,13 @@ public class OAuth2ServiceImpl implements OAuth2Service {
         Long userId = entry.userId();
         String codeVerifier = entry.codeVerifier();
 
+        if (!systemSettingService.isOAuth2LinkEnabled()) {
+            String message = "Tính năng Google OAuth2 hiện đang bị tắt.";
+            return callbackFailure(entry, "FEATURE_DISABLED", null, message);
+        }
+
         if (code == null || code.isBlank()) {
-            if (isGoogleLogin) stateStore.completeGoogleLoginFailure(pollToken, "MISSING_CODE", "Không nhận được mã ủy quyền từ Google.");
-            return renderHtmlResult(false, null, "Không nhận được mã ủy quyền (code) từ Google.");
+            return callbackFailure(entry, "MISSING_CODE", null, "Không nhận được mã ủy quyền (code) từ Google.");
         }
 
         GoogleTokenResponse tokenResponse;
@@ -294,25 +329,23 @@ public class OAuth2ServiceImpl implements OAuth2Service {
                     .retrieve()
                     .body(GoogleTokenResponse.class);
         } catch (Exception e) {
-            log.error("Lỗi khi đổi code lấy token từ Google OAuth2: {}", e.getMessage());
-            if (isGoogleLogin) stateStore.completeGoogleLoginFailure(pollToken, "GOOGLE_TOKEN_ERROR", "Không thể kết nối máy chủ Google để đổi mã truy cập.");
-            return renderHtmlResult(false, null, "Không thể kết nối đến máy chủ Google để đổi mã truy cập. Vui lòng thử lại.");
+            log.error("Lỗi khi đổi code lấy token từ Google OAuth2: {}", e.getClass().getSimpleName());
+            return callbackFailure(entry, "GOOGLE_TOKEN_ERROR", null, "Không thể kết nối đến máy chủ Google để đổi mã truy cập. Vui lòng thử lại.");
         }
 
-        if (tokenResponse == null || tokenResponse.accessToken() == null) {
-            if (isGoogleLogin) stateStore.completeGoogleLoginFailure(pollToken, "GOOGLE_TOKEN_ERROR", "Không nhận được access token từ Google.");
-            return renderHtmlResult(false, null, "Không nhận được access token từ máy chủ Google.");
+        if (tokenResponse == null || tokenResponse.accessToken() == null || tokenResponse.accessToken().isBlank()
+                || (tokenResponse.expiresIn() != null && tokenResponse.expiresIn() <= 0)
+                || (tokenResponse.tokenType() != null && !"Bearer".equalsIgnoreCase(tokenResponse.tokenType()))) {
+            return callbackFailure(entry, "GOOGLE_TOKEN_ERROR", null, "Không nhận được access token từ máy chủ Google.");
         }
 
         // Kiểm tra granular consent: người dùng có thể bỏ tick quyền truy cập Gmail trên màn hình Google
         if (!hasRequiredGmailScope(tokenResponse.scope())) {
-            log.warn("OAuth2 callback thiếu quyền Gmail (https://mail.google.com/) cho userId={}. Scope nhận được: {}",
-                    userId, tokenResponse.scope());
+            log.warn("OAuth2 callback thiếu quyền Gmail (https://mail.google.com/) cho userId={}", userId);
             auditLogService.log(userId, "LINK_GMAIL_DENIED_SCOPE",
-                    "Người dùng chưa cấp quyền truy cập Gmail (thiếu scope https://mail.google.com/)", null);
+                    "Người dùng chưa cấp quyền truy cập Gmail (thiếu scope https://mail.google.com/)", (String) null);
             String msg = "Bạn chưa cấp quyền truy cập Gmail, hãy bấm Liên kết lại và giữ nguyên các ô quyền.";
-            if (isGoogleLogin) stateStore.completeGoogleLoginFailure(pollToken, "MISSING_GMAIL_SCOPE", msg);
-            return renderHtmlResult(false, null, msg);
+            return callbackFailure(entry, "MISSING_GMAIL_SCOPE", null, msg);
         }
 
         GoogleUserInfo userInfo;
@@ -323,55 +356,92 @@ public class OAuth2ServiceImpl implements OAuth2Service {
                     .retrieve()
                     .body(GoogleUserInfo.class);
         } catch (Exception e) {
-            log.error("Lỗi khi lấy thông tin người dùng từ Google UserInfo: {}", e.getMessage());
-            if (isGoogleLogin) stateStore.completeGoogleLoginFailure(pollToken, "GOOGLE_USERINFO_ERROR", "Không thể đọc thông tin tài khoản Google.");
-            return renderHtmlResult(false, null, "Không thể xác định địa chỉ email của tài khoản Google vừa ủy quyền.");
+            log.error("Lỗi khi lấy thông tin người dùng từ Google UserInfo: {}", e.getClass().getSimpleName());
+            return callbackFailure(entry, "GOOGLE_USERINFO_ERROR", null, "Không thể xác định địa chỉ email của tài khoản Google vừa ủy quyền.");
         }
 
         if (userInfo == null || userInfo.email() == null || userInfo.email().isBlank()) {
-            if (isGoogleLogin) stateStore.completeGoogleLoginFailure(pollToken, "GOOGLE_USERINFO_ERROR", "Không thể đọc email từ Google.");
-            return renderHtmlResult(false, null, "Không thể đọc thông tin email từ Google.");
+            return callbackFailure(entry, "GOOGLE_USERINFO_ERROR", null, "Không thể đọc thông tin email từ Google.");
         }
 
         if (!userInfo.isEmailVerified()) {
             String msg = "Địa chỉ email Google chưa được xác thực (email_verified=false).";
-            if (isGoogleLogin) stateStore.completeGoogleLoginFailure(pollToken, "EMAIL_NOT_VERIFIED", msg);
-            return renderHtmlResult(false, userInfo.email(), msg);
+            return callbackFailure(entry, "EMAIL_NOT_VERIFIED", userInfo.email(), msg);
         }
 
-        String email = userInfo.email().toLowerCase().trim();
+        String email = userInfo.email().toLowerCase(java.util.Locale.ROOT).trim();
+        // The OIDC identity and the Gmail mailbox must both belong to this same
+        // access token. Do not infer mailbox identity from a display address.
+        GoogleGmailProfile profile;
+        try {
+            profile = restClient.get()
+                    .uri(oAuthConfig.getProfileUrl())
+                    .header("Authorization", "Bearer " + tokenResponse.accessToken())
+                    .retrieve()
+                    .body(GoogleGmailProfile.class);
+        } catch (Exception e) {
+            log.warn("Không thể đọc Gmail profile: {}", e.getClass().getSimpleName());
+            return callbackFailure(entry, "GOOGLE_PROFILE_ERROR", null,
+                    "Không thể xác định hộp thư Gmail bằng quyền vừa được cấp. Vui lòng thử lại.");
+        }
+        if (profile == null || profile.emailAddress() == null || profile.emailAddress().isBlank()) {
+            return callbackFailure(entry, "GOOGLE_PROFILE_ERROR", null, "Gmail không trả về địa chỉ hộp thư.");
+        }
+        if (!email.equalsIgnoreCase(profile.emailAddress().trim())) {
+            return callbackFailure(entry, "ACCOUNT_MISMATCH", null,
+                    "Địa chỉ hộp thư Gmail không khớp danh tính Google đã xác thực.");
+        }
         String maskedEmail = MailCredentials.maskEmail(email);
         long expiresIn = tokenResponse.expiresIn() != null ? tokenResponse.expiresIn() : 3600L;
 
         // ==================== LUỒNG 1: ĐĂNG NHẬP BẰNG GOOGLE OAUTH2 (HỢP NHẤT KHI TRÙNG EMAIL) ====================
         if (isGoogleLogin) {
-            return completeGoogleLoginCallback(pollToken, email, maskedEmail, userInfo, tokenResponse, expiresIn);
+            try {
+                return completeGoogleLoginCallback(pollToken, email, maskedEmail, userInfo, tokenResponse, expiresIn);
+            } catch (RuntimeException ex) {
+                log.warn("Không thể hoàn tất đăng nhập Google: {}", ex.getClass().getSimpleName());
+                return callbackFailure(entry, "INTERNAL_SERVER_ERROR", email, "Không thể hoàn tất đăng nhập Google. Vui lòng thử lại.");
+            }
         }
 
         // ==================== LUỒNG 2: LIÊN KẾT HOẶC THÊM PHƯƠNG THỨC GOOGLE OAUTH2 CHO USER ĐÃ ĐĂNG NHẬP ====================
         User user = userRepository.findById(userId).orElse(null);
         if (user == null) {
-            return renderHtmlResult(false, email, "Không tìm thấy thông tin tài khoản người dùng tương ứng trên hệ thống.");
+            return callbackFailure(entry, "USER_NOT_FOUND", email, "Không tìm thấy thông tin tài khoản người dùng tương ứng trên hệ thống.");
+        }
+        // State proves who started the flow, not that permission is still current.
+        if (!user.isEnabled()) {
+            return callbackFailure(entry, "ACCOUNT_LOCKED", email, "Tài khoản của bạn đã bị khóa.");
+        }
+        if (user.isMustChangePassword()) {
+            return callbackFailure(entry, "PASSWORD_CHANGE_REQUIRED", email,
+                    "Tài khoản yêu cầu bắt buộc phải đổi mật khẩu trước khi liên kết Gmail.");
+        }
+        if (systemSettingService.isMaintenanceMode() && user.getRole() != Role.ADMIN) {
+            return callbackFailure(entry, "MAINTENANCE_MODE", email, "Hệ thống đang bảo trì.");
+        }
+        if (!systemSettingService.isOAuth2LinkEnabled()) {
+            return callbackFailure(entry, "FEATURE_DISABLED", email, "Tính năng liên kết Gmail bằng OAuth2 hiện đang bị tắt.");
         }
 
-        String encryptedRefresh = (tokenResponse.refreshToken() != null && !tokenResponse.refreshToken().isBlank())
-                ? aesCipher.encrypt(tokenResponse.refreshToken())
-                : null;
-        String trustedAvatar = isTrustedGoogleAvatarUrl(userInfo.picture()) ? userInfo.picture().trim() : null;
-
         try {
+            String encryptedRefresh = (tokenResponse.refreshToken() != null && !tokenResponse.refreshToken().isBlank())
+                    ? aesCipher.encrypt(tokenResponse.refreshToken()) : null;
+            String trustedAvatar = isTrustedGoogleAvatarUrl(userInfo.picture()) ? userInfo.picture().trim() : null;
             GmailAccountLinkService.UpsertResult upsert = linkService.upsertOAuth2(
                     user,
-                    userInfo.email(),
+                    email,
                     encryptedRefresh,
                     userInfo.name(),
                     trustedAvatar,
-                    LocalDateTime.now().plusSeconds(expiresIn)
+                    LocalDateTime.now().plusSeconds(expiresIn),
+                    entry.accountId(), entry.intent()
             );
             GmailAccount saved = upsert.account();
             if (saved != null && saved.getId() != null) {
-                tokenCache.put(saved.getId(), new CachedToken(tokenResponse.accessToken(), Instant.now().plusSeconds(expiresIn)));
+                rememberToken(saved, tokenResponse.accessToken(), Instant.now().plusSeconds(expiresIn));
                 avatarCache.invalidate(saved.getId());
+                stateStore.completeLinkSuccess(pollToken, saved.getId(), upsert.outcome(), upsert.message());
             }
 
             String heading = switch (upsert.outcome()) {
@@ -387,40 +457,56 @@ public class OAuth2ServiceImpl implements OAuth2Service {
             };
             return renderHtmlResult(true, heading, email, htmlMessage);
         } catch (AppException ex) {
-            return renderHtmlResult(false, email, ex.getMessage());
+            return callbackFailure(entry, ex.getCode(), email, ex.getMessage());
+        } catch (RuntimeException ex) {
+            log.warn("Không thể lưu liên kết OAuth2: {}", ex.getClass().getSimpleName());
+            return callbackFailure(entry, "INTERNAL_SERVER_ERROR", email, "Không thể lưu liên kết Gmail. Vui lòng thử lại.");
+        }
+    }
+
+    private String callbackFailure(OAuth2StateStore.StateEntry entry, String code, String email, String message) {
+        completeCallbackFailure(entry, code, message);
+        return renderHtmlResult(false, email, message);
+    }
+
+    private void completeCallbackFailure(OAuth2StateStore.StateEntry entry, String code, String message) {
+        if (entry.flowType() == OAuth2StateStore.FlowType.GOOGLE_LOGIN) {
+            stateStore.completeGoogleLoginFailure(entry.pollToken(), code, message);
+        } else {
+            stateStore.completeLinkFailure(entry.pollToken(), code, message);
         }
     }
 
     @Override
     public String getFreshAccessToken(GmailAccount account) {
         if (!account.hasOAuth() && account.getAuthType() != AuthType.OAUTH2) {
-            throw new IllegalArgumentException("Tài khoản không sử dụng phương thức xác thực OAuth2: " + account.getEmail());
+            throw new IllegalArgumentException("Tài khoản chưa có phương thức xác thực OAuth2.");
         }
 
-        Long accountId = account.getId() != null ? account.getId() : 0L;
+        Long accountId = account.getId();
         String maskedEmail = MailCredentials.maskEmail(account.getEmail());
 
-        // 1. Kiểm tra cache trong RAM (nếu còn hạn > 60s thì dùng ngay)
-        CachedToken cached = tokenCache.getIfPresent(accountId);
-        if (cached != null && Instant.now().plusSeconds(60).isBefore(cached.expiresAt())) {
-            return cached.token();
-        }
-
-        // 2. Khóa đồng bộ theo account ID để tránh race condition khi nhiều luồng cùng refresh một tài khoản
-        Object lock = accountLocks.computeIfAbsent(accountId, k -> new Object());
-        synchronized (lock) {
-            // Double-check cache sau khi có khóa
-            CachedToken secondCheck = tokenCache.getIfPresent(accountId);
-            if (secondCheck != null && Instant.now().plusSeconds(60).isBefore(secondCheck.expiresAt())) {
-                return secondCheck.token();
+        // Bounded striped locks avoid retaining an object for every deleted
+        // mailbox. Transient accounts never share the cache or a grant entry.
+        synchronized (accountLock(accountId)) {
+            // A competing relink/removal/rotation may have committed while
+            // this caller waited for the stripe. Do not reuse a cache entry or
+            // send an obsolete refresh grant to the provider in that case.
+            GmailAccountSnapshot.requireCurrent(gmailAccountRepository, account);
+            if (account.getStatus() == AccountStatus.NEEDS_REAUTH) {
+                throw new ReauthRequiredException();
+            }
+            CachedToken cached = accountId == null ? null : tokenCache.getIfPresent(accountId);
+            if (cached != null && cached.matches(account)) {
+                if (cached.token() == null) throw new ReauthRequiredException();
+                if (Instant.now().plusSeconds(60).isBefore(cached.expiresAt())) return cached.token();
             }
 
             oAuthConfig.validateConfig();
 
-            String decryptedRefreshToken = aesCipher.decrypt(account.getRefreshTokenEncrypted());
+            String decryptedRefreshToken = account.hasOAuth() ? aesCipher.decrypt(account.getRefreshTokenEncrypted()) : null;
             if (decryptedRefreshToken == null || decryptedRefreshToken.isBlank()) {
-                account.setStatus(AccountStatus.NEEDS_REAUTH);
-                gmailAccountRepository.save(account);
+                rejectGrant(account, maskedEmail);
                 throw new ReauthRequiredException("Không tìm thấy Refresh Token hợp lệ cho Gmail " + maskedEmail + ". Vui lòng liên kết lại.");
             }
 
@@ -438,37 +524,89 @@ public class OAuth2ServiceImpl implements OAuth2Service {
                         .retrieve()
                         .body(GoogleTokenResponse.class);
 
-                if (response == null || response.accessToken() == null) {
+                if (response == null || response.accessToken() == null || response.accessToken().isBlank()
+                        || (response.expiresIn() != null && response.expiresIn() <= 0)
+                        || (response.tokenType() != null && !"Bearer".equalsIgnoreCase(response.tokenType()))) {
                     throw new AppException(HttpStatus.BAD_GATEWAY, "GMAIL_CONNECTION_ERROR",
                             "Phản hồi làm mới token từ Google không hợp lệ.");
                 }
+                // RFC 6749 permits an omitted scope when unchanged. An
+                // explicitly reduced scope must never be cached or used.
+                if (response.scope() != null && !hasRequiredGmailScope(response.scope())) {
+                    rejectGrant(account, maskedEmail);
+                    throw new ReauthRequiredException("Quyền truy cập Gmail không còn đầy đủ. Vui lòng cấp lại quyền.");
+                }
 
                 long expiresIn = response.expiresIn() != null ? response.expiresIn() : 3600L;
-                tokenCache.put(accountId, new CachedToken(response.accessToken(), Instant.now().plusSeconds(expiresIn)));
-
+                Instant expiry = Instant.now().plusSeconds(expiresIn);
                 account.setTokenExpiresAt(LocalDateTime.now().plusSeconds(expiresIn));
-                gmailAccountRepository.save(account);
+                // A rotated refresh token is part of the new grant; never
+                // publish an access token before the corresponding row commits.
+                if (response.refreshToken() != null && !response.refreshToken().isBlank()) {
+                    account.setRefreshTokenEncrypted(aesCipher.encrypt(response.refreshToken()));
+                }
+                saveRefreshState(account);
+                rememberToken(account, response.accessToken(), expiry);
 
                 log.info("Làm mới Access Token thành công cho: {}", maskedEmail);
                 return response.accessToken();
 
             } catch (RestClientResponseException e) {
                 // Khi Google trả về 400 Bad Request kèm invalid_grant (người dùng thu hồi quyền trên Google Account)
-                log.warn("Lỗi làm mới token cho email {}: status={}, body={}",
-                        maskedEmail, e.getStatusCode(), e.getResponseBodyAsString());
+                log.warn("Lỗi làm mới token cho email {}: status={}", maskedEmail, e.getStatusCode());
+                if (e.getStatusCode().value() != 400 || !isInvalidGrant(e)) {
+                    throw new AppException(HttpStatus.BAD_GATEWAY, "GMAIL_CONNECTION_ERROR",
+                            "Không thể làm mới phiên Google. Vui lòng thử lại sau.");
+                }
 
-                account.setStatus(AccountStatus.NEEDS_REAUTH);
-                gmailAccountRepository.save(account);
-                auditLogService.log(account.getUser() != null ? account.getUser().getId() : null,
-                        "GMAIL_NEEDS_REAUTH", "Quyền truy cập bị thu hồi hoặc hết hạn: " + maskedEmail, null);
+                rejectGrant(account, maskedEmail);
 
                 throw new ReauthRequiredException(
                         "Quyền truy cập Gmail (" + maskedEmail + ") đã bị thu hồi hoặc hết hạn. Vui lòng liên kết lại tài khoản.");
+            } catch (AppException | ReauthRequiredException e) {
+                throw e;
             } catch (Exception e) {
-                log.error("Lỗi kết nối khi làm mới token Google cho {}: {}", maskedEmail, e.getMessage());
+                log.error("Lỗi kết nối khi làm mới token Google cho {}: {}", maskedEmail, e.getClass().getSimpleName());
                 throw new AppException(HttpStatus.BAD_GATEWAY, "GMAIL_CONNECTION_ERROR",
-                        "Không thể kết nối đến máy chủ Google để làm mới phiên làm việc: " + e.getMessage(), e);
+                        "Không thể kết nối đến máy chủ Google để làm mới phiên làm việc.", e);
             }
+        }
+    }
+
+    private Object accountLock(Long accountId) {
+        return accountId == null ? new Object() : accountLocks[Math.floorMod(accountId.hashCode(), accountLocks.length)];
+    }
+
+    private void rememberToken(GmailAccount account, String token, Instant expiry) {
+        if (account.getId() == null || !account.hasOAuth()) return;
+        synchronized (accountLock(account.getId())) {
+            tokenCache.put(account.getId(), new CachedToken(token, expiry,
+                    account.getRefreshTokenEncrypted(), account.getUser() == null ? null : account.getUser().getId()));
+        }
+    }
+
+    private void saveRefreshState(GmailAccount account) {
+        GmailAccountSnapshot.saveState(gmailAccountRepository, account);
+    }
+
+    private void rejectGrant(GmailAccount account, String maskedEmail) {
+        // Keep a newer, independently linked grant untouched.
+        if (account.getId() != null) {
+            tokenCache.asMap().computeIfPresent(account.getId(), (id, entry) -> entry.matches(account) ? null : entry);
+        }
+        account.setStatus(AccountStatus.NEEDS_REAUTH);
+        account.setFallbackActive(false);
+        saveRefreshState(account);
+        rememberToken(account, null, Instant.MAX);
+        auditLogService.log(account.getUser() != null ? account.getUser().getId() : null,
+                "GMAIL_NEEDS_REAUTH", "Quyền truy cập cần cấp lại: " + maskedEmail, (String) null);
+    }
+
+    private static boolean isInvalidGrant(RestClientResponseException ex) {
+        try {
+            return "invalid_grant".equals(ERROR_JSON.readTree(ex.getResponseBodyAsString()).path("error").asText());
+        } catch (Exception ignored) {
+            return false;
         }
     }
 
@@ -477,14 +615,14 @@ public class OAuth2ServiceImpl implements OAuth2Service {
         if (!account.hasOAuth() && account.getAuthType() != AuthType.OAUTH2) {
             return;
         }
+        // Clear local caches even when a stored credential cannot be decrypted.
+        if (account.getId() != null) {
+            tokenCache.asMap().computeIfPresent(account.getId(), (id, entry) -> entry.matches(account) ? null : entry);
+            avatarCache.invalidate(account.getId());
+        }
         String refreshToken = aesCipher.decrypt(account.getRefreshTokenEncrypted());
         if (refreshToken == null || refreshToken.isBlank()) {
             return;
-        }
-
-        // Xóa khỏi cache
-        if (account.getId() != null) {
-            tokenCache.invalidate(account.getId());
         }
 
         try {
@@ -500,7 +638,8 @@ public class OAuth2ServiceImpl implements OAuth2Service {
 
             log.info("Đã gửi yêu cầu thu hồi token Google thành công cho: {}", MailCredentials.maskEmail(account.getEmail()));
         } catch (Exception e) {
-            log.warn("Không thể thu hồi token trên Google (best-effort): {}", e.getMessage());
+            // The unlink/delete caller records the failure and continues local deletion.
+            throw new IllegalStateException("Không thể thu hồi token trên Google.");
         }
     }
 
@@ -550,20 +689,23 @@ public class OAuth2ServiceImpl implements OAuth2Service {
             mergedExisting = true;
 
             if (!user.isEnabled()) {
-                auditLogService.log(user.getId(), "GOOGLE_LOGIN_FAILED", "ACCOUNT_LOCKED", null);
+                auditLogService.log(user.getId(), "GOOGLE_LOGIN_FAILED", "ACCOUNT_LOCKED", (String) null);
                 String msg = "Tài khoản của bạn đã bị khóa. Vui lòng liên hệ Quản trị viên.";
                 stateStore.completeGoogleLoginFailure(pollToken, "ACCOUNT_LOCKED", msg);
                 return renderHtmlResult(false, email, msg);
             }
             if (systemSettingService.isMaintenanceMode() && user.getRole() != Role.ADMIN) {
-                auditLogService.log(user.getId(), "GOOGLE_LOGIN_FAILED", "MAINTENANCE_MODE", null);
+                auditLogService.log(user.getId(), "GOOGLE_LOGIN_FAILED", "MAINTENANCE_MODE", (String) null);
                 String msg = "Hệ thống đang bảo trì. Chỉ Quản trị viên (ADMIN) mới có thể đăng nhập.";
                 stateStore.completeGoogleLoginFailure(pollToken, "MAINTENANCE_MODE", msg);
                 return renderHtmlResult(false, email, msg);
             }
             if ((user.getFullName() == null || user.getFullName().isBlank()) && userInfo.name() != null && !userInfo.name().isBlank()) {
-                user.setFullName(userInfo.name().trim());
-                userRepository.save(user);
+                String name = userInfo.name().trim();
+                // Avoid merging a stale user snapshot over concurrent security updates.
+                userRepository.fillMissingFullName(user.getId(), name.substring(0, Math.min(name.length(), 100)), LocalDateTime.now());
+                user = userRepository.findById(user.getId())
+                        .orElseThrow(() -> new AppException(HttpStatus.NOT_FOUND, "USER_NOT_FOUND", "Không tìm thấy người dùng."));
             }
         } else {
             mergedExisting = false;
@@ -593,52 +735,28 @@ public class OAuth2ServiceImpl implements OAuth2Service {
         }
 
         // Tự động liên kết hoặc thêm OAuth2 vào GmailAccount tương ứng (GIỮ NGUYÊN App Password nếu đã có!)
-        String emailKey = EmailNormalizer.normalizeKey(email);
-        Optional<GmailAccount> gmailOpt = gmailAccountRepository.findByUserIdAndEmailKey(user.getId(), emailKey);
-        GmailAccount gmailAccount;
-        if (gmailOpt.isPresent()) {
-            gmailAccount = gmailOpt.get();
-            boolean hadOAuth = gmailAccount.hasOAuth();
-            if (tokenResponse.refreshToken() != null && !tokenResponse.refreshToken().isBlank()) {
-                gmailAccount.setRefreshTokenEncrypted(aesCipher.encrypt(tokenResponse.refreshToken()));
-                if (!hadOAuth) {
-                    gmailAccount.setAuthType(AuthType.OAUTH2);
-                }
+        String encryptedRefresh = tokenResponse.refreshToken() != null && !tokenResponse.refreshToken().isBlank()
+                ? aesCipher.encrypt(tokenResponse.refreshToken()) : null;
+        GmailAccount gmailAccount = null;
+        String linkWarning = null;
+        try {
+            gmailAccount = linkService.upsertOAuth2(user, email, encryptedRefresh, userInfo.name(),
+                    isTrustedGoogleAvatarUrl(userInfo.picture()) ? userInfo.picture().trim() : null,
+                    LocalDateTime.now().plusSeconds(expiresIn)).account();
+        } catch (AppException ex) {
+            // Authentication and mailbox linking are separate: a user can log in to
+            // change their password, but cannot auto-link a mailbox before doing so.
+            if ("GMAIL_LIMIT_REACHED".equals(ex.getCode()) || "MISSING_REFRESH_TOKEN".equals(ex.getCode())
+                    || "PASSWORD_CHANGE_REQUIRED".equals(ex.getCode())) {
+                linkWarning = ex.getMessage();
+            } else {
+                stateStore.completeGoogleLoginFailure(pollToken, ex.getCode(), ex.getMessage());
+                return renderHtmlResult(false, email, ex.getMessage());
             }
-            gmailAccount.setStatus(AccountStatus.ACTIVE);
-            gmailAccount.setFallbackActive(false);
-            if ((gmailAccount.getDisplayName() == null || gmailAccount.getDisplayName().isBlank())
-                    && userInfo.name() != null && !userInfo.name().isBlank()) {
-                gmailAccount.setDisplayName(userInfo.name().trim());
-            }
-            if (isTrustedGoogleAvatarUrl(userInfo.picture())) {
-                gmailAccount.setAvatarUrl(userInfo.picture().trim());
-            }
-            gmailAccount.setTokenExpiresAt(LocalDateTime.now().plusSeconds(expiresIn));
-            gmailAccount.setLastVerifiedAt(LocalDateTime.now());
-            gmailAccount = gmailAccountRepository.save(gmailAccount);
-        } else if (tokenResponse.refreshToken() != null && !tokenResponse.refreshToken().isBlank()) {
-            gmailAccount = new GmailAccount();
-            gmailAccount.setUser(user);
-            gmailAccount.setEmail(email);
-            gmailAccount.setEmailKey(emailKey);
-            gmailAccount.setDisplayName(userInfo.name() != null && !userInfo.name().isBlank() ? userInfo.name().trim() : email);
-            if (isTrustedGoogleAvatarUrl(userInfo.picture())) {
-                gmailAccount.setAvatarUrl(userInfo.picture().trim());
-            }
-            gmailAccount.setAuthType(AuthType.OAUTH2);
-            gmailAccount.setRefreshTokenEncrypted(aesCipher.encrypt(tokenResponse.refreshToken()));
-            gmailAccount.setStatus(AccountStatus.ACTIVE);
-            gmailAccount.setFallbackActive(false);
-            gmailAccount.setTokenExpiresAt(LocalDateTime.now().plusSeconds(expiresIn));
-            gmailAccount.setLastVerifiedAt(LocalDateTime.now());
-            gmailAccount = gmailAccountRepository.save(gmailAccount);
-        } else {
-            gmailAccount = null;
         }
 
         if (gmailAccount != null && gmailAccount.getId() != null) {
-            tokenCache.put(gmailAccount.getId(), new CachedToken(tokenResponse.accessToken(), Instant.now().plusSeconds(expiresIn)));
+            rememberToken(gmailAccount, tokenResponse.accessToken(), Instant.now().plusSeconds(expiresIn));
             avatarCache.invalidate(gmailAccount.getId());
         }
 
@@ -647,13 +765,16 @@ public class OAuth2ServiceImpl implements OAuth2Service {
         stateStore.completeGoogleLoginSuccess(pollToken, loginResponse);
 
         auditLogService.log(user.getId(), mergedExisting ? "GOOGLE_LOGIN_MERGED" : "GOOGLE_LOGIN_NEW",
-                "Đăng nhập Google OAuth2: " + maskedEmail, null);
+                "Đăng nhập Google OAuth2: " + maskedEmail, (String) null);
         log.info("Đăng nhập Google OAuth2 thành công cho userId={} (mergedExisting={}, email={})",
                 user.getId(), mergedExisting, maskedEmail);
 
         String htmlMsg = mergedExisting
                 ? "Đăng nhập thành công! Tài khoản cùng email <strong>" + maskedEmail + "</strong> đã được hợp nhất tự động với phiên <strong>Google OAuth2</strong>."
                 : "Chào mừng! Tài khoản <strong>" + maskedEmail + "</strong> đã được tạo và liên kết sẵn vào <strong>Veyra Mail</strong>.";
+        if (linkWarning != null) {
+            htmlMsg = "Đăng nhập thành công. Chưa liên kết được hộp thư Gmail: " + linkWarning;
+        }
         return renderHtmlResult(true, email, htmlMsg);
     }
 
@@ -729,7 +850,7 @@ public class OAuth2ServiceImpl implements OAuth2Service {
                     }
                 }
             } catch (Exception e) {
-                log.debug("Không thể tự bổ sung Google UserInfo cho accountId={}: {}", account.getId(), e.getMessage());
+                log.debug("Không thể tự bổ sung Google UserInfo cho accountId={}: {}", account.getId(), e.getClass().getSimpleName());
             }
         }
 
@@ -753,7 +874,7 @@ public class OAuth2ServiceImpl implements OAuth2Service {
                 return payload;
             }
         } catch (Exception e) {
-            log.debug("Không thể tải ảnh đại diện Google cho accountId={}: {}", account.getId(), e.getMessage());
+            log.debug("Không thể tải ảnh đại diện Google cho accountId={}: {}", account.getId(), e.getClass().getSimpleName());
         }
 
         avatarCache.put(account.getId(), Optional.empty());

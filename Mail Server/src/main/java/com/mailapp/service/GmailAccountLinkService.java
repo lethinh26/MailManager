@@ -6,8 +6,11 @@ import com.mailapp.mail.model.MailCredentials;
 import com.mailapp.model.AccountStatus;
 import com.mailapp.model.AuthType;
 import com.mailapp.model.GmailAccount;
+import com.mailapp.model.LinkIntent;
+import com.mailapp.model.Role;
 import com.mailapp.model.User;
 import com.mailapp.repository.GmailAccountRepository;
+import com.mailapp.repository.UserRepository;
 import com.mailapp.util.EmailNormalizer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -38,16 +41,19 @@ public class GmailAccountLinkService {
     private final GmailAccountRepository gmailAccountRepository;
     private final SystemSettingService systemSettingService;
     private final AuditLogService auditLogService;
+    private final UserRepository userRepository;
     private final TransactionTemplate requiresNewTx;
 
     @Autowired
     public GmailAccountLinkService(GmailAccountRepository gmailAccountRepository,
                                    SystemSettingService systemSettingService,
                                    AuditLogService auditLogService,
-                                   @Autowired(required = false) PlatformTransactionManager txManager) {
+                                   @Autowired(required = false) PlatformTransactionManager txManager,
+                                   UserRepository userRepository) {
         this.gmailAccountRepository = gmailAccountRepository;
         this.systemSettingService = systemSettingService;
         this.auditLogService = auditLogService;
+        this.userRepository = userRepository;
         if (txManager != null) {
             TransactionTemplate tpl = new TransactionTemplate(txManager);
             tpl.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
@@ -57,24 +63,36 @@ public class GmailAccountLinkService {
         }
     }
 
+    public GmailAccountLinkService(GmailAccountRepository gmailAccountRepository,
+                                   SystemSettingService systemSettingService,
+                                   AuditLogService auditLogService,
+                                   PlatformTransactionManager txManager) {
+        this(gmailAccountRepository, systemSettingService, auditLogService, txManager, null);
+    }
+
     /**
      * Upsert phương thức App Password cho (currentUser, emailKey).
      * - Chưa có hộp thư: tạo mới với authType = APP_PASSWORD (outcome = CREATED).
      * - Đã có hộp thư: giữ nguyên id, displayName và refreshTokenEncrypted (nếu có OAuth2);
      *   thêm hoặc cập nhật appPasswordEncrypted (outcome = METHOD_ADDED hoặc METHOD_UPDATED).
-     * - Không bao giờ trả lỗi trùng email.
+     * - CREATE từ chối hộp thư đã tồn tại, UPSERT mới cho phép cập nhật.
      */
     public UpsertResult upsertAppPassword(User currentUser,
                                           String rawEmail,
                                           String encryptedPassword,
                                           String requestedDisplayName,
                                           String clientIp) {
+        return upsertAppPassword(currentUser, rawEmail, encryptedPassword, requestedDisplayName, clientIp, LinkIntent.UPSERT);
+    }
+
+    public UpsertResult upsertAppPassword(User currentUser, String rawEmail, String encryptedPassword,
+                                          String requestedDisplayName, String clientIp, LinkIntent intent) {
         String displayEmail = EmailNormalizer.normalizeDisplayEmail(rawEmail);
         String emailKey = EmailNormalizer.normalizeKey(displayEmail);
         String maskedEmail = MailCredentials.maskEmail(displayEmail);
 
         return executeWithRaceRetry(() -> doUpsertAppPassword(
-                currentUser, displayEmail, emailKey, maskedEmail, encryptedPassword, requestedDisplayName, clientIp));
+                currentUser, displayEmail, emailKey, maskedEmail, encryptedPassword, requestedDisplayName, clientIp, intent));
     }
 
     /**
@@ -83,7 +101,7 @@ public class GmailAccountLinkService {
      * - Đã có hộp thư: giữ nguyên id, displayName và appPasswordEncrypted (nếu có App Password);
      *   thêm hoặc cập nhật refreshTokenEncrypted; đặt mặc định preferredMethod = OAUTH2 khi thêm OAuth2 lần đầu;
      *   xóa fallbackActive và khôi phục status = ACTIVE.
-     * - Không bao giờ trả lỗi trùng email.
+     * - CREATE từ chối hộp thư đã tồn tại, UPSERT mới cho phép cập nhật.
      */
     public UpsertResult upsertOAuth2(User user,
                                      String rawEmail,
@@ -91,13 +109,27 @@ public class GmailAccountLinkService {
                                      String googleDisplayName,
                                      String trustedAvatarUrl,
                                      LocalDateTime tokenExpiresAt) {
+        return upsertOAuth2(user, rawEmail, encryptedRefreshToken, googleDisplayName,
+                trustedAvatarUrl, tokenExpiresAt, null);
+    }
+
+    public UpsertResult upsertOAuth2(User user, String rawEmail, String encryptedRefreshToken,
+                                    String googleDisplayName, String trustedAvatarUrl,
+                                    LocalDateTime tokenExpiresAt, Long expectedAccountId) {
+        return upsertOAuth2(user, rawEmail, encryptedRefreshToken, googleDisplayName, trustedAvatarUrl,
+                tokenExpiresAt, expectedAccountId, LinkIntent.UPSERT);
+    }
+
+    public UpsertResult upsertOAuth2(User user, String rawEmail, String encryptedRefreshToken,
+                                    String googleDisplayName, String trustedAvatarUrl,
+                                    LocalDateTime tokenExpiresAt, Long expectedAccountId, LinkIntent intent) {
         String displayEmail = EmailNormalizer.normalizeDisplayEmail(rawEmail);
         String emailKey = EmailNormalizer.normalizeKey(displayEmail);
         String maskedEmail = MailCredentials.maskEmail(displayEmail);
 
         return executeWithRaceRetry(() -> doUpsertOAuth2(
                 user, displayEmail, emailKey, maskedEmail, encryptedRefreshToken,
-                googleDisplayName, trustedAvatarUrl, tokenExpiresAt));
+                googleDisplayName, trustedAvatarUrl, tokenExpiresAt, expectedAccountId, intent));
     }
 
     private UpsertResult doUpsertAppPassword(User currentUser,
@@ -106,11 +138,15 @@ public class GmailAccountLinkService {
                                              String maskedEmail,
                                              String encryptedPassword,
                                              String requestedDisplayName,
-                                             String clientIp) {
+                                             String clientIp, LinkIntent intent) {
+        currentUser = lockAndValidateOwner(currentUser, AuthType.APP_PASSWORD);
         LocalDateTime now = LocalDateTime.now();
         Optional<GmailAccount> existingOpt = gmailAccountRepository.findByUserIdAndEmailKey(currentUser.getId(), emailKey);
 
         if (existingOpt.isPresent()) {
+            if (intent == LinkIntent.CREATE) {
+                throw new AppException(HttpStatus.CONFLICT, "GMAIL_DUPLICATE", "Gmail này đã liên kết.");
+            }
             GmailAccount existing = existingOpt.get();
             boolean alreadyHadAppPass = existing.hasAppPassword();
 
@@ -184,15 +220,26 @@ public class GmailAccountLinkService {
                                         String encryptedRefreshToken,
                                         String googleDisplayName,
                                         String trustedAvatarUrl,
-                                        LocalDateTime tokenExpiresAt) {
+                                        LocalDateTime tokenExpiresAt,
+                                        Long expectedAccountId, LinkIntent intent) {
+        user = lockAndValidateOwner(user, AuthType.OAUTH2);
         LocalDateTime now = LocalDateTime.now();
         Optional<GmailAccount> existingOpt = gmailAccountRepository.findByUserIdAndEmailKey(user.getId(), emailKey);
+        if (expectedAccountId != null && (existingOpt.isEmpty()
+                || !expectedAccountId.equals(existingOpt.get().getId()))) {
+            throw new AppException(HttpStatus.CONFLICT, "ACCOUNT_MISMATCH",
+                    "Tài khoản Google vừa cấp quyền không khớp hộp thư đã chọn hoặc hộp thư đã bị gỡ.");
+        }
 
         if (existingOpt.isPresent()) {
+            if (intent == LinkIntent.CREATE) {
+                throw new AppException(HttpStatus.CONFLICT, "GMAIL_DUPLICATE", "Gmail này đã liên kết.");
+            }
             GmailAccount existing = existingOpt.get();
             boolean alreadyHadOAuth = existing.hasOAuth();
 
-            if (!alreadyHadOAuth && (encryptedRefreshToken == null || encryptedRefreshToken.isBlank())) {
+            if ((!alreadyHadOAuth || existing.getStatus() == AccountStatus.NEEDS_REAUTH)
+                    && (encryptedRefreshToken == null || encryptedRefreshToken.isBlank())) {
                 throw new AppException(HttpStatus.BAD_REQUEST, "MISSING_REFRESH_TOKEN",
                         "Google không cấp Refresh Token khi thêm phương thức Google OAuth2 cho " + maskedEmail
                                 + ". Hãy thu hồi quyền cũ tại myaccount.google.com/permissions rồi thử lại.");
@@ -231,10 +278,8 @@ public class GmailAccountLinkService {
                         + " (đặt làm phương thức chính, vẫn giữ App Password dự phòng).";
             }
 
-            auditLogService.log(user.getId(),
-                    alreadyHadOAuth ? "UPDATE_GMAIL_METHOD" : "ADD_GMAIL_METHOD",
-                    (alreadyHadOAuth ? "Cập nhật liên kết OAuth2: " : "Thêm phương thức OAuth2: ") + maskedEmail,
-                    null);
+            auditLogService.log(user.getId(), "OAUTH2_CALLBACK",
+                    "outcome=" + outcome.name() + "; email=" + maskedEmail, (String) null);
             log.info("Người dùng id={} {} (OAUTH2) cho {}", user.getId(), outcome, maskedEmail);
             return new UpsertResult(saved, outcome, message);
         }
@@ -268,11 +313,43 @@ public class GmailAccountLinkService {
         newAccount.setLastVerifiedAt(now);
 
         GmailAccount saved = saveAndFlushSafe(newAccount);
-        auditLogService.log(user.getId(), "LINK_GMAIL", "Liên kết Gmail OAuth2: " + maskedEmail, null);
+        auditLogService.log(user.getId(), "OAUTH2_CALLBACK",
+                "outcome=CREATED; email=" + maskedEmail, (String) null);
         log.info("Liên kết thành công tài khoản Gmail OAuth2 mới: {}", maskedEmail);
 
         String message = "Tài khoản " + maskedEmail + " đã được liên kết thành công vào Veyra Mail.";
         return new UpsertResult(saved, LinkOutcome.CREATED, message);
+    }
+
+    private User lockAndValidateOwner(User user, AuthType method) {
+        if (userRepository == null) {
+            // Direct unit-test constructor; production always receives the repository.
+            checkPasswordChanged(user);
+            return user;
+        }
+        User current = userRepository.lockUserById(user.getId())
+                .orElseThrow(() -> new AppException(HttpStatus.NOT_FOUND, "USER_NOT_FOUND", "Không tìm thấy người dùng."));
+        if (!current.isEnabled()) {
+            throw new AppException(HttpStatus.FORBIDDEN, "ACCOUNT_LOCKED", "Tài khoản của bạn đã bị khóa.");
+        }
+        checkPasswordChanged(current);
+        if (current.getRole() != Role.ADMIN && systemSettingService.isMaintenanceMode()) {
+            throw new AppException(HttpStatus.SERVICE_UNAVAILABLE, "MAINTENANCE_MODE", "Hệ thống đang bảo trì.");
+        }
+        boolean enabled = method == AuthType.OAUTH2
+                ? systemSettingService.isOAuth2LinkEnabled()
+                : systemSettingService.isAppPasswordLinkEnabled();
+        if (!enabled) {
+            throw new AppException(HttpStatus.FORBIDDEN, "FEATURE_DISABLED", "Phương thức liên kết Gmail đã bị tắt.");
+        }
+        return current;
+    }
+
+    private void checkPasswordChanged(User user) {
+        if (user.isMustChangePassword()) {
+            throw new AppException(HttpStatus.FORBIDDEN, "PASSWORD_CHANGE_REQUIRED",
+                    "Tài khoản yêu cầu bắt buộc phải đổi mật khẩu trước khi liên kết Gmail.");
+        }
     }
 
     private GmailAccount saveAndFlushSafe(GmailAccount account) {
@@ -288,6 +365,19 @@ public class GmailAccountLinkService {
         try {
             return runInTx(action);
         } catch (DataIntegrityViolationException raceEx) {
+            // Do not retry arbitrary persistence failures (including an audit
+            // insert failure). Only a collision on this link's unique key
+            // can be resolved by reloading the existing account.
+            boolean linkCollision = false;
+            for (Throwable cause = raceEx; cause != null; cause = cause.getCause()) {
+                if (cause instanceof org.hibernate.exception.ConstraintViolationException violation
+                        && violation.getConstraintName() != null) {
+                    String key = violation.getConstraintName().toLowerCase(java.util.Locale.ROOT);
+                    linkCollision = key.contains("uk_user_gmail_key");
+                    if (linkCollision) break;
+                }
+            }
+            if (!linkCollision) throw raceEx;
             log.info("Phát hiện tranh chấp đồng thời (UNIQUE user_id + email_key), tự động thử gộp lại vào bản ghi hiện có.");
             return runInTx(action);
         }

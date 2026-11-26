@@ -6,6 +6,8 @@ import com.mailapp.model.AccountStatus;
 import com.mailapp.model.AuthType;
 import com.mailapp.model.GmailAccount;
 import com.mailapp.security.AesCipher;
+import jakarta.mail.Session;
+import java.net.InetAddress;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -32,6 +34,21 @@ class MailConnectionFactoryTest {
     void setUp() {
         properties = new MailConnectionProperties();
         factory = new DefaultMailConnectionFactory(properties, aesCipher, accessTokenProvider, null);
+    }
+
+    @Test
+    void factoryDefaultsAndProbeTimeoutMatchTaskAndTestTransportRequiresOptIn() {
+        assertEquals(10_000, properties.getConnectionTimeoutMs());
+        assertEquals(15_000, properties.getTimeoutMs());
+        assertEquals(30_000, properties.getWriteTimeoutMs());
+        assertEquals(10_000, DefaultMailConnectionFactory.probeTimeout(35_000));
+        assertEquals(10_000, DefaultMailConnectionFactory.probeTimeout(0));
+        assertEquals(200, DefaultMailConnectionFactory.probeTimeout(200));
+        assertFalse(factory.allowLocalTestTransport("127.0.0.1"));
+        properties.setLocalTestTransport(true);
+        assertTrue(factory.allowLocalTestTransport("127.0.0.1"));
+        assertFalse(factory.allowLocalTestTransport("host.docker.internal"));
+        assertFalse(factory.allowLocalTestTransport("imap.gmail.com"));
     }
 
     @Test
@@ -69,5 +86,33 @@ class MailConnectionFactoryTest {
 
         assertThrows(IllegalArgumentException.class, () -> factory.openImap(account));
         verify(accessTokenProvider).getValidAccessToken(account);
+    }
+
+    @Test
+    void legacyOAuthSessionEnforcesXoauth2TlsAndScopedAuthenticator() throws Exception {
+        GmailAccount account = new GmailAccount();
+        account.setEmail("test-oauth@gmail.com");
+        account.setAuthType(AuthType.OAUTH2);
+        account.setStatus(AccountStatus.ACTIVE);
+        when(accessTokenProvider.getValidAccessToken(account)).thenReturn("fixture-token");
+        Session imap = factory.createSession(account, MailConnectionFactory.Protocol.IMAP);
+        Session smtp = factory.createSession(account, MailConnectionFactory.Protocol.SMTP);
+        assertNotSame(imap, smtp);
+        assertFalse(imap.getDebug());
+        assertFalse(smtp.getDebug());
+        assertEquals("XOAUTH2", imap.getProperty("mail.imaps.sasl.mechanisms"));
+        assertEquals("XOAUTH2", smtp.getProperty("mail.smtp.auth.mechanisms"));
+        assertEquals("true", imap.getProperty("mail.imaps.ssl.checkserveridentity"));
+        assertEquals("true", smtp.getProperty("mail.smtp.starttls.required"));
+        assertEquals("true", smtp.getProperty("mail.smtp.ssl.checkserveridentity"));
+        assertNull(imap.getProperty("mail.imaps.ssl.trust"));
+        assertFalse(imap.getProperties().containsValue("fixture-token"));
+        InetAddress gmail = InetAddress.getByAddress("imap.gmail.com", new byte[]{127, 0, 0, 1});
+        assertEquals("fixture-token", imap.requestPasswordAuthentication(gmail, 993, "imaps", null,
+                account.getEmail()).getPassword());
+        assertNull(imap.requestPasswordAuthentication(gmail, 587, "smtp", null, account.getEmail()));
+        assertNull(imap.requestPasswordAuthentication(gmail, 993, "imaps", null, "other@gmail.com"));
+        assertNull(imap.requestPasswordAuthentication(InetAddress.getByAddress("other.example", new byte[]{127, 0, 0, 1}),
+                993, "imaps", null, account.getEmail()));
     }
 }

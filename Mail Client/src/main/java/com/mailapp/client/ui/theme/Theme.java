@@ -303,6 +303,17 @@ public final class Theme {
         return p;
     }
 
+    /** Keep every attachment chip reachable without consuming the mail body. */
+    public static JScrollPane horizontalChipScroll(JPanel chips) {
+        JScrollPane scroll = new JScrollPane(chips, JScrollPane.VERTICAL_SCROLLBAR_NEVER,
+                JScrollPane.HORIZONTAL_SCROLLBAR_ALWAYS);
+        scroll.setBorder(BorderFactory.createEmptyBorder());
+        scroll.setOpaque(false);
+        scroll.getViewport().setOpaque(false);
+        scroll.getHorizontalScrollBar().setUnitIncrement(24);
+        return scroll;
+    }
+
     /** Panel luôn bám đúng bề rộng viewport (không sinh thanh cuộn ngang, không cắt nội dung). */
     public static JPanel trackedWidthPanel(LayoutManager layout) {
         return new TrackedWidthPanel(layout);

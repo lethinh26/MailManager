@@ -12,6 +12,9 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.SimpleTransactionStatus;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.util.Optional;
 
@@ -28,10 +31,14 @@ class AuditLogServiceTest {
     private UserRepository userRepository;
 
     private AuditLogServiceImpl auditLogService;
+    private PlatformTransactionManager transactionManager;
 
     @BeforeEach
     void setUp() {
-        auditLogService = new AuditLogServiceImpl(auditLogRepository, userRepository);
+        transactionManager = mock(PlatformTransactionManager.class);
+        when(transactionManager.getTransaction(any())).thenReturn(new SimpleTransactionStatus());
+        auditLogService = new AuditLogServiceImpl(auditLogRepository, userRepository, transactionManager,
+                mock(com.mailapp.service.impl.MailAuditRecovery.class));
     }
 
     @Test
@@ -47,7 +54,7 @@ class AuditLogServiceTest {
         auditLogService.log(userId, "LINK_GMAIL", "Email: test@gmail.com", "192.168.1.100");
 
         ArgumentCaptor<AuditLog> captor = ArgumentCaptor.forClass(AuditLog.class);
-        verify(auditLogRepository).save(captor.capture());
+        verify(auditLogRepository).saveAndFlush(captor.capture());
 
         AuditLog saved = captor.getValue();
         assertNotNull(saved);
@@ -65,13 +72,47 @@ class AuditLogServiceTest {
         auditLogService.log(null, "LOGIN_FAILED", "Bad credentials", "127.0.0.1");
 
         ArgumentCaptor<AuditLog> captor = ArgumentCaptor.forClass(AuditLog.class);
-        verify(auditLogRepository).save(captor.capture());
+        verify(auditLogRepository).saveAndFlush(captor.capture());
 
         AuditLog saved = captor.getValue();
         assertNotNull(saved);
         assertNull(saved.getUser());
         assertEquals("LOGIN_FAILED", saved.getAction());
         assertEquals("Bad credentials", saved.getDetail());
+    }
+
+    @Test
+    void requestOverloadUsesEffectiveRemoteAddressNotSpoofedForwardedHeader() {
+        var request = new org.springframework.mock.web.MockHttpServletRequest();
+        request.setRemoteAddr("192.0.2.10");
+        request.addHeader("X-Forwarded-For", "203.0.113.77");
+        auditLogService.log(null, "LOGIN_FAILED", "Bad credentials", request);
+        ArgumentCaptor<AuditLog> captor = ArgumentCaptor.forClass(AuditLog.class);
+        verify(auditLogRepository).saveAndFlush(captor.capture());
+        assertEquals("192.0.2.10", captor.getValue().getIpAddress());
+    }
+
+    @Test
+    void standaloneAuditCommitFailureDoesNotTurnConfirmedExternalOperationIntoFailure() {
+        doThrow(new org.springframework.transaction.TransactionSystemException("fixture commit failure"))
+                .when(transactionManager).commit(any());
+        assertDoesNotThrow(() -> auditLogService.log(null, "SEND_MAIL", "recipientCount=1", "127.0.0.1"));
+        verify(auditLogRepository).saveAndFlush(any());
+    }
+
+    @Test
+    void auditWriteFailureRollsBackAndPropagatesWithinBusinessTransaction() {
+        when(auditLogRepository.saveAndFlush(any())).thenThrow(
+                new org.springframework.dao.DataAccessResourceFailureException("fixture insert rejected"));
+        TransactionSynchronizationManager.setActualTransactionActive(true);
+        try {
+            assertThrows(org.springframework.dao.DataAccessResourceFailureException.class,
+                    () -> auditLogService.log(null, "ADMIN_CHANGE_SETTING", "MAIL_PAGE_SIZE", "127.0.0.1"));
+            verify(transactionManager).rollback(any());
+            verify(transactionManager, never()).commit(any());
+        } finally {
+            TransactionSynchronizationManager.setActualTransactionActive(false);
+        }
     }
 }
 

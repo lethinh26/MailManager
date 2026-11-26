@@ -21,6 +21,8 @@ public class ChangePasswordDialog extends JDialog {
     private final ApiClient apiClient;
     private final boolean forced;
     private boolean passwordChangedSuccessfully = false;
+    private boolean disposed;
+    private boolean submitting;
 
     private JPasswordField currentPasswordField;
     private JPasswordField newPasswordField;
@@ -154,11 +156,9 @@ public class ChangePasswordDialog extends JDialog {
         JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 5));
         buttonPanel.setBackground(Color.WHITE);
 
-        if (!forced) {
-            cancelButton = new JButton("Hủy bỏ");
-            cancelButton.addActionListener(e -> dispose());
-            buttonPanel.add(cancelButton);
-        }
+        cancelButton = new JButton(forced ? "Đăng xuất" : "Hủy bỏ");
+        cancelButton.addActionListener(e -> { if (!submitting) dispose(); });
+        buttonPanel.add(cancelButton);
 
         submitButton = new JButton("Cập nhật mật khẩu");
         submitButton.setUI(new javax.swing.plaf.basic.BasicButtonUI());
@@ -231,7 +231,8 @@ public class ChangePasswordDialog extends JDialog {
     }
 
     private void executeChangePassword() {
-        String currentPass = new String(currentPasswordField.getPassword()).trim();
+        if (disposed || submitting || !submitButton.isEnabled()) return;
+        String currentPass = new String(currentPasswordField.getPassword());
         String newPass = new String(newPasswordField.getPassword());
         String confirmPass = new String(confirmPasswordField.getPassword());
 
@@ -245,7 +246,7 @@ public class ChangePasswordDialog extends JDialog {
         }
 
         if (!PasswordValidator.meetsPolicy(newPass)) {
-            errorLabel.setText("Mật khẩu mới phải có ít nhất 8 ký tự, gồm cả chữ và số.");
+            errorLabel.setText("Mật khẩu mới tối thiểu 8 ký tự, gồm chữ và số, tối đa 72 byte UTF-8.");
             newPasswordField.setBorder(new LineBorder(Color.RED, 1));
             return;
         }
@@ -262,25 +263,36 @@ public class ChangePasswordDialog extends JDialog {
             return;
         }
 
+        submitting = true;
+        long generation = SessionStore.getInstance().getGeneration();
         submitButton.setEnabled(false);
+        cancelButton.setEnabled(false);
         submitButton.setText("Đang xử lý...");
 
         SwingWorker<ChangePasswordResponse, Void> worker = new SwingWorker<>() {
             @Override
             protected ChangePasswordResponse doInBackground() throws Exception {
-                return apiClient.changePassword(currentPass, newPass);
+                return apiClient.requestChangePassword(currentPass, newPass);
             }
 
             @Override
             protected void done() {
+                submitting = false;
+                if (disposed || generation != SessionStore.getInstance().getGeneration()) return;
                 submitButton.setEnabled(true);
+                cancelButton.setEnabled(true);
                 submitButton.setText("Cập nhật mật khẩu");
 
                 try {
                     ChangePasswordResponse response = get();
+                    if (response == null || response.accessToken() == null || response.accessToken().isBlank()
+                            || response.user() == null || response.user().mustChangePassword()) {
+                        throw new IllegalStateException("Máy chủ chưa xác nhận phiên sau đổi mật khẩu.");
+                    }
                     passwordChangedSuccessfully = true;
 
                     // Cập nhật session token mới
+                    apiClient.setAccessToken(response.accessToken());
                     SessionStore.getInstance().updateToken(response.accessToken());
                     if (response.user() != null) {
                         SessionStore.getInstance().updateUser(response.user());
@@ -315,6 +327,14 @@ public class ChangePasswordDialog extends JDialog {
         currentPasswordField.setBorder(UIManager.getBorder("TextField.border"));
         newPasswordField.setBorder(UIManager.getBorder("TextField.border"));
         confirmPasswordField.setBorder(UIManager.getBorder("TextField.border"));
+    }
+
+    @Override public void dispose() {
+        disposed = true;
+        if (currentPasswordField != null) currentPasswordField.setText("");
+        if (newPasswordField != null) newPasswordField.setText("");
+        if (confirmPasswordField != null) confirmPasswordField.setText("");
+        super.dispose();
     }
 
     public boolean isPasswordChangedSuccessfully() {

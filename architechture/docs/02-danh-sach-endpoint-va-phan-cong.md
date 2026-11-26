@@ -1,5 +1,7 @@
 # Java Mail App — Danh sách Endpoint & Phân công 6 thành viên
 
+> **Phụ lục đặc tả đã phê duyệt 26/11/2026 (sau G6):** Ba Task Detail AM-4323, AM-4340, AM-4391 trong [Tasks Detail](Tasks%20Detail/) có §4 hiện hành ưu tiên hơn những mô tả cũ tương ứng ở tài liệu này: SEND_MAIL chỉ metadata đã che/số lượng, không raw To/subject/body; bootstrap Admin từ cấu hình BCrypt/forced-change, không mật khẩu cố định/console plaintext, schema additive V1–V9; DELETE 204 mặc định, explicit permanent=true chỉ trong Trash, UIDVALIDITY và targeted UID MOVE/UIDPLUS, không global expunge. Giữ các yêu cầu còn lại và nghiệm thu Gmail thật; mô tả gốc bên dưới được bảo toàn để truy vết.
+
 > Tài liệu tiếp theo của: `01-thiet-ke-tong-the.md` (Thiết kế hệ thống v2, 2026-10-23)
 > Phiên bản: **v1 — 2026-10-23** | Backend: Spring Boot + MySQL 8 | Client: Java Swing thuần
 > Kết quả: **27 endpoint** chia thành 8 nhóm, **15 module** chia cho **6 thành viên — mỗi thành viên phụ trách từ 2 module trở lên**.

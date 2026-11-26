@@ -55,6 +55,7 @@ class MailFallbackConnectionTest {
     private MailConnectionProperties greenMailProps() {
         MailConnectionProperties props = new MailConnectionProperties();
         props.setImapHost("127.0.0.1");
+        props.setLocalTestTransport(true);
         props.setImapPort(IMAPS_PORT);
         props.setRetryEnabled(true);
         props.setRetryMaxAttempts(2);
@@ -102,7 +103,7 @@ class MailFallbackConnectionTest {
         verify(audit, times(1)).log(eq(10L), eq("FALLBACK_TO_APP_PASSWORD"), argThat(detail ->
                 detail.contains("f***@gmail.com")
                         && !detail.contains("backupAppPass16!")
-                        && !detail.contains("revoked-refresh-token")), isNull());
+                        && !detail.contains("revoked-refresh-token")), org.mockito.ArgumentMatchers.<String>isNull());
 
         // Lần 2: đã ở NEEDS_REAUTH + có App Password -> đi thẳng App Password, KHÔNG gọi Google tokenProvider thêm lần nào
         try (ImapConnection conn2 = factory.openImap(account)) {
@@ -133,7 +134,10 @@ class MailFallbackConnectionTest {
 
         assertThrows(ReauthRequiredException.class, () -> factory.openImap(account));
         assertFalse(account.isFallbackActive());
-        verify(audit, never()).log(any(), eq("FALLBACK_TO_APP_PASSWORD"), any(), any());
+        assertEquals(AccountStatus.NEEDS_REAUTH, account.getStatus());
+        assertThrows(ReauthRequiredException.class, () -> factory.openImap(account));
+        verify(tokenProvider, times(1)).getValidAccessToken(account);
+        verify(audit, never()).log(any(), eq("FALLBACK_TO_APP_PASSWORD"), any(), org.mockito.ArgumentMatchers.<String>any());
     }
 
     @Test
@@ -161,6 +165,9 @@ class MailFallbackConnectionTest {
         factory.getNetworkRetry().getEventPublisher().onRetry(e -> retryCount.incrementAndGet());
 
         assertThrows(MailAuthException.class, () -> factory.openImap(account));
+        assertEquals(AccountStatus.NEEDS_REAUTH, account.getStatus());
+        assertFalse(account.isFallbackActive(), "Failed backup must not be advertised as active");
+        verify(audit, never()).log(any(), eq("FALLBACK_TO_APP_PASSWORD"), any(), org.mockito.ArgumentMatchers.<String>any());
         assertEquals(0, retryCount.get(), "Lỗi xác thực tuyệt đối không được retry!");
         verify(tokenProvider, times(1)).getValidAccessToken(account);
     }

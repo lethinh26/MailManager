@@ -78,7 +78,8 @@ public class PublicHealthController {
                 maintenance,
                 sendMailEnabled,
                 maxGmail,
-                maxAttachmentMb
+                maxAttachmentMb,
+                systemSettingService.getMailPageSize()
         );
 
         return ResponseEntity.ok(config);

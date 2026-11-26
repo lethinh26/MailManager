@@ -54,6 +54,7 @@ public class LoginFrame extends JFrame {
     private JPanel oauthDivider;
     private AuthUiKit.GoogleSignInButton googleLoginButton;
     private AuthUiKit.AccentLinkButton registerButton;
+    private AuthUiKit.AccentLinkButton forgotPasswordButton;
     private AuthUiKit.PillGhostButton testConnectionButton;
     private AuthUiKit.PillGhostButton themeToggleButton;
 
@@ -61,6 +62,12 @@ public class LoginFrame extends JFrame {
     private JLabel errorLabel;
 
     private Timer rateLimitTimer;
+    private Timer publicConfigTimer;
+    private boolean fetchingConfig;
+    private boolean checkingConnection;
+    private PublicConfigDto currentPublicConfig;
+    private RegisterFrame activeRegisterFrame;
+    private boolean disposed;
     private int remainingSeconds = 0;
 
     public LoginFrame(ApiClient apiClient) {
@@ -74,7 +81,13 @@ public class LoginFrame extends JFrame {
         initComponents();
         setupEvents();
         if (autoFetch) {
+            registerButton.setVisible(false);
+            noAccountLbl.setVisible(false);
+            googleLoginButton.setVisible(false);
+            oauthDivider.setVisible(false);
             fetchPublicConfig();
+            publicConfigTimer = new Timer(15000, e -> fetchPublicConfig());
+            publicConfigTimer.start();
         }
     }
 
@@ -126,13 +139,15 @@ public class LoginFrame extends JFrame {
         rightContainer.add(topBar, BorderLayout.NORTH);
 
         // Bọc thẻ nổi căn giữa theo cả 2 chiều
-        JPanel cardCenterWrap = new JPanel(new GridBagLayout());
-        cardCenterWrap.setOpaque(false);
-
-        cardPanel = new AuthUiKit.ElevatedCardPanel(18);
+        cardPanel = new AuthUiKit.ElevatedCardPanel(18) {
+            @Override
+            public Dimension getPreferredSize() {
+                // The compact brand, maintenance banner and validation text
+                // can make the form taller than the original 540px design.
+                return new Dimension(422, Math.max(540, super.getPreferredSize().height));
+            }
+        };
         cardPanel.setLayout(new BoxLayout(cardPanel, BoxLayout.Y_AXIS));
-        cardPanel.setPreferredSize(new Dimension(422, 540));
-        cardPanel.setMaximumSize(new Dimension(438, 600));
 
         // Header thương hiệu gọn (chỉ hiện khi cửa sổ thu hẹp < 700px và ẩn heroPanel)
         compactBrandHeader = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
@@ -251,7 +266,14 @@ public class LoginFrame extends JFrame {
         cardPanel.add(userWrapper);
         cardPanel.add(Box.createVerticalStrut(14));
 
-        cardPanel.add(passLbl);
+        JPanel passwordLabelRow = new JPanel(new BorderLayout());
+        passwordLabelRow.setOpaque(false);
+        passwordLabelRow.setAlignmentX(Component.LEFT_ALIGNMENT);
+        passwordLabelRow.setMaximumSize(new Dimension(Integer.MAX_VALUE, 28));
+        forgotPasswordButton = new AuthUiKit.AccentLinkButton("Quên mật khẩu?");
+        passwordLabelRow.add(passLbl, BorderLayout.WEST);
+        passwordLabelRow.add(forgotPasswordButton, BorderLayout.EAST);
+        cardPanel.add(passwordLabelRow);
         cardPanel.add(Box.createVerticalStrut(6));
         cardPanel.add(passWrapper);
         cardPanel.add(Box.createVerticalStrut(10));
@@ -272,16 +294,14 @@ public class LoginFrame extends JFrame {
         cardPanel.add(Box.createVerticalStrut(6));
         cardPanel.add(connectionStatusLabel);
 
-        GridBagConstraints cardGbc = new GridBagConstraints();
-        cardGbc.gridx = 0;
-        cardGbc.gridy = 0;
-        cardGbc.weightx = 1.0;
-        cardGbc.weighty = 1.0;
-        cardGbc.fill = GridBagConstraints.NONE;
-        cardGbc.anchor = GridBagConstraints.CENTER;
-        cardCenterWrap.add(cardPanel, cardGbc);
-
-        rightContainer.add(cardCenterWrap, BorderLayout.CENTER);
+        JScrollPane cardScroll = new JScrollPane(new CardViewport(cardPanel),
+                ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED,
+                ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+        cardScroll.setBorder(BorderFactory.createEmptyBorder());
+        cardScroll.setOpaque(false);
+        cardScroll.getViewport().setOpaque(false);
+        cardScroll.setMinimumSize(new Dimension(0, 0));
+        rightContainer.add(cardScroll, BorderLayout.CENTER);
 
         rootGbc.gridx = 1;
         rootGbc.weightx = 0.56;
@@ -300,20 +320,60 @@ public class LoginFrame extends JFrame {
 
         // Thứ tự điều hướng Tab chuẩn từ trên xuống dưới (5 phần tử)
         java.util.List<Component> tabOrder = getExpectedTabOrder();
+        for (Component component : tabOrder) {
+            component.addFocusListener(new java.awt.event.FocusAdapter() {
+                @Override public void focusGained(java.awt.event.FocusEvent event) {
+                    if (component instanceof JComponent control)
+                        control.scrollRectToVisible(new Rectangle(0, 0, control.getWidth(), control.getHeight()));
+                }
+            });
+        }
         setFocusTraversalPolicyProvider(true);
         setFocusTraversalPolicy(new FocusTraversalPolicy() {
-            @Override public Component getComponentAfter(Container a, Component c) {
+            private Component next(Component c, int step) {
                 int idx = tabOrder.indexOf(c);
-                return tabOrder.get((idx + 1) % tabOrder.size());
+                for (int i = 0; i < tabOrder.size(); i++) {
+                    idx = Math.floorMod(idx + step, tabOrder.size());
+                    Component candidate = tabOrder.get(idx);
+                    if (candidate.isVisible() && candidate.isEnabled()) return candidate;
+                }
+                return usernameField;
             }
-            @Override public Component getComponentBefore(Container a, Component c) {
-                int idx = tabOrder.indexOf(c);
-                return tabOrder.get((idx - 1 + tabOrder.size()) % tabOrder.size());
-            }
+            @Override public Component getComponentAfter(Container a, Component c) { return next(c, 1); }
+            @Override public Component getComponentBefore(Container a, Component c) { return next(c, -1); }
             @Override public Component getFirstComponent(Container a) { return tabOrder.get(0); }
             @Override public Component getLastComponent(Container a) { return tabOrder.get(tabOrder.size() - 1); }
             @Override public Component getDefaultComponent(Container a) { return tabOrder.get(0); }
         });
+    }
+
+    /** Center at normal sizes; keep the complete card reachable in a short viewport. */
+    private static final class CardViewport extends JPanel implements Scrollable {
+        private final JComponent card;
+        CardViewport(JComponent card) {
+            super(null);
+            this.card = card;
+            setOpaque(false);
+            add(card);
+        }
+        @Override public Dimension getPreferredSize() { return card.getPreferredSize(); }
+        @Override public Dimension getPreferredScrollableViewportSize() { return getPreferredSize(); }
+        @Override public boolean getScrollableTracksViewportWidth() { return true; }
+        @Override public boolean getScrollableTracksViewportHeight() {
+            return getParent() instanceof JViewport viewport
+                    && viewport.getHeight() >= getPreferredSize().height;
+        }
+        @Override public int getScrollableUnitIncrement(Rectangle visible, int orientation, int direction) { return 16; }
+        @Override public int getScrollableBlockIncrement(Rectangle visible, int orientation, int direction) {
+            return Math.max(16, visible.height - 16);
+        }
+        @Override public void doLayout() {
+            Dimension preferred = getPreferredSize();
+            int width = Math.min(getWidth(), preferred.width);
+            card.setBounds(Math.max(0, (getWidth() - width) / 2),
+                    Math.max(0, (getHeight() - preferred.height) / 2),
+                    width, preferred.height);
+        }
     }
 
     private void updateResponsiveLayout() {
@@ -347,7 +407,7 @@ public class LoginFrame extends JFrame {
     }
 
     public java.util.List<Component> getExpectedTabOrder() {
-        return java.util.List.of(usernameField, passwordField, loginButton, googleLoginButton, registerButton, testConnectionButton);
+        return java.util.List.of(usernameField, forgotPasswordButton, passwordField, loginButton, googleLoginButton, registerButton, testConnectionButton);
     }
 
     private void setupEvents() {
@@ -355,12 +415,25 @@ public class LoginFrame extends JFrame {
         googleLoginButton.addActionListener(e -> executeGoogleOAuthLogin());
         usernameField.addActionListener(e -> passwordField.requestFocusInWindow());
         passwordField.addActionListener(e -> executeLogin());
+        forgotPasswordButton.addActionListener(e -> JOptionPane.showMessageDialog(this,
+                "Vui lòng liên hệ Quản trị viên để được đặt lại mật khẩu.",
+                "Quên mật khẩu", JOptionPane.INFORMATION_MESSAGE));
 
         registerButton.addActionListener(e -> {
+            if (disposed || !registerButton.isVisible()
+                    || currentPublicConfig == null || !currentPublicConfig.registrationEnabled()
+                    || currentPublicConfig.maintenanceMode()) return;
+            if (activeRegisterFrame != null && activeRegisterFrame.isDisplayable()) {
+                activeRegisterFrame.toFront();
+                return;
+            }
             RegisterFrame registerFrame = new RegisterFrame(apiClient, prefilledUsername -> {
+                if (disposed) return;
                 setPrefilledUsername(prefilledUsername);
                 setVisible(true);
             });
+            activeRegisterFrame = registerFrame;
+            if (currentPublicConfig != null) registerFrame.applyPublicConfig(currentPublicConfig);
             registerFrame.setVisible(true);
         });
 
@@ -376,8 +449,10 @@ public class LoginFrame extends JFrame {
      * Kiểm tra trạng thái máy chủ và đo độ trễ kết nối HTTPS.
      */
     public void checkServerConnection() {
-        connectionStatusLabel.setText("Đang kiểm tra kết nối tới " + apiClient.getBaseUrl() + "...");
-        connectionStatusLabel.setForeground(Theme.textSecondary());
+        if (disposed || checkingConnection) return;
+        checkingConnection = true;
+        testConnectionButton.setEnabled(false);
+        setConnectionStatus("Đang kiểm tra kết nối...", Theme.textSecondary());
 
         SwingWorker<Long, Void> worker = new SwingWorker<>() {
             @Override
@@ -387,24 +462,51 @@ public class LoginFrame extends JFrame {
 
             @Override
             protected void done() {
+                checkingConnection = false;
+                if (disposed) return;
                 try {
                     long latency = get();
-                    connectionStatusLabel.setText("[OK] Kết nối TLS máy chủ thành công (" + latency + " ms)");
-                    connectionStatusLabel.setForeground(Theme.success());
+                    String transport = apiClient.getBaseUrl().startsWith("https:") ? "TLS" : "HTTP";
+                    setConnectionStatus("[OK] Kết nối " + transport + " thành công (" + latency + " ms)", Theme.success());
                 } catch (Exception ex) {
-                    Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
-                    connectionStatusLabel.setText("[X] Lỗi kết nối máy chủ: " + cause.getMessage());
-                    connectionStatusLabel.setForeground(Theme.danger());
+                    setConnectionStatus(connectionFailureText(ex), Theme.danger());
+                } finally {
+                    testConnectionButton.setEnabled(true);
                 }
             }
         };
         worker.execute();
     }
 
+    private void setConnectionStatus(String message, Color color) {
+        connectionStatusLabel.setText(message);
+        connectionStatusLabel.setToolTipText(message);
+        connectionStatusLabel.setForeground(color);
+        SwingUtilities.invokeLater(() -> {
+            if (!disposed) connectionStatusLabel.scrollRectToVisible(
+                    new Rectangle(0, 0, connectionStatusLabel.getWidth(), connectionStatusLabel.getHeight()));
+        });
+    }
+
+    private static String connectionFailureText(Throwable error) {
+        // Do not display raw TLS/provider/HTTP exception details (or "null").
+        for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+            if (cause instanceof javax.net.ssl.SSLException)
+                return "[X] Chứng chỉ TLS không hợp lệ.";
+            if (cause instanceof java.net.http.HttpTimeoutException)
+                return "[X] Kết nối quá thời gian chờ.";
+            if (cause instanceof ApiException api)
+                return "[X] Máy chủ trả HTTP " + api.getStatusCode() + ".";
+        }
+        return "[X] Không kết nối được máy chủ.";
+    }
+
     /**
      * [EP-P1] Lấy cấu hình công khai của hệ thống để điều chỉnh giao diện.
      */
     public void fetchPublicConfig() {
+        if (disposed || fetchingConfig) return;
+        fetchingConfig = true;
         SwingWorker<PublicConfigDto, Void> worker = new SwingWorker<>() {
             @Override
             protected PublicConfigDto doInBackground() throws Exception {
@@ -413,12 +515,15 @@ public class LoginFrame extends JFrame {
 
             @Override
             protected void done() {
+                fetchingConfig = false;
+                if (disposed) return;
                 try {
                     PublicConfigDto config = get();
                     SessionStore.getInstance().setPublicConfig(config);
                     applyPublicConfig(config);
                 } catch (Exception ignored) {
-                    // Nếu lỗi kết nối ban đầu, dùng cấu hình mặc định
+                    SessionStore.getInstance().setPublicConfig(null);
+                    applyPublicConfig(null);
                 }
             }
         };
@@ -426,14 +531,18 @@ public class LoginFrame extends JFrame {
     }
 
     public void applyPublicConfig(PublicConfigDto config) {
-        if (config == null) return;
+        currentPublicConfig = config;
 
-        maintenanceBanner.setVisible(config.maintenanceMode());
-        boolean oauthEnabled = config.oauth2LinkEnabled();
+        maintenanceBanner.setVisible(config != null && config.maintenanceMode());
+        boolean oauthEnabled = config != null && config.oauth2LinkEnabled() && !config.maintenanceMode();
         oauthDivider.setVisible(oauthEnabled);
         googleLoginButton.setVisible(oauthEnabled);
-        registerButton.setVisible(config.registrationEnabled());
-        noAccountLbl.setVisible(config.registrationEnabled());
+        boolean registrationEnabled = config != null && config.registrationEnabled() && !config.maintenanceMode();
+        registerButton.setVisible(registrationEnabled);
+        noAccountLbl.setVisible(registrationEnabled);
+        if (activeRegisterFrame != null && activeRegisterFrame.isDisplayable()) {
+            activeRegisterFrame.applyPublicConfig(config);
+        }
 
         revalidate();
         repaint();
@@ -445,6 +554,7 @@ public class LoginFrame extends JFrame {
      * rồi nhận JWT vào thẳng MainFrame (kèm hộp thư Gmail & ảnh đại diện sẵn sàng).
      */
     private void executeGoogleOAuthLogin() {
+        if (disposed || !googleLoginButton.isEnabled() || !googleLoginButton.isVisible()) return;
         errorLabel.setText(" ");
         connectionStatusLabel.setText(" ");
         resetBorders();
@@ -510,8 +620,12 @@ public class LoginFrame extends JFrame {
                     if (cancelled.get() || isCancelled()) {
                         return null;
                     }
-                    ApiClient.GoogleLoginPollDto poll = apiClient.pollGoogleOAuthLogin(start.pollToken());
+                    ApiClient.GoogleLoginPollDto poll = apiClient.requestGoogleOAuthLoginPoll(start.pollToken());
                     if (poll != null && !"PENDING".equalsIgnoreCase(poll.status())) {
+                        if ("SUCCESS".equalsIgnoreCase(poll.status())) {
+                            LoginResponse verified = apiClient.verifyLogin(poll.loginResponse());
+                            return new ApiClient.GoogleLoginPollDto(poll.status(), verified, poll.code(), poll.message());
+                        }
                         return poll;
                     }
                 }
@@ -568,6 +682,7 @@ public class LoginFrame extends JFrame {
     }
 
     private void executeLogin() {
+        if (!loginButton.isEnabled()) return;
         String username = usernameField.getText().trim();
         String password = new String(passwordField.getPassword());
 
@@ -591,17 +706,20 @@ public class LoginFrame extends JFrame {
             return;
         }
 
-        loginButton.setLoading(true, "Đang xác thực...");
+        loginButton.setLoading(true, "Đang đăng nhập...");
+        googleLoginButton.setEnabled(false);
 
         SwingWorker<LoginResponse, Void> worker = new SwingWorker<>() {
             @Override
             protected LoginResponse doInBackground() throws Exception {
-                return apiClient.login(username, password);
+                return apiClient.verifyLogin(apiClient.requestLogin(username, password));
             }
 
             @Override
             protected void done() {
                 loginButton.setLoading(false, "Đăng Nhập");
+                googleLoginButton.setEnabled(true);
+                if (!isDisplayable()) return;
 
                 try {
                     LoginResponse response = get();
@@ -622,7 +740,10 @@ public class LoginFrame extends JFrame {
     }
 
     private void handleLoginSuccess(LoginResponse response) {
+        if (disposed) return;
+        if (activeRegisterFrame != null) activeRegisterFrame.dispose();
         UserDto user = response.user();
+        apiClient.setAccessToken(response.accessToken());
         SessionStore.getInstance().saveSession(response.accessToken(), user);
 
         // Nếu mustChangePassword=true, BẮT BUỘC mở ChangePasswordDialog (modal, không tắt được)
@@ -654,7 +775,7 @@ public class LoginFrame extends JFrame {
             errorLabel.setText("Sai tên đăng nhập hoặc mật khẩu.");
             passwordField.setText("");
             passwordField.requestFocusInWindow();
-        } else if (status == 403 && "ACCOUNT_LOCKED".equalsIgnoreCase(code)) {
+        } else if (status == 403 && ("ACCOUNT_LOCKED".equalsIgnoreCase(code) || "ACCOUNT_DISABLED".equalsIgnoreCase(code))) {
             errorLabel.setText("Tài khoản đã bị khóa. Vui lòng liên hệ Quản trị viên.");
         } else if (status == 429) {
             startRateLimitCountdown(ex.getRetryAfterSeconds());
@@ -674,7 +795,7 @@ public class LoginFrame extends JFrame {
             rateLimitTimer.stop();
         }
 
-        errorLabel.setText("Đăng nhập sai quá 5 lần. Thử lại sau " + remainingSeconds + "s.");
+        errorLabel.setText("Đăng nhập sai quá giới hạn. Thử lại sau " + remainingSeconds + "s.");
 
         rateLimitTimer = new Timer(1000, (ActionEvent e) -> {
             remainingSeconds--;
@@ -684,7 +805,7 @@ public class LoginFrame extends JFrame {
                 loginButton.setText("Đăng Nhập");
                 errorLabel.setText(" ");
             } else {
-                errorLabel.setText("Đăng nhập sai quá 5 lần. Thử lại sau " + remainingSeconds + "s.");
+                errorLabel.setText("Đăng nhập sai quá giới hạn. Thử lại sau " + remainingSeconds + "s.");
             }
         });
         rateLimitTimer.start();
@@ -715,6 +836,12 @@ public class LoginFrame extends JFrame {
 
     @Override
     public void dispose() {
+        disposed = true;
+        if (activeRegisterFrame != null) {
+            activeRegisterFrame.dispose();
+            activeRegisterFrame = null;
+        }
+        if (publicConfigTimer != null) publicConfigTimer.stop();
         if (rateLimitTimer != null && rateLimitTimer.isRunning()) rateLimitTimer.stop();
         if (heroPanel != null) heroPanel.stopAnimation();
         if (cardPanel != null) cardPanel.stopAnimation();

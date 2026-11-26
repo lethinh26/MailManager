@@ -60,6 +60,8 @@ class MailConnectionFaultAndRetryTest {
         MailConnectionProperties properties = new MailConnectionProperties();
         properties.setImapHost("127.0.0.1");
         properties.setImapPort(IMAPS_PORT);
+        properties.setLocalTestTransport(true);
+        properties.setPoolEnabled(false);
         properties.setRetryEnabled(true);
         properties.setRetryMaxAttempts(2);
         properties.setRetryWaitDurationMs(50);

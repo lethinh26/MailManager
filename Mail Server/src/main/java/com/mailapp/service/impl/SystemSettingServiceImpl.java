@@ -11,8 +11,11 @@ import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Primary;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.util.concurrent.TimeUnit;
+import java.util.Optional;
 
 /**
  * Triển khai SystemSettingService đọc trực tiếp từ bảng system_settings
@@ -26,7 +29,7 @@ public class SystemSettingServiceImpl implements SystemSettingService {
 
     private final SystemSettingRepository systemSettingRepository;
 
-    private final Cache<String, String> cache = Caffeine.newBuilder()
+    private final Cache<String, Optional<String>> cache = Caffeine.newBuilder()
             .expireAfterWrite(3, TimeUnit.SECONDS)
             .maximumSize(100)
             .build();
@@ -72,7 +75,7 @@ public class SystemSettingServiceImpl implements SystemSettingService {
 
     @Override
     public int getMailPageSize() {
-        return parseInt("MAIL_PAGE_SIZE", 30);
+        return parseInt("MAIL_PAGE_SIZE", 20);
     }
 
     @Override
@@ -110,21 +113,39 @@ public class SystemSettingServiceImpl implements SystemSettingService {
             setting.setUpdatedBy(updatedBy);
         }
         systemSettingRepository.save(setting);
-        // Xóa cache tức thì để mọi request tiếp theo thấy ngay giá trị mới
-        cache.invalidate(key);
-        cache.put(key, value);
-        log.info("Cập nhật system_setting key={} value={}", key, value);
+        // Read committed data on next access; an older commit cannot overwrite a newer cache entry.
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            afterCommit(() -> cache.invalidate(key));
+        } else {
+            cache.invalidate(key);
+            cache.put(key, Optional.ofNullable(value));
+        }
+        log.info("Cập nhật system_setting");
     }
 
     @Override
     public void evictCache() {
-        cache.invalidateAll();
+        afterCommit(cache::invalidateAll);
+    }
+
+    private void afterCommit(Runnable action) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    action.run();
+                }
+            });
+        } else {
+            action.run();
+        }
     }
 
     @Override
     public String getSettingValue(String key, String defaultValue) {
+        // Cache the DB result, not the caller's fallback. Two callers may
+        // legitimately ask for different defaults for the same missing key.
         return cache.get(key, k -> systemSettingRepository.findById(k)
-                .map(SystemSetting::getValue)
-                .orElse(defaultValue));
+                .map(SystemSetting::getValue)).orElse(defaultValue);
     }
 }

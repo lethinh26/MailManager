@@ -1,6 +1,7 @@
 package com.mailapp.client.ui.frames;
 
 import com.mailapp.client.model.RegisterRequest;
+import com.mailapp.client.model.PublicConfigDto;
 import com.mailapp.client.model.UserDto;
 import com.mailapp.client.net.ApiClient;
 import com.mailapp.client.net.ApiException;
@@ -8,7 +9,9 @@ import com.mailapp.client.ui.theme.AppIcons;
 import com.mailapp.client.ui.theme.AuthUiKit;
 import com.mailapp.client.ui.theme.Theme;
 import com.mailapp.client.util.ClientConfig;
+import com.mailapp.client.util.ClientSafetyUtil;
 import com.mailapp.client.util.PasswordValidator;
+import com.mailapp.client.util.FeatureAdmission;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
@@ -50,6 +53,9 @@ public class RegisterFrame extends JFrame {
 
     private AuthUiKit.AnimatedGradientButton registerButton;
     private JButton backToLoginButton;
+    private final FeatureAdmission registrationAdmission = new FeatureAdmission(true);
+    private boolean submitting;
+    private volatile boolean disposed;
 
     public RegisterFrame(ApiClient apiClient, Consumer<String> onRegisterSuccess) {
         super("Đăng Ký Tài Khoản — " + AppIcons.BRAND_FULL);
@@ -109,7 +115,7 @@ public class RegisterFrame extends JFrame {
         headerRow.add(titleStack, BorderLayout.CENTER);
 
         usernameField = new JTextField(20);
-        userWrap = new AuthUiKit.ModernFieldWrapper(usernameField, AppIcons.Glyph.USER, "VD: nguyen_van_a (3–50 ký tự)");
+        userWrap = new AuthUiKit.ModernFieldWrapper(usernameField, AppIcons.Glyph.USER, "VD: nguyen_van_a (3–64 ký tự)");
         userWrap.setAlignmentX(Component.LEFT_ALIGNMENT);
 
         fullNameField = new JTextField(20);
@@ -230,17 +236,24 @@ public class RegisterFrame extends JFrame {
         java.util.List<Component> tabOrder = getExpectedTabOrder();
         setFocusTraversalPolicyProvider(true);
         setFocusTraversalPolicy(new FocusTraversalPolicy() {
-            @Override public Component getComponentAfter(Container a, Component c) {
+            private Component next(Container a, Component c, int step) {
                 int idx = tabOrder.indexOf(c);
-                return tabOrder.get((idx + 1) % tabOrder.size());
+                for (int i = 0; i < tabOrder.size(); i++) {
+                    idx = Math.floorMod(idx + step, tabOrder.size());
+                    Component candidate = tabOrder.get(idx);
+                    if (candidate.isEnabled() && candidate.isVisible()) return candidate;
+                }
+                return backToLoginButton;
+            }
+            @Override public Component getComponentAfter(Container a, Component c) {
+                return next(a, c, 1);
             }
             @Override public Component getComponentBefore(Container a, Component c) {
-                int idx = tabOrder.indexOf(c);
-                return tabOrder.get((idx - 1 + tabOrder.size()) % tabOrder.size());
+                return next(a, c, -1);
             }
-            @Override public Component getFirstComponent(Container a) { return tabOrder.get(0); }
+            @Override public Component getFirstComponent(Container a) { return next(a, backToLoginButton, 1); }
             @Override public Component getLastComponent(Container a) { return tabOrder.get(tabOrder.size() - 1); }
-            @Override public Component getDefaultComponent(Container a) { return tabOrder.get(0); }
+            @Override public Component getDefaultComponent(Container a) { return getFirstComponent(a); }
         });
     }
 
@@ -302,6 +315,8 @@ public class RegisterFrame extends JFrame {
     }
 
     private void executeRegister() {
+        if (disposed || submitting || !registrationAdmission.isAllowed() || !registerButton.isEnabled()) return;
+        FeatureAdmission.Ticket admission = registrationAdmission.capture();
         String username = usernameField.getText().trim();
         String fullName = fullNameField.getText().trim();
         String email = emailField.getText().trim();
@@ -313,19 +328,19 @@ public class RegisterFrame extends JFrame {
 
         boolean hasClientError = false;
 
-        if (username.length() < 3 || username.length() > 50 || !username.matches("^[a-zA-Z0-9_]+$")) {
+        if (username.length() < 3 || username.length() > 64 || !username.matches("^[a-zA-Z0-9_]+$")) {
             userWrap.setError(true);
-            errorLabel.setText("Tên đăng nhập phải từ 3 đến 50 ký tự (chỉ gồm chữ, số, _).");
+            errorLabel.setText("Tên đăng nhập phải từ 3 đến 64 ký tự (chỉ gồm chữ, số, _).");
             hasClientError = true;
         }
 
-        if (fullName.isEmpty()) {
+        if (fullName.isEmpty() || fullName.length() > 255) {
             fullNameWrap.setError(true);
-            if (!hasClientError) errorLabel.setText("Vui lòng nhập họ và tên.");
+            if (!hasClientError) errorLabel.setText("Họ và tên phải có từ 1 đến 255 ký tự.");
             hasClientError = true;
         }
 
-        if (email.isEmpty() || !email.matches("^[A-Za-z0-9+_.-]+@(.+)$")) {
+        if (email.length() > 255 || !com.mailapp.client.util.ComposeValidation.isEmail(email)) {
             emailWrap.setError(true);
             if (!hasClientError) errorLabel.setText("Địa chỉ email không đúng định dạng.");
             hasClientError = true;
@@ -333,7 +348,7 @@ public class RegisterFrame extends JFrame {
 
         if (!PasswordValidator.meetsPolicy(password)) {
             passWrap.setError(true);
-            if (!hasClientError) errorLabel.setText("Mật khẩu phải từ 8 ký tự trở lên, gồm cả chữ và số.");
+            if (!hasClientError) errorLabel.setText("Mật khẩu tối thiểu 8 ký tự, gồm chữ và số, tối đa 72 byte UTF-8.");
             hasClientError = true;
         }
 
@@ -348,19 +363,35 @@ public class RegisterFrame extends JFrame {
             return;
         }
 
+        submitting = true;
         registerButton.setLoading(true, "Đang tạo tài khoản...");
+        updateFormEnabled();
 
         RegisterRequest request = new RegisterRequest(username, email, password, fullName, "USER");
 
         SwingWorker<UserDto, Void> worker = new SwingWorker<>() {
             @Override
             protected UserDto doInBackground() throws Exception {
+                PublicConfigDto config = apiClient.getPublicConfig();
+                if (disposed) throw new InterruptedException();
+                requireRegistrationAdmission(admission);
+                if (config == null) {
+                    throw new ApiException(503, "CONFIG_UNAVAILABLE", "Chưa tải được cấu hình đăng ký.");
+                }
+                if (!config.registrationEnabled() || config.maintenanceMode()) {
+                    throw new ApiException(403, "REGISTRATION_DISABLED", "Đăng ký đã bị tắt");
+                }
+                if (disposed) throw new InterruptedException();
+                requireRegistrationAdmission(admission);
                 return apiClient.register(request);
             }
 
             @Override
             protected void done() {
+                submitting = false;
+                if (disposed) return;
                 registerButton.setLoading(false, "Đăng Ký Tài Khoản");
+                updateFormEnabled();
 
                 try {
                     UserDto createdUser = get();
@@ -372,7 +403,7 @@ public class RegisterFrame extends JFrame {
                             JOptionPane.INFORMATION_MESSAGE
                     );
 
-                    if (onRegisterSuccess != null) {
+                    if (!disposed && onRegisterSuccess != null) {
                         onRegisterSuccess.accept(createdUser.username());
                     }
 
@@ -380,9 +411,9 @@ public class RegisterFrame extends JFrame {
                 } catch (Exception ex) {
                     Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
                     if (cause instanceof ApiException apiEx) {
-                        handleServerError(apiEx);
+                        handleServerError(apiEx, admission);
                     } else {
-                        errorLabel.setText("Lỗi kết nối máy chủ: " + cause.getMessage());
+                        errorLabel.setText(ClientSafetyUtil.toFriendlyVietnameseError(cause));
                         cardPanel.triggerShake();
                     }
                 }
@@ -392,19 +423,26 @@ public class RegisterFrame extends JFrame {
         worker.execute();
     }
 
-    private void handleServerError(ApiException ex) {
+    private void handleServerError(ApiException ex, FeatureAdmission.Ticket admission) {
         String code = ex.getCode();
         int status = ex.getStatusCode();
         cardPanel.triggerShake();
 
-        if (status == 409 && "EMAIL_TAKEN".equalsIgnoreCase(code)) {
+        if ("FORM_INVALIDATED".equals(code)) {
+            if (registrationAdmission.isAllowed()) errorLabel.setText(ex.getMessage());
+            else setRegistrationAllowed(false);
+        } else if (status == 409 && "EMAIL_TAKEN".equalsIgnoreCase(code)) {
             emailWrap.setError(true);
             errorLabel.setText(ex.getMessage());
         } else if (status == 409 || "USERNAME_TAKEN".equalsIgnoreCase(code)) {
             userWrap.setError(true);
             errorLabel.setText("Tên đăng nhập '" + usernameField.getText().trim() + "' đã tồn tại. Vui lòng chọn tên khác.");
-        } else if (status == 403 || "REGISTRATION_DISABLED".equalsIgnoreCase(code)) {
-            errorLabel.setText("Hệ thống hiện đang tắt tính năng đăng ký mới. Vui lòng liên hệ Quản trị viên.");
+        } else if ("REGISTRATION_DISABLED".equalsIgnoreCase(code)) {
+            if (registrationAdmission.isCurrent(admission)) setRegistrationAllowed(false);
+            else if (registrationAdmission.isAllowed()) errorLabel.setText(ex.getMessage());
+        } else if ("CONFIG_UNAVAILABLE".equalsIgnoreCase(code)) {
+            if (registrationAdmission.isCurrent(admission)) applyPublicConfig(null);
+            else if (registrationAdmission.isAllowed()) errorLabel.setText(ex.getMessage());
         } else if (status == 429) {
             errorLabel.setText("Quá nhiều lần gửi yêu cầu. Vui lòng thử lại sau " + ex.getRetryAfterSeconds() + " giây.");
         } else if (status == 400) {
@@ -435,8 +473,47 @@ public class RegisterFrame extends JFrame {
         confirmWrap.setError(false);
     }
 
+    private void requireRegistrationAdmission(FeatureAdmission.Ticket admission) {
+        if (!registrationAdmission.isCurrent(admission)) {
+            throw new ApiException(400, "FORM_INVALIDATED",
+                    "Cấu hình đăng ký đã thay đổi. Vui lòng nhập lại mật khẩu và bấm Đăng ký.");
+        }
+    }
+
+    public void applyPublicConfig(PublicConfigDto config) {
+        if (disposed) return;
+        setRegistrationAllowed(config != null && config.registrationEnabled() && !config.maintenanceMode());
+        if (config == null) errorLabel.setText("Chưa tải được cấu hình đăng ký. Hãy kiểm tra kết nối.");
+    }
+
+    private void setRegistrationAllowed(boolean allowed) {
+        boolean changed = registrationAdmission.isAllowed() != allowed;
+        registrationAdmission.update(allowed);
+        if (!allowed) {
+            passwordField.setText("");
+            confirmPasswordField.setText("");
+            errorLabel.setText("Đăng ký đã bị tắt hoặc hệ thống đang bảo trì. Vui lòng liên hệ Quản trị viên.");
+        } else if (changed) {
+            errorLabel.setText(" ");
+        }
+        updateFormEnabled();
+    }
+
+    private void updateFormEnabled() {
+        boolean enabled = registrationAdmission.isAllowed() && !submitting;
+        registerButton.setEnabled(enabled);
+        usernameField.setEnabled(enabled);
+        fullNameField.setEnabled(enabled);
+        emailField.setEnabled(enabled);
+        passwordField.setEnabled(enabled);
+        confirmPasswordField.setEnabled(enabled);
+    }
+
     @Override
     public void dispose() {
+        disposed = true;
+        if (passwordField != null) passwordField.setText("");
+        if (confirmPasswordField != null) confirmPasswordField.setText("");
         if (cardPanel != null) cardPanel.stopAnimation();
         if (userWrap != null) userWrap.stopAnimation();
         if (fullNameWrap != null) fullNameWrap.stopAnimation();

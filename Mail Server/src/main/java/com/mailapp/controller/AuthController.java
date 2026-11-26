@@ -63,20 +63,18 @@ public class AuthController {
     @Operation(
             summary = "Đăng nhập hệ thống (EP-A2)",
             description = "Xác thực tài khoản bằng username và password. Trả về JWT Access Token hạn 24h và thông tin người dùng. " +
-                    "Hỗ trợ bảo vệ chống brute-force (tối đa 5 lần sai / 15 phút) và kiểm tra chế độ bảo trì."
+                    "Hỗ trợ bảo vệ chống brute-force (giới hạn LOGIN_MAX_FAILED_ATTEMPTS / 15 phút) và kiểm tra chế độ bảo trì."
     )
     @ApiResponses(value = {
             @ApiResponse(responseCode = "200", description = "Đăng nhập thành công",
                     content = @Content(schema = @Schema(implementation = LoginResponse.class))),
             @ApiResponse(responseCode = "400", description = "Dữ liệu yêu cầu không hợp lệ (VALIDATION_ERROR)",
                     content = @Content(schema = @Schema(implementation = ErrorResponse.class))),
-            @ApiResponse(responseCode = "401", description = "Sai tài khoản hoặc mật khẩu (INVALID_CREDENTIALS)",
+            @ApiResponse(responseCode = "401", description = "Sai tài khoản hoặc mật khẩu (UNAUTHORIZED)",
                     content = @Content(schema = @Schema(implementation = ErrorResponse.class))),
-            @ApiResponse(responseCode = "403", description = "Tài khoản bị khóa (ACCOUNT_LOCKED)",
+            @ApiResponse(responseCode = "403", description = "Tài khoản bị khóa (ACCOUNT_DISABLED) hoặc bảo trì (MAINTENANCE_MODE)",
                     content = @Content(schema = @Schema(implementation = ErrorResponse.class))),
             @ApiResponse(responseCode = "429", description = "Vượt quá số lần thử đăng nhập (TOO_MANY_ATTEMPTS kèm header Retry-After)",
-                    content = @Content(schema = @Schema(implementation = ErrorResponse.class))),
-            @ApiResponse(responseCode = "503", description = "Hệ thống đang bảo trì (MAINTENANCE_MODE)",
                     content = @Content(schema = @Schema(implementation = ErrorResponse.class)))
     })
     public ResponseEntity<LoginResponse> login(

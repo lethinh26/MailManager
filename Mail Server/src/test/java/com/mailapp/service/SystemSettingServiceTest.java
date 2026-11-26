@@ -41,6 +41,8 @@ class SystemSettingServiceTest {
         assertFalse(service.isMaintenanceMode());
         assertEquals(5, service.getMaxGmailPerUser());
         assertEquals(25, service.getMaxAttachmentSizeMb());
+        assertEquals(20, service.getMailPageSize());
+        assertEquals(5, service.getLoginMaxFailedAttempts());
     }
 
     @Test
@@ -56,6 +58,21 @@ class SystemSettingServiceTest {
         // Lần 2: lấy từ Caffeine cache, không gọi lại repository
         assertFalse(service.isOAuth2LinkEnabled());
         verify(systemSettingRepository, times(1)).findById("ALLOW_OAUTH2_LINK");
+    }
+
+    @Test
+    void genericAccessorsUseKnownDefaultsWithoutCachingCallerFallback() {
+        when(systemSettingRepository.findById(anyString())).thenReturn(Optional.empty());
+        assertFalse(service.getBoolOrDefault("ALLOW_REGISTRATION", false));
+        assertTrue(service.getBool("ALLOW_REGISTRATION"));
+        assertTrue(service.isRegistrationEnabled());
+        verify(systemSettingRepository, times(1)).findById("ALLOW_REGISTRATION");
+        assertEquals(20, service.getInt("MAIL_PAGE_SIZE"));
+        assertEquals("20", service.getString("MAIL_PAGE_SIZE"));
+        assertNull(service.getString("MISSING_KEY"));
+        assertTrue(service.getBoolOrDefault("MISSING_KEY", true));
+        assertFalse(service.getBoolOrDefault("MISSING_KEY", false));
+        verify(systemSettingRepository, times(1)).findById("MISSING_KEY");
     }
 
     @Test

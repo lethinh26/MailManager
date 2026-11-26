@@ -26,8 +26,8 @@ public class DefaultAccessTokenProvider implements AccessTokenProvider {
     @Override
     public String getValidAccessToken(GmailAccount account) {
         Objects.requireNonNull(account, "GmailAccount không được null");
-        if (account.getAuthType() != AuthType.OAUTH2) {
-            throw new IllegalArgumentException("Tài khoản không phải loại xác thực OAuth2: " + account.getEmail());
+        if (!account.hasOAuth() && account.getAuthType() != AuthType.OAUTH2) {
+            throw new IllegalArgumentException("Tài khoản chưa có phương thức xác thực OAuth2.");
         }
         return oauth2Service.getFreshAccessToken(account);
     }

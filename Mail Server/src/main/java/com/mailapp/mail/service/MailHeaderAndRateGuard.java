@@ -4,6 +4,8 @@ import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.mailapp.exception.AppException;
 import com.mailapp.exception.RateLimitException;
+import jakarta.mail.internet.AddressException;
+import jakarta.mail.internet.InternetAddress;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
@@ -90,7 +92,13 @@ public class MailHeaderAndRateGuard {
             String trimmed = addr.trim();
             if (!SIMPLE_EMAIL.matcher(trimmed).matches()) {
                 throw new AppException(HttpStatus.BAD_REQUEST, "INVALID_EMAIL",
-                        "Địa chỉ email không hợp lệ trong '" + field + "': " + trimmed);
+                        "Địa chỉ email không hợp lệ trong '" + field + "'.");
+            }
+            try {
+                new InternetAddress(trimmed, true).validate();
+            } catch (AddressException e) {
+                throw new AppException(HttpStatus.BAD_REQUEST, "INVALID_EMAIL",
+                        "Địa chỉ email không hợp lệ trong '" + field + "'.");
             }
         }
     }

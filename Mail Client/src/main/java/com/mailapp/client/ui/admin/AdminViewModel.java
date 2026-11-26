@@ -18,6 +18,10 @@ public final class AdminViewModel {
      * Trả về null nếu hợp lệ, hoặc chuỗi lỗi tiếng Việt cụ thể nếu vi phạm.
      */
     public static String validateSettingsUpdate(Map<String, String> settings) {
+        return validateSettingsUpdate(settings, false);
+    }
+
+    public static String validateSettingsUpdate(Map<String, String> settings, boolean legacyUnlimitedQuota) {
         if (settings == null || settings.isEmpty()) {
             return "Không có cấu hình nào để lưu.";
         }
@@ -29,7 +33,7 @@ public final class AdminViewModel {
         }
 
         String err;
-        if ((err = checkIntRange(settings, "MAX_GMAIL_PER_USER", 0, 50)) != null) return err;
+        if ((err = checkIntRange(settings, "MAX_GMAIL_PER_USER", legacyUnlimitedQuota ? 0 : 1, 50)) != null) return err;
         if ((err = checkIntRange(settings, "MAX_ATTACHMENT_SIZE_MB", 1, 50)) != null) return err;
         if ((err = checkIntRange(settings, "MAIL_PAGE_SIZE", 10, 100)) != null) return err;
         if ((err = checkIntRange(settings, "LOGIN_MAX_FAILED_ATTEMPTS", 3, 20)) != null) return err;

@@ -1,5 +1,7 @@
 # Java Mail App — Thiết kế hệ thống v2 (để duyệt)
 
+> **Phụ lục đặc tả đã phê duyệt 26/11/2026 (sau G6):** Ba Task Detail AM-4323, AM-4340, AM-4391 trong [Tasks Detail](Tasks%20Detail/) có §4 hiện hành ưu tiên hơn những mô tả cũ tương ứng ở tài liệu này: SEND_MAIL chỉ metadata đã che/số lượng, không raw To/subject/body; bootstrap Admin từ cấu hình BCrypt/forced-change, không mật khẩu cố định/console plaintext, schema additive V1–V9; DELETE 204 mặc định, explicit permanent=true chỉ trong Trash, UIDVALIDITY và targeted UID MOVE/UIDPLUS, không global expunge. Giữ các yêu cầu còn lại và nghiệm thu Gmail thật; mô tả gốc bên dưới được bảo toàn để truy vết.
+
 > Dự án môn học: Ứng dụng Windows quản lý nhiều Gmail, gửi / nhận mail an toàn qua TLS
 > Client: **Java Swing thuần** | Backend: **Spring Boot** | DB: **MySQL 8**
 > Phiên bản: **v2 — 2026-10-23** — thay thế v1

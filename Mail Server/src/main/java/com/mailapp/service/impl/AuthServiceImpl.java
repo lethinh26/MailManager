@@ -56,13 +56,20 @@ public class AuthServiceImpl implements AuthService {
     }
 
     @Override
-    @Transactional
+    // Rejected login attempts have no user writes; retain their audit record.
+    @Transactional(noRollbackFor = AppException.class)
     public LoginResponse login(LoginRequest request, String clientIp) {
         String username = request.username().trim();
         String password = request.password();
 
         // 1. Kiểm tra giới hạn tần suất đăng nhập (Rate Limiter)
         loginRateLimiter.checkLimit(username, clientIp);
+
+        if (!com.mailapp.security.PasswordPolicy.fitsBcrypt(password)) {
+            loginRateLimiter.recordFailedAttempt(username, clientIp);
+            auditLogService.log(null, "LOGIN_FAILED", "BAD_PASSWORD_LENGTH", clientIp);
+            throw new AppException(HttpStatus.UNAUTHORIZED, "UNAUTHORIZED", "Sai tài khoản hoặc mật khẩu");
+        }
 
         // 2. Tìm kiếm người dùng theo tên đăng nhập HOẶC địa chỉ email (hỗ trợ đăng nhập bằng Gmail + mật khẩu)
         var userOptional = userRepository.findByUsername(username)
@@ -72,12 +79,14 @@ public class AuthServiceImpl implements AuthService {
             // Chống timing attack: thực hiện phép băm tốn thời gian giả lập
             passwordEncoder.matches(password, DUMMY_BCRYPT_HASH);
             loginRateLimiter.recordFailedAttempt(username, clientIp);
-            auditLogService.log(null, "LOGIN_FAILED", "UNKNOWN_USER: username=" + username, clientIp);
-            log.warn("Đăng nhập thất bại: Tên người dùng không tồn tại [{}] từ IP: {}", username, clientIp);
-            throw new AppException(HttpStatus.UNAUTHORIZED, "INVALID_CREDENTIALS", "Sai tên đăng nhập hoặc mật khẩu.");
+            auditLogService.log(null, "LOGIN_FAILED", "UNKNOWN_USER", clientIp);
+            log.warn("Đăng nhập thất bại: Tên người dùng không tồn tại");
+            throw new AppException(HttpStatus.UNAUTHORIZED, "UNAUTHORIZED", "Sai tài khoản hoặc mật khẩu");
         }
 
-        User user = userOptional.get();
+        User user = userRepository.lockUserById(userOptional.get().getId())
+                .orElseThrow(() -> new AppException(HttpStatus.UNAUTHORIZED, "UNAUTHORIZED",
+                        "Sai tài khoản hoặc mật khẩu"));
 
         // 3. Kiểm tra mật khẩu bằng BCrypt
         boolean passwordMatches = passwordEncoder.matches(password, user.getPasswordHash());
@@ -85,28 +94,28 @@ public class AuthServiceImpl implements AuthService {
         if (!passwordMatches) {
             loginRateLimiter.recordFailedAttempt(username, clientIp);
             auditLogService.log(user.getId(), "LOGIN_FAILED", "BAD_PASSWORD", clientIp);
-            log.warn("Đăng nhập thất bại: Sai mật khẩu cho user [{}] từ IP: {}", username, clientIp);
-            throw new AppException(HttpStatus.UNAUTHORIZED, "INVALID_CREDENTIALS", "Sai tên đăng nhập hoặc mật khẩu.");
+            log.warn("Đăng nhập thất bại: Sai mật khẩu cho user id={}", user.getId());
+            throw new AppException(HttpStatus.UNAUTHORIZED, "UNAUTHORIZED", "Sai tài khoản hoặc mật khẩu");
         }
 
         // 4. Mật khẩu ĐÚNG -> Kiểm tra trạng thái tài khoản bị khóa (chỉ báo sau khi mật khẩu đúng)
         if (!user.isEnabled()) {
             auditLogService.log(user.getId(), "LOGIN_FAILED", "ACCOUNT_LOCKED", clientIp);
-            log.warn("Đăng nhập thất bại: Tài khoản bị khóa id={}, username={}", user.getId(), username);
-            throw new AppException(HttpStatus.FORBIDDEN, "ACCOUNT_LOCKED", "Tài khoản của bạn đã bị khóa.");
+            log.warn("Đăng nhập thất bại: Tài khoản bị khóa id={}", user.getId());
+            throw new AppException(HttpStatus.FORBIDDEN, "ACCOUNT_DISABLED", "Tài khoản của bạn đã bị khóa.");
         }
 
         // 5. Kiểm tra chế độ bảo trì hệ thống (MAINTENANCE_MODE)
         if (systemSettingService.isMaintenanceMode() && user.getRole() != Role.ADMIN) {
             auditLogService.log(user.getId(), "LOGIN_FAILED", "MAINTENANCE_MODE", clientIp);
             log.warn("Từ chối người dùng thông thường id={} trong thời gian bảo trì hệ thống", user.getId());
-            throw new AppException(HttpStatus.SERVICE_UNAVAILABLE, "MAINTENANCE_MODE",
+            throw new AppException(HttpStatus.FORBIDDEN, "MAINTENANCE_MODE",
                     "Hệ thống đang bảo trì, chỉ quản trị viên mới có thể đăng nhập.");
         }
 
         // 6. Tự động nâng cấp hash mật khẩu nếu thuật toán PasswordEncoder yêu cầu rehash
         if (passwordEncoder.upgradeEncoding(user.getPasswordHash())) {
-            log.info("Nâng cấp hash mật khẩu cho user: {}", username);
+            log.info("Nâng cấp hash mật khẩu cho user id={}", user.getId());
             user.setPasswordHash(passwordEncoder.encode(password));
             userRepository.save(user);
         }
@@ -119,9 +128,8 @@ public class AuthServiceImpl implements AuthService {
         long expiresInSeconds = jwtProvider.getExpirationSeconds();
 
         // 9. Ghi Audit Log thành công
-        auditLogService.log(user.getId(), "LOGIN_SUCCESS", "SUCCESS", clientIp);
-        log.info("Người dùng '{}' (id={}, role={}) đăng nhập thành công từ IP {}",
-                user.getUsername(), user.getId(), user.getRole(), clientIp);
+        auditLogService.log(user.getId(), "LOGIN", "SUCCESS", clientIp);
+        log.info("Người dùng id={}, role={} đăng nhập thành công", user.getId(), user.getRole());
 
         return LoginResponse.of(accessToken, expiresInSeconds, UserDto.from(user));
     }
@@ -155,7 +163,7 @@ public class AuthServiceImpl implements AuthService {
             loginRateLimiter.recordFailedAttempt("register", clientIp);
             throw new AppException(HttpStatus.CONFLICT, "USERNAME_TAKEN", "Tên đăng nhập '" + username + "' đã được sử dụng.");
         }
-        String normalizedEmail = request.email().trim().toLowerCase();
+        String normalizedEmail = request.email().trim().toLowerCase(java.util.Locale.ROOT);
         if (userRepository.findByEmailIgnoreCase(normalizedEmail).isPresent()) {
             loginRateLimiter.recordFailedAttempt("register", clientIp);
             throw new AppException(HttpStatus.CONFLICT, "EMAIL_TAKEN",
@@ -184,7 +192,8 @@ public class AuthServiceImpl implements AuthService {
     }
 
     @Override
-    @Transactional
+    // Validation failures precede all password writes and must retain failure audit.
+    @Transactional(noRollbackFor = AppException.class)
     public ChangePasswordResponse changePassword(ChangePasswordRequest request, User currentUser, String clientIp) {
         if (currentUser == null) {
             throw new AppException(HttpStatus.UNAUTHORIZED, "UNAUTHORIZED", "Chưa xác thực người dùng.");
@@ -194,56 +203,70 @@ public class AuthServiceImpl implements AuthService {
         String userKey = String.valueOf(currentUser.getId());
         loginRateLimiter.checkLimit("change-password", userKey);
 
+        // Authentication happened before this transaction; never merge the principal
+        // snapshot. Serialize with reset/lock/role changes and validate the latest hash.
+        User user = userRepository.lockUserById(currentUser.getId())
+                .filter(User::isEnabled)
+                .orElseThrow(() -> new AppException(HttpStatus.UNAUTHORIZED, "UNAUTHORIZED",
+                        "Phiên đăng nhập không còn hợp lệ."));
+        if (systemSettingService.isMaintenanceMode() && user.getRole() != Role.ADMIN) {
+            throw new AppException(HttpStatus.SERVICE_UNAVAILABLE, "MAINTENANCE_MODE", "Hệ thống đang bảo trì.");
+        }
+
         String currentPassword = request.currentPassword();
         String newPassword = request.newPassword();
 
         // 2. Kiểm tra mật khẩu hiện tại bằng BCrypt
-        if (!passwordEncoder.matches(currentPassword, currentUser.getPasswordHash())) {
+        if (!com.mailapp.security.PasswordPolicy.fitsBcrypt(currentPassword)
+                || !passwordEncoder.matches(currentPassword, user.getPasswordHash())) {
             loginRateLimiter.recordFailedAttempt("change-password", userKey);
-            auditLogService.log(currentUser.getId(), "CHANGE_PASSWORD_FAILED", "Mật khẩu hiện tại không chính xác", clientIp);
-            throw new AppException(HttpStatus.BAD_REQUEST, "INVALID_CREDENTIALS", "Mật khẩu hiện tại không chính xác.");
+            auditLogService.log(user.getId(), "CHANGE_PASSWORD_FAILED", "Mật khẩu hiện tại không chính xác", clientIp);
+            throw new AppException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "Mật khẩu hiện tại sai");
         }
 
         // 3. Mật khẩu mới không được trùng mật khẩu cũ
         if (newPassword.equals(currentPassword)) {
-            throw new AppException(HttpStatus.BAD_REQUEST, "SAME_PASSWORD", "Mật khẩu mới không được trùng với mật khẩu hiện tại.");
+            throw new AppException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "Mật khẩu mới không được trùng với mật khẩu hiện tại.");
         }
 
         // 4. Kiểm tra chính sách mật khẩu
         validatePasswordPolicy(newPassword);
 
         // 5. Cập nhật mật khẩu mới và bỏ cờ must_change_password
-        currentUser.setPasswordHash(passwordEncoder.encode(newPassword));
-        currentUser.setMustChangePassword(false);
-        userRepository.save(currentUser);
+        user.setPasswordHash(passwordEncoder.encode(newPassword));
+        user.setMustChangePassword(false);
+        userRepository.save(user);
 
         // 6. Xóa bộ đếm rate limit và ghi audit (TUYỆT ĐỐI KHÔNG GHI MẬT KHẨU)
         loginRateLimiter.recordSuccess("change-password", userKey);
-        auditLogService.log(currentUser.getId(), "CHANGE_PASSWORD", "Đổi mật khẩu tài khoản thành công", clientIp);
+        auditLogService.log(user.getId(), "CHANGE_PASSWORD", "Đổi mật khẩu tài khoản thành công", clientIp);
 
         // 7. Phát hành JWT token mới phản ánh trạng thái mustChangePassword=false
-        String newAccessToken = jwtProvider.generateToken(currentUser);
+        String newAccessToken = jwtProvider.generateToken(user);
         long expiresIn = jwtProvider.getExpirationSeconds();
 
-        log.info("Người dùng id={} ({}) đã đổi mật khẩu thành công", currentUser.getId(), currentUser.getUsername());
+        log.info("Người dùng id={} ({}) đã đổi mật khẩu thành công", user.getId(), user.getUsername());
 
         return new ChangePasswordResponse(
                 "Đổi mật khẩu thành công.",
                 newAccessToken,
                 "Bearer",
                 expiresIn,
-                UserDto.from(currentUser)
+                UserDto.from(user)
         );
     }
 
     private void validatePasswordPolicy(String password) {
         if (password == null || password.length() < 8) {
-            throw new AppException(HttpStatus.BAD_REQUEST, "WEAK_PASSWORD", "Mật khẩu phải có độ dài tối thiểu 8 ký tự.");
+            throw new AppException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "Mật khẩu phải có độ dài tối thiểu 8 ký tự.");
+        }
+        if (!com.mailapp.security.PasswordPolicy.fitsBcrypt(password)) {
+            throw new AppException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "Mật khẩu tối đa 72 byte UTF-8.");
         }
         boolean hasLetter = password.matches(".*[a-zA-Z].*");
         boolean hasDigit = password.matches(".*[0-9].*");
         if (!hasLetter || !hasDigit) {
-            throw new AppException(HttpStatus.BAD_REQUEST, "WEAK_PASSWORD", "Mật khẩu phải bao gồm cả chữ cái và chữ số.");
+            throw new AppException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "Mật khẩu phải bao gồm cả chữ cái và chữ số.");
         }
     }
 }

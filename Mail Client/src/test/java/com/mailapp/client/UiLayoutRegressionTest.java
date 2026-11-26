@@ -1,5 +1,8 @@
 package com.mailapp.client;
 
+import com.mailapp.client.model.PublicConfigDto;
+import com.mailapp.client.net.ApiClient;
+import com.mailapp.client.ui.frames.LoginFrame;
 import com.mailapp.client.ui.theme.Theme;
 import com.mailapp.client.ui.theme.WrapLayout;
 import org.junit.jupiter.api.DisplayName;
@@ -50,6 +53,62 @@ class UiLayoutRegressionTest {
                         "Badge vượt ra ngoài khung 170px: x=" + c.getX() + " w=" + c.getWidth());
             }
         });
+    }
+
+    @Test
+    void attachmentStripKeepsAllChipsReachableAtNarrowWidth() throws Exception {
+        onEdt(() -> {
+            JPanel chips = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 4));
+            for (int i = 0; i < 3; i++) {
+                JButton chip = new JButton("fixture " + i);
+                chip.setPreferredSize(new Dimension(180, 30));
+                chips.add(chip);
+            }
+            JScrollPane scroll = Theme.horizontalChipScroll(chips);
+            scroll.setSize(260, scroll.getPreferredSize().height);
+            scroll.doLayout();
+            scroll.getViewport().doLayout();
+            chips.doLayout();
+            assertTrue(chips.getWidth() > scroll.getViewport().getExtentSize().width);
+            Component last = chips.getComponent(2);
+            assertEquals(chips.getComponent(0).getY(), last.getY());
+            assertTrue(last.getX() + last.getWidth() <= chips.getWidth());
+            chips.scrollRectToVisible(last.getBounds());
+            assertTrue(scroll.getViewport().getViewPosition().x > 0);
+            assertTrue(last.getY() + last.getHeight() <= scroll.getViewport().getExtentSize().height);
+        });
+    }
+
+    @Test
+    void minimumLoginSizeKeepsBottomControlsReachable() throws Exception {
+        org.junit.jupiter.api.Assumptions.assumeFalse(GraphicsEnvironment.isHeadless());
+        AtomicReference<LoginFrame> frame = new AtomicReference<>();
+        try {
+            onEdt(() -> {
+                LoginFrame login = new LoginFrame(new ApiClient("http://127.0.0.1:19999"), false);
+                frame.set(login);
+                login.applyPublicConfig(new PublicConfigDto(true, true, true, true, true, 5, 25));
+                login.setSize(login.getMinimumSize());
+                login.setVisible(true);
+            });
+            onEdt(() -> {
+                LoginFrame login = frame.get();
+                login.validate();
+                JComponent ping = (JComponent) login.getExpectedTabOrder().get(6);
+                JScrollPane scroll = (JScrollPane) SwingUtilities.getAncestorOfClass(JScrollPane.class, ping);
+                assertNotNull(scroll, "Login controls must be inside a scrollable viewport");
+                assertEquals(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER, scroll.getHorizontalScrollBarPolicy());
+                assertTrue(scroll.getViewport().getViewSize().height >= scroll.getViewport().getExtentSize().height);
+                ping.scrollRectToVisible(new Rectangle(0, 0, ping.getWidth(), ping.getHeight()));
+                assertEquals(new Rectangle(0, 0, ping.getWidth(), ping.getHeight()), ping.getVisibleRect());
+                assertTrue(scroll.getViewport().getViewPosition().y > 0);
+                JComponent first = (JComponent) login.getExpectedTabOrder().get(0);
+                first.scrollRectToVisible(new Rectangle(0, 0, first.getWidth(), first.getHeight()));
+                assertEquals(new Rectangle(0, 0, first.getWidth(), first.getHeight()), first.getVisibleRect());
+            });
+        } finally {
+            if (frame.get() != null) onEdt(() -> frame.get().dispose());
+        }
     }
 
     @Test

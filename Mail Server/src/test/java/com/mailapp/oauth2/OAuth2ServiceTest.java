@@ -7,6 +7,7 @@ import com.mailapp.exception.ReauthRequiredException;
 import com.mailapp.model.AccountStatus;
 import com.mailapp.model.AuthType;
 import com.mailapp.model.GmailAccount;
+import com.mailapp.model.LinkIntent;
 import com.mailapp.repository.GmailAccountRepository;
 import com.mailapp.repository.UserRepository;
 import com.mailapp.security.AesCipher;
@@ -75,7 +76,8 @@ class OAuth2ServiceTest {
         when(systemSettingService.getMaxGmailPerUser()).thenReturn(5);
         when(gmailAccountRepository.countByUserId(userId)).thenReturn(1L);
 
-        when(stateStore.generateState(eq(userId), anyString())).thenReturn("mock-state-12345");
+        when(stateStore.generateLinkState(eq(userId), anyString(), isNull(), eq(LinkIntent.CREATE)))
+                .thenReturn(new OAuth2StateStore.LinkStatePair("mock-state-12345", "mock-poll-token"));
         when(oAuthConfig.getClientId()).thenReturn("my-client-id.apps.googleusercontent.com");
         when(oAuthConfig.getRedirectUri()).thenReturn("https://localhost:8443/api/oauth2/callback");
         when(oAuthConfig.getAuthUrl()).thenReturn("https://accounts.google.com/o/oauth2/v2/auth");
@@ -83,6 +85,7 @@ class OAuth2ServiceTest {
         AuthorizeUrlResponse response = oauth2Service.getAuthorizeUrl(userId);
 
         assertNotNull(response);
+        assertEquals("mock-poll-token", response.pollToken());
         String url = response.authorizeUrl();
         assertTrue(url.contains("https://accounts.google.com/o/oauth2/v2/auth"));
         assertTrue(url.contains("client_id=my-client-id.apps.googleusercontent.com"));

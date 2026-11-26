@@ -30,14 +30,31 @@ Hoàn thành `[FE-Admin] Tab thống kê` thuộc **[M15] Màn hình Admin** the
   - **Nhật ký**: filter (userId/action/date range) + JTable EP-ST2 phân trang
 - Mọi call API → `SwingWorker`; error → JOptionPane với `code`/`message`
 
+### 4.1. Đối chiếu triển khai hiện tại (26/11/2026)
+
+- **Code và hành vi:** AdminFrame applyStats hiển thị KPI user/admin/Gmail/số đăng ký/failed login, biểu đồ sent theo ngày, nút refresh qua SwingWorker EP-ST1.
+- **Test liên quan:** AdminModuleClientTest, AdminIntegrationTest, ClientLiveServerE2ETest.
+- **Nghiệm thu:** kiểm tra kết quả chạy mới trong test matrix; test tự động không thay thế thao tác manual hoặc kết nối Google thật.
+- **Bổ sung vòng triển khai cuối:** KPI đăng ký hôm nay/7 ngày/30 ngày; tổng user lấy stats, không lấy số bản ghi sau lọc; generation chống response stats cũ.
+
+- **Bổ sung G4:** G4 stats worker kiểm window generation/disposed; dispose tăng generation; không manual chart mới.
+
 ## 5. Acceptance criteria
 
-- [ ] Contract đúng: method, path, request/response schema, error code khớp spec
-- [ ] Ownership check (gmail_account.user_id == user) nếu đụng Gmail
-- [ ] Feature flag check nếu spec yêu cầu
-- [ ] Audit log ghi đúng action
-- [ ] Không lộ credential / token / app password / nội dung mail trong response hoặc log
-- [ ] Manual test pass (Postman cho BE, chạy Swing cho FE)
+**Kết quả 26/11/2026:** 2 PASS (code/test thực tế và local manual được duyệt nếu có), 3 N/A, 1 OPEN. Chỉ [x] là PASS; N/A không tính đạt.
+
+**Suite liên quan đã chạy:** AdminIntegrationTest: 18/18 PASS; AdminModuleClientTest: 5/5 PASS; ClientLiveServerE2ETest: 16/16 PASS.
+
+**Nghiệm thu bổ sung (tự động):** Lũy kế Backend 280/285, Client 130/130, tổng 410 PASS / 415 JUnit, 5 live SKIP, 0 FAIL/ERROR trong evidence hợp nhất. G6 chạy mới Client 34/34 targeted (2 test mới); E2E 16/16 kế thừa G5, Backend/JAR không đổi, BE 34/34 và Newman 140 request/653 assertion kế thừa G4. Không Gmail thật, native manual, HTTP manual, E2E, Newman hoặc full suite mới. Newman G4 kế thừa (6.2.1): 140 request, 653 assertion, 0 lỗi/skip; OAuth loopback 4 exchange + 4 UserInfo + 4 Gmail profile + 2 revoke. UI/HTTP automated tách khỏi quan sát từng thao tác; xem test matrix.
+
+Xem architechture/docs/acceptance-review.md, swing-acceptance-observed.md, swing-acceptance-cases.md và Mail Server/docs/testing/test-matrix.md.
+
+- [x] Contract đúng: method, path, request/response schema, error code khớp spec — PASS (code/test thực tế). Đối chiếu §4.1 và test liên quan; phạm vi code/tự động, không thay manual.
+- [ ] Ownership check (gmail_account.user_id == user) nếu đụng Gmail — N/A (không áp dụng; không tính PASS/OPEN). Phạm vi Ownership của task đã rà lại ở bảng N/A swing-acceptance-cases.md: O giữ: KPI aggregate admin không mở thư người khác; F giữ: không stats flag riêng; A giữ: read-only stats. Role vẫn bắt buộc.
+- [ ] Feature flag check nếu spec yêu cầu — N/A (không áp dụng; không tính PASS/OPEN). Phạm vi Feature của task đã rà lại ở bảng N/A swing-acceptance-cases.md: O giữ: KPI aggregate admin không mở thư người khác; F giữ: không stats flag riêng; A giữ: read-only stats. Role vẫn bắt buộc.
+- [ ] Audit log ghi đúng action — N/A (không áp dụng; không tính PASS/OPEN). Phạm vi Audit của task đã rà lại ở bảng N/A swing-acceptance-cases.md: O giữ: KPI aggregate admin không mở thư người khác; F giữ: không stats flag riêng; A giữ: read-only stats. Role vẫn bắt buộc.
+- [x] Không lộ credential / token / app password / nội dung mail trong response hoặc log — PASS (code/test thực tế). Đối chiếu DTO/log và test an toàn liên quan; dữ liệu chỉ cho đúng người gọi. Không suy rộng sang Gmail thật.
+- [ ] Manual test pass (Postman cho BE, chạy Swing cho FE) — OPEN. Quan sát thực tế: [swing-acceptance-observed.md](../swing-acceptance-observed.md) AM-4375 (M26, BLOCKED): Chưa vào Stats tab. Phần còn lại: KPI/chart/refresh không quan sát. Không thay bằng assertion tự động; human sign-off và Gmail/Google thật (nếu áp dụng) vẫn tách riêng. **G4:** G4 stats worker kiểm window generation/disposed; dispose tăng generation; không manual chart mới. [AM-4375-M ma trận nghĩa vụ](../acceptance-obligation-matrix.md#am-4375-m).
 
 ## 6. Phụ thuộc & tài liệu
 

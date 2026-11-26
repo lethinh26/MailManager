@@ -3,8 +3,10 @@ package com.mailapp.controller;
 import com.mailapp.dto.AuthorizeUrlResponse;
 import com.mailapp.exception.AppException;
 import com.mailapp.model.User;
+import com.mailapp.model.LinkIntent;
 import com.mailapp.oauth2.OAuth2Service;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.CacheControl;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -32,18 +34,33 @@ public class OAuth2Controller {
     @GetMapping("/authorize-url")
     public ResponseEntity<AuthorizeUrlResponse> getAuthorizeUrl(
             @RequestParam(value = "accountId", required = false) Long accountId,
+            @RequestParam(value = "intent", required = false) LinkIntent intent,
             @AuthenticationPrincipal User currentUser) {
         if (currentUser == null) {
             throw new AppException(HttpStatus.UNAUTHORIZED, "UNAUTHORIZED", "Chưa xác thực người dùng.");
         }
-        AuthorizeUrlResponse response = (accountId != null)
+        AuthorizeUrlResponse response = intent != null
+                ? oauth2Service.getAuthorizeUrl(currentUser.getId(), accountId, intent)
+                : (accountId != null)
                 ? oauth2Service.getAuthorizeUrl(currentUser.getId(), accountId)
                 : oauth2Service.getAuthorizeUrl(currentUser.getId());
-        return ResponseEntity.ok(response);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(response);
     }
 
     public ResponseEntity<AuthorizeUrlResponse> getAuthorizeUrl(User currentUser) {
-        return getAuthorizeUrl(null, currentUser);
+        return getAuthorizeUrl(null, null, currentUser);
+    }
+
+    @GetMapping("/link/poll")
+    public ResponseEntity<OAuth2Service.LinkPollResponse> pollLink(
+            @RequestParam("pollToken") String pollToken,
+            @AuthenticationPrincipal User currentUser) {
+        if (currentUser == null) {
+            throw new AppException(HttpStatus.UNAUTHORIZED, "UNAUTHORIZED", "Chưa xác thực người dùng.");
+        }
+        OAuth2Service.LinkPollResponse result = oauth2Service.pollLink(pollToken, currentUser.getId());
+        return ResponseEntity.status("PENDING".equals(result.status()) ? HttpStatus.ACCEPTED : HttpStatus.OK)
+                .cacheControl(CacheControl.noStore()).body(result);
     }
 
     /**
@@ -59,6 +76,6 @@ public class OAuth2Controller {
             @RequestParam(value = "error_description", required = false) String errorDescription) {
 
         String resultHtml = oauth2Service.handleCallback(code, state, error, errorDescription);
-        return ResponseEntity.ok(resultHtml);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(resultHtml);
     }
 }

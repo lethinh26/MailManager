@@ -6,6 +6,7 @@ import com.mailapp.client.net.ApiClient;
 import com.mailapp.client.service.AttachmentCleanupService;
 import com.mailapp.client.service.AttachmentCleanupService.ItemStatus;
 import com.mailapp.client.service.AttachmentCleanupService.MailCleanupResult;
+import com.mailapp.client.ui.frames.LoginFrame;
 import com.mailapp.client.util.ClientSafetyUtil;
 import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.DisplayName;
@@ -13,6 +14,10 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import javax.net.ssl.SSLHandshakeException;
+import javax.swing.*;
+import java.awt.Component;
+import java.awt.Container;
+import java.awt.GraphicsEnvironment;
 import java.io.File;
 import java.io.IOException;
 import java.io.OutputStream;
@@ -24,6 +29,9 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -55,6 +63,69 @@ class ClientSecurityAndResilienceTest {
                 .contains(".cer"));
         assertTrue(ClientSafetyUtil.toFriendlyVietnameseError(new IOException("There is not enough space on the disk"))
                 .contains("Ổ đĩa"));
+    }
+
+    @Test
+    void publicConnectionCheckDoesNotOverlapOrExposeRawErrors() throws Exception {
+        org.junit.jupiter.api.Assumptions.assumeFalse(GraphicsEnvironment.isHeadless());
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicInteger calls = new AtomicInteger();
+        AtomicReference<LoginFrame> frame = new AtomicReference<>();
+        ApiClient transport = new ApiClient("http://127.0.0.1:19999") {
+            @Override public long pingServer() throws IOException, InterruptedException {
+                if (calls.incrementAndGet() == 1) {
+                    started.countDown();
+                    if (!release.await(5, TimeUnit.SECONDS)) throw new IOException("fixture timeout");
+                    throw new ConnectException();
+                }
+                throw new SSLHandshakeException("fixture-internal-certificate-diagnostic");
+            }
+        };
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                LoginFrame login = new LoginFrame(transport, false);
+                frame.set(login);
+                login.checkServerConnection();
+                assertFalse(login.getExpectedTabOrder().get(6).isEnabled());
+                login.checkServerConnection();
+            });
+            assertTrue(started.await(5, TimeUnit.SECONDS));
+            assertEquals(1, calls.get());
+            release.countDown();
+            assertEquals("[X] Không kết nối được máy chủ.", awaitConnectionResult(frame.get()));
+            SwingUtilities.invokeAndWait(() -> frame.get().checkServerConnection());
+            assertEquals("[X] Chứng chỉ TLS không hợp lệ.", awaitConnectionResult(frame.get()));
+            assertEquals(2, calls.get());
+        } finally {
+            release.countDown();
+            if (frame.get() != null) SwingUtilities.invokeAndWait(frame.get()::dispose);
+        }
+    }
+
+    private static String awaitConnectionResult(LoginFrame frame) throws Exception {
+        for (int i = 0; i < 100; i++) {
+            AtomicReference<String> text = new AtomicReference<>();
+            SwingUtilities.invokeAndWait(() -> {
+                if (frame.getExpectedTabOrder().get(6).isEnabled())
+                    text.set(connectionResult(frame));
+            });
+            if (text.get() != null) return text.get();
+            Thread.sleep(50);
+        }
+        fail("Public connection check never completed");
+        return null;
+    }
+
+    private static String connectionResult(Component c) {
+        if (c instanceof JLabel label && label.getText() != null && label.getText().startsWith("[X]"))
+            return label.getText();
+        if (c instanceof Container container)
+            for (Component child : container.getComponents()) {
+                String value = connectionResult(child);
+                if (value != null) return value;
+            }
+        return null;
     }
 
     @Test
