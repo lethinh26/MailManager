@@ -17,6 +17,7 @@ public interface AuditLogRepository extends JpaRepository<AuditLog, Long> {
     List<AuditLog> findByUserIdOrderByCreatedAtDesc(Long userId);
     Page<AuditLog> findByUserIdOrderByCreatedAtDesc(Long userId, Pageable pageable);
     List<AuditLog> findByActionOrderByCreatedAtDesc(String action);
+    java.util.Optional<AuditLog> findByMailEventId(String eventId);
 
     long countByActionAndCreatedAtAfter(String action, LocalDateTime since);
     List<AuditLog> findByActionAndCreatedAtGreaterThanEqual(String action, LocalDateTime since);
@@ -30,7 +31,19 @@ public interface AuditLogRepository extends JpaRepository<AuditLog, Long> {
             LEFT JOIN a.user u
             WHERE (:userId IS NULL OR u.id = :userId)
               AND (:username IS NULL OR :username = '' OR LOWER(COALESCE(u.username, '')) LIKE LOWER(CONCAT('%', :username, '%')))
-              AND (:action IS NULL OR :action = '' OR UPPER(a.action) = UPPER(:action))
+              AND (:action IS NULL OR :action = '' OR LOCATE(UPPER(:action), UPPER(a.action)) > 0
+                   OR (UPPER(:action) = 'LOGIN_SUCCESS' AND a.action = 'LOGIN')
+                   OR (UPPER(:action) = 'MAIL_DELETE' AND a.action = 'DELETE_MAIL')
+                   OR (UPPER(:action) = 'DELETE_MAIL' AND a.action = 'MAIL_DELETE')
+                   OR (UPPER(:action) = 'SETTING_CHANGE' AND a.action = 'ADMIN_CHANGE_SETTING')
+                   OR (UPPER(:action) = 'ADMIN_CHANGE_SETTING' AND a.action = 'SETTING_CHANGE')
+                   OR (UPPER(:action) = 'OAUTH2_CALLBACK'
+                       AND a.action IN ('LINK_GMAIL', 'ADD_GMAIL_METHOD', 'UPDATE_GMAIL_METHOD')
+                       AND LOCATE('OAUTH2', UPPER(COALESCE(a.detail, ''))) > 0)
+                   OR (a.action = 'OAUTH2_CALLBACK' AND (
+                       (UPPER(:action) = 'LINK_GMAIL' AND LOCATE('outcome=CREATED;', COALESCE(a.detail, '')) > 0)
+                       OR (UPPER(:action) = 'ADD_GMAIL_METHOD' AND LOCATE('outcome=METHOD_ADDED;', COALESCE(a.detail, '')) > 0)
+                       OR (UPPER(:action) = 'UPDATE_GMAIL_METHOD' AND LOCATE('outcome=METHOD_UPDATED;', COALESCE(a.detail, '')) > 0))))
               AND (:fromTime IS NULL OR a.createdAt >= :fromTime)
               AND (:toTime IS NULL OR a.createdAt <= :toTime)
             ORDER BY a.createdAt DESC, a.id DESC

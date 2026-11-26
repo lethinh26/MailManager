@@ -14,6 +14,7 @@ import com.mailapp.security.JwtAuthenticationFilter;
 import com.mailapp.security.JwtProvider;
 import com.mailapp.security.SecurityConfig;
 import com.mailapp.service.AuthService;
+import com.mailapp.service.SystemSettingService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -24,10 +25,15 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.Arguments;
+import java.util.stream.Stream;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.when;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
@@ -52,6 +58,63 @@ class AuthControllerIntegrationTest {
 
     @MockBean
     private JtiDenylistService denylistService;
+
+    @MockBean
+    private SystemSettingService systemSettingService;
+
+    @Test
+    void testMalformedJsonReturnsStructured400() throws Exception {
+        mockMvc.perform(post("/api/auth/login")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.errorCode").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.path").value("/api/auth/login"));
+    }
+
+    static Stream<Arguments> globalErrors() {
+        return Stream.of(
+                Arguments.of(new org.springframework.security.access.AccessDeniedException("denied"), 403, "FORBIDDEN"),
+                Arguments.of(new java.util.NoSuchElementException("private internal detail"), 404, "NOT_FOUND"),
+                Arguments.of(new jakarta.persistence.EntityNotFoundException("private internal detail"), 404, "NOT_FOUND"),
+                Arguments.of(new org.springframework.web.multipart.MaxUploadSizeExceededException(1L), 413, "PAYLOAD_TOO_LARGE"),
+                Arguments.of(new IllegalStateException("private internal detail"), 500, "INTERNAL_ERROR"));
+    }
+
+    @ParameterizedTest
+    @MethodSource("globalErrors")
+    void globalExceptionMappingsReturnStructuredSafeErrors(RuntimeException exception, int expectedStatus, String code) throws Exception {
+        when(authService.login(any(LoginRequest.class), anyString())).thenThrow(exception);
+        mockMvc.perform(post("/api/auth/login")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(new LoginRequest("valid_user", "ValidPassword123"))))
+                .andExpect(status().is(expectedStatus))
+                .andExpect(jsonPath("$.status").value(expectedStatus))
+                .andExpect(jsonPath("$.code").value(code))
+                .andExpect(jsonPath("$.errorCode").value(code))
+                .andExpect(jsonPath("$.path").value("/api/auth/login"))
+                .andExpect(jsonPath("$.timestamp").exists())
+                .andExpect(jsonPath("$.error").isNotEmpty())
+                .andExpect(jsonPath("$.message").isNotEmpty())
+                .andExpect(content().string(org.hamcrest.Matchers.not(org.hamcrest.Matchers.containsString("private internal detail"))));
+    }
+
+    @Test
+    void wrongMethodAndContentTypeReturnStructuredErrors() throws Exception {
+        mockMvc.perform(get("/api/auth/login"))
+                .andExpect(status().isMethodNotAllowed())
+                .andExpect(jsonPath("$.code").value("METHOD_NOT_ALLOWED"))
+                .andExpect(jsonPath("$.path").value("/api/auth/login"));
+        mockMvc.perform(post("/api/auth/login").contentType(MediaType.TEXT_PLAIN).content("wrong content type"))
+                .andExpect(status().isUnsupportedMediaType())
+                .andExpect(jsonPath("$.code").value("UNSUPPORTED_MEDIA_TYPE"))
+                .andExpect(jsonPath("$.path").value("/api/auth/login"));
+        mockMvc.perform(get("/api/auth/oauth2/google/poll"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.path").value("/api/auth/oauth2/google/poll"));
+    }
 
     @Test
     @DisplayName("POST /api/auth/login thành công trả 200 OK kèm JWT và Cache-Control: no-store")
@@ -88,10 +151,10 @@ class AuthControllerIntegrationTest {
     }
 
     @Test
-    @DisplayName("POST /api/auth/login sai thông tin trả 401 Unauthorized và code INVALID_CREDENTIALS")
+    @DisplayName("POST /api/auth/login sai thông tin trả 401 Unauthorized và code UNAUTHORIZED")
     void testLoginInvalidCredentials() throws Exception {
         when(authService.login(any(LoginRequest.class), anyString()))
-                .thenThrow(new AppException(HttpStatus.UNAUTHORIZED, "INVALID_CREDENTIALS", "Sai tên đăng nhập hoặc mật khẩu."));
+                .thenThrow(new AppException(HttpStatus.UNAUTHORIZED, "UNAUTHORIZED", "Sai tài khoản hoặc mật khẩu"));
 
         LoginRequest request = new LoginRequest("cuongle", "WrongPassword!");
 
@@ -99,14 +162,14 @@ class AuthControllerIntegrationTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isUnauthorized())
-                .andExpect(jsonPath("$.code").value("INVALID_CREDENTIALS"));
+                .andExpect(jsonPath("$.code").value("UNAUTHORIZED"));
     }
 
     @Test
-    @DisplayName("POST /api/auth/login tài khoản bị khóa trả 403 Forbidden và code ACCOUNT_LOCKED")
+    @DisplayName("POST /api/auth/login tài khoản bị khóa trả 403 Forbidden và code ACCOUNT_DISABLED")
     void testLoginAccountLocked() throws Exception {
         when(authService.login(any(LoginRequest.class), anyString()))
-                .thenThrow(new AppException(HttpStatus.FORBIDDEN, "ACCOUNT_LOCKED", "Tài khoản của bạn đã bị khóa. Vui lòng liên hệ quản trị viên."));
+                .thenThrow(new AppException(HttpStatus.FORBIDDEN, "ACCOUNT_DISABLED", "Tài khoản của bạn đã bị khóa. Vui lòng liên hệ quản trị viên."));
 
         LoginRequest request = new LoginRequest("locked_user", "CorrectPassword123!");
 
@@ -114,7 +177,7 @@ class AuthControllerIntegrationTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isForbidden())
-                .andExpect(jsonPath("$.code").value("ACCOUNT_LOCKED"));
+                .andExpect(jsonPath("$.code").value("ACCOUNT_DISABLED"));
     }
 
     @Test
@@ -134,17 +197,17 @@ class AuthControllerIntegrationTest {
     }
 
     @Test
-    @DisplayName("POST /api/auth/login khi hệ thống bảo trì trả 503 Service Unavailable")
+    @DisplayName("POST /api/auth/login khi hệ thống bảo trì trả 403 Forbidden")
     void testLoginMaintenanceMode() throws Exception {
         when(authService.login(any(LoginRequest.class), anyString()))
-                .thenThrow(new AppException(HttpStatus.SERVICE_UNAVAILABLE, "MAINTENANCE_MODE", "Hệ thống đang bảo trì."));
+                .thenThrow(new AppException(HttpStatus.FORBIDDEN, "MAINTENANCE_MODE", "Hệ thống đang bảo trì."));
 
         LoginRequest request = new LoginRequest("normal_user", "ValidPassword123!");
 
         mockMvc.perform(post("/api/auth/login")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
-                .andExpect(status().isServiceUnavailable())
+                .andExpect(status().isForbidden())
                 .andExpect(jsonPath("$.code").value("MAINTENANCE_MODE"));
     }
 

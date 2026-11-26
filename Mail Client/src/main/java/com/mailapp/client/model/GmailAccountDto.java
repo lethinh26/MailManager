@@ -72,4 +72,11 @@ public record GmailAccountDto(
     public boolean isFallbackActive() {
         return Boolean.TRUE.equals(fallbackActive);
     }
+
+    /** Mirror the server's NEEDS_REAUTH gate, not merely the last fallback indicator. */
+    public boolean requiresReauthBeforeMail() {
+        if (!"NEEDS_REAUTH".equalsIgnoreCase(status)) return false;
+        return !(hasAppPassword() && ("OAUTH2".equalsIgnoreCase(effectivePreferredMethod())
+                || ("APP_PASSWORD".equalsIgnoreCase(effectivePreferredMethod()) && hasOAuth())));
+    }
 }

@@ -15,7 +15,10 @@ import com.mailapp.client.ui.theme.Theme;
 import com.mailapp.client.ui.theme.WrapLayout;
 import com.mailapp.client.util.ClientConfig;
 import com.mailapp.client.util.ClientSafetyUtil;
+import com.mailapp.client.util.FileUtil;
+import com.mailapp.client.util.MailSizeDisplay;
 import com.mailapp.client.util.SessionStore;
+import com.mailapp.client.util.FeatureAdmission;
 
 import javax.swing.*;
 import javax.swing.border.CompoundBorder;
@@ -55,13 +58,31 @@ public class MainFrame extends JFrame {
     private List<MailFolderDto> currentFolders = new ArrayList<>();
     private MailFolderDto selectedFolder;
     private int currentPage = 0;
+    private int activePageSize = 20;
+    private MailboxViewModel.SearchCriteria activeSearchCriteria;
     private boolean hasMoreMails = false;
     private long totalMails = 0;
     private long currentUidValidity = 0;
+    private volatile long mailboxGeneration;
+    private boolean mailboxReady;
     private MailDetailResponse currentDetail;
     private boolean showHtmlMode = true;
     private boolean headerExpanded = false;
     private boolean mockupMode = false;
+    private volatile boolean closing;
+    private boolean configRefreshing;
+    private boolean foldersLoading;
+    private boolean suppressDetailSelection;
+    private long accountsRequestGeneration;
+    private long userRequestGeneration;
+    private boolean forcedPasswordDialogOpen;
+    private javax.swing.Timer configTimer;
+    private GmailManagerDialog activeGmailManager;
+    private ComposeDialog activeComposeDialog;
+    private CleanupPreviewDialog activeCleanupDialog;
+    private AdminFrame activeAdminFrame;
+    private final FeatureAdmission oauthLinkAdmission = new FeatureAdmission(false);
+    private Runnable cancelOAuthLink;
 
     // Auto-cleanup timer & active SwingWorkers (chống race condition & rò rỉ luồng khi đóng cửa sổ)
     private javax.swing.Timer autoCleanTimer;
@@ -72,6 +93,8 @@ public class MainFrame extends JFrame {
     // Top bar & menus
     private JMenu adminMenu;
     private JButton adminToolbarBtn;
+    private JButton composeBtn;
+    private JMenuItem composeItem;
     private JButton userProfileBtn;
     private JButton autoCleanStopBtn;
     private JLabel autoCleanBadge;
@@ -82,6 +105,10 @@ public class MainFrame extends JFrame {
     private JPanel accountsListPanel;
     private final Map<Long, java.awt.image.BufferedImage> accountAvatars = new java.util.concurrent.ConcurrentHashMap<>();
     private final Set<Long> avatarFetchedIds = java.util.Collections.synchronizedSet(new HashSet<>());
+    private final Set<SessionStore.AttachmentKey> pendingDownloads = new HashSet<>();
+    private final Set<MailIdentity> pendingFlagUpdates = new HashSet<>();
+    private boolean deleting;
+    private record MailIdentity(Long gmailId, String folder, long uidValidity, long uid) {}
     private DefaultListModel<MailFolderDto> folderListModel;
     private JList<MailFolderDto> folderList;
 
@@ -96,10 +123,16 @@ public class MainFrame extends JFrame {
     private final java.util.Set<Long> loadedUids = new java.util.HashSet<>();
     private JList<MailSummaryDto> mailList;
     private JButton loadMoreBtn;
+    private JButton previousPageBtn;
+    private JButton nextPageBtn;
+    private JComboBox<Integer> pageSizeCombo;
     private JLabel mailCountLabel;
     private JLabel listEmptyTitle;
     private JLabel listEmptySub;
     private JButton listEmptyActionBtn;
+    private PublicConfigDto lastAppliedConfig;
+    private boolean reauthCta;
+    private JLabel userStatusLabel;
 
     // Right column
     private CardLayout detailCardLayout;
@@ -140,9 +173,11 @@ public class MainFrame extends JFrame {
         setupKeyboardShortcuts();
         setupWindowBoundsPersistence();
         configureAutoCleanTimer();
+        applyPublicConfig(SessionStore.getInstance().getPublicConfig());
 
         if (autoLoad) {
             loadPublicConfig();
+            startConfigRefresh();
             loadUserInfo();
             loadGmailAccounts();
         }
@@ -227,7 +262,7 @@ public class MainFrame extends JFrame {
         left.add(brand);
         left.add(Box.createHorizontalStrut(Theme.SP_1));
 
-        JButton composeBtn = Theme.primaryButton("Soạn thư", AppIcons.vectorIcon(AppIcons.Glyph.COMPOSE, 16, Color.WHITE));
+        composeBtn = Theme.primaryButton("Soạn thư", AppIcons.vectorIcon(AppIcons.Glyph.COMPOSE, 16, Color.WHITE));
         composeBtn.setToolTipText("Soạn thư mới (Ctrl+N)");
         composeBtn.setMnemonic(KeyEvent.VK_S);
         composeBtn.addActionListener(e -> openComposeDialog(null, null));
@@ -356,6 +391,8 @@ public class MainFrame extends JFrame {
             if (!e.getValueIsAdjusting() && !mockupMode) {
                 MailFolderDto f = folderList.getSelectedValue();
                 if (f != null && (selectedFolder == null || !f.name().equals(selectedFolder.name()))) {
+                    resetMailboxDetail();
+                    currentUidValidity = 0;
                     selectedFolder = f;
                     loadMails(0, false);
                 }
@@ -475,15 +512,36 @@ public class MainFrame extends JFrame {
             public boolean getScrollableTracksViewportWidth() {
                 return true;
             }
+            private boolean starGesture;
+            @Override protected void processMouseEvent(MouseEvent e) {
+                if (e.getID() == MouseEvent.MOUSE_PRESSED) {
+                    starGesture = false;
+                    int index = locationToIndex(e.getPoint());
+                    Rectangle bounds = index < 0 ? null : getCellBounds(index, index);
+                    if (SwingUtilities.isLeftMouseButton(e) && bounds != null && bounds.contains(e.getPoint())
+                            && e.getX() >= bounds.x + bounds.width - 34 && !mockupMode) {
+                        starGesture = true;
+                        toggleStarForMail(getModel().getElementAt(index));
+                    }
+                }
+                if (starGesture && SwingUtilities.isLeftMouseButton(e)) {
+                    e.consume();
+                    if (e.getID() == MouseEvent.MOUSE_CLICKED) starGesture = false;
+                    return;
+                }
+                super.processMouseEvent(e);
+            }
         };
         mailList.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
         mailList.setBackground(Theme.bgSurface());
         mailList.setCellRenderer(new MailSummaryCellRenderer());
         mailList.addListSelectionListener(e -> {
-            if (!e.getValueIsAdjusting() && !mockupMode) {
+            if (!e.getValueIsAdjusting() && !mockupMode && !suppressDetailSelection) {
                 MailSummaryDto sel = mailList.getSelectedValue();
                 if (sel != null && mailList.getSelectedIndices().length == 1) {
                     loadMailDetail(sel, false);
+                } else {
+                    resetMailboxDetail();
                 }
             }
         });
@@ -492,9 +550,38 @@ public class MainFrame extends JFrame {
             public void keyPressed(KeyEvent e) {
                 if (e.getKeyCode() == KeyEvent.VK_ENTER) {
                     MailSummaryDto sel = mailList.getSelectedValue();
-                    if (sel != null) loadMailDetail(sel, false);
+                    if (sel != null && mailList.getSelectedIndices().length == 1) loadMailDetail(sel, false);
                 }
             }
+        });
+        mailList.addMouseListener(new MouseAdapter() {
+            private void popup(MouseEvent e) {
+                if (!e.isPopupTrigger() || mockupMode || !mailboxReady) return;
+                int index = mailList.locationToIndex(e.getPoint());
+                Rectangle bounds = index < 0 ? null : mailList.getCellBounds(index, index);
+                if (bounds == null || !bounds.contains(e.getPoint())) return;
+                if (!mailList.isSelectedIndex(index)) {
+                    suppressDetailSelection = true;
+                    try {
+                        mailList.setSelectedIndex(index);
+                        resetMailboxDetail();
+                    } finally {
+                        suppressDetailSelection = false;
+                    }
+                }
+                JPopupMenu menu = new JPopupMenu();
+                MailSummaryDto item = mailListModel.get(index);
+                long generation = mailboxGeneration;
+                JMenuItem star = new JMenuItem(item.flags() != null && item.flags().flagged() ? "Bỏ gắn sao" : "Gắn sao");
+                star.addActionListener(a -> { if (mailboxGeneration == generation) toggleStarForMail(item); });
+                menu.add(star);
+                JMenuItem delete = new JMenuItem("Xóa thư đã chọn");
+                delete.addActionListener(a -> { if (mailboxGeneration == generation) deleteSelectedMails(); });
+                menu.add(delete);
+                menu.show(mailList, e.getX(), e.getY());
+            }
+            @Override public void mousePressed(MouseEvent e) { popup(e); }
+            @Override public void mouseReleased(MouseEvent e) { popup(e); }
         });
 
         JScrollPane mailScroll = new JScrollPane(mailList);
@@ -525,8 +612,35 @@ public class MainFrame extends JFrame {
         loadMoreBtn.setVisible(false);
         loadMoreBtn.addActionListener(e -> loadMails(currentPage + 1, true));
 
-        listFooter.add(mailCountLabel, BorderLayout.WEST);
-        listFooter.add(loadMoreBtn, BorderLayout.EAST);
+        JPanel counts = new JPanel(new BorderLayout(4, 0));
+        counts.setOpaque(false);
+        counts.add(mailCountLabel, BorderLayout.CENTER);
+        counts.add(loadMoreBtn, BorderLayout.EAST);
+        listFooter.add(counts, BorderLayout.NORTH);
+        JPanel pageControls = new JPanel(new FlowLayout(FlowLayout.LEFT, 3, 0));
+        pageControls.setOpaque(false);
+        previousPageBtn = new JButton("‹");
+        previousPageBtn.setToolTipText("Trang trước");
+        previousPageBtn.setEnabled(false);
+        previousPageBtn.addActionListener(e -> { if (currentPage > 0) loadMails(currentPage - 1, false); });
+        nextPageBtn = new JButton("›");
+        nextPageBtn.setToolTipText("Trang sau");
+        nextPageBtn.setEnabled(false);
+        nextPageBtn.addActionListener(e -> { if (hasMoreMails) loadMails(currentPage + 1, false); });
+        pageSizeCombo = new JComboBox<>(new Integer[]{0, 10, 20, 50});
+        pageSizeCombo.setRenderer(new DefaultListCellRenderer() {
+            @Override public Component getListCellRendererComponent(JList<?> list, Object value, int index,
+                                                                     boolean selected, boolean focus) {
+                return super.getListCellRendererComponent(list,
+                        Integer.valueOf(0).equals(value) ? "Mặc định" : value, index, selected, focus);
+            }
+        });
+        pageSizeCombo.setToolTipText("Số thư mỗi trang");
+        pageSizeCombo.addActionListener(e -> { if (!mockupMode && selectedFolder != null) loadMails(0, false); });
+        pageControls.add(previousPageBtn);
+        pageControls.add(nextPageBtn);
+        pageControls.add(pageSizeCombo);
+        listFooter.add(pageControls, BorderLayout.SOUTH);
         listWrapper.add(listFooter, BorderLayout.SOUTH);
 
         // 2. LOADING (Skeleton rows drawn with Java2D)
@@ -658,7 +772,7 @@ public class MainFrame extends JFrame {
         cleanupOneBtn = Theme.iconButton(AppIcons.Glyph.DOWNLOAD, iconSz, "Tải đính kèm & Xóa thư này", Theme.success(), this::openCleanupForCurrentMail);
         cleanupOneBtn.setBorder(compactBtnPad);
 
-        deleteBtn = Theme.iconButton(AppIcons.Glyph.DELETE, iconSz, "Xóa thư", Theme.danger(), this::deleteSelectedMails);
+        deleteBtn = Theme.iconButton(AppIcons.Glyph.DELETE, iconSz, "Xóa thư", Theme.danger(), this::deleteCurrentDetail);
         deleteBtn.setBorder(compactBtnPad);
 
         actionBar.add(replyBtn);
@@ -837,7 +951,7 @@ public class MainFrame extends JFrame {
         attachmentsStrip = new JPanel(new FlowLayout(FlowLayout.LEFT, Theme.SP_2, Theme.SP_1));
         attachmentsStrip.setOpaque(false);
         attachmentsContainer.add(attTitle, BorderLayout.NORTH);
-        attachmentsContainer.add(attachmentsStrip, BorderLayout.CENTER);
+        attachmentsContainer.add(Theme.horizontalChipScroll(attachmentsStrip), BorderLayout.CENTER);
         attachmentsContainer.setVisible(false);
 
         detail.add(detailNorth, BorderLayout.NORTH);
@@ -883,6 +997,10 @@ public class MainFrame extends JFrame {
 
         right.add(autoCleanBadge);
         right.add(autoCleanStopBtn);
+        userStatusLabel = new JLabel();
+        userStatusLabel.setFont(Theme.fontTiny());
+        userStatusLabel.setForeground(Theme.textMuted());
+        right.add(userStatusLabel);
         right.add(serverBadgeLabel);
 
         bar.add(statusBarLabel, BorderLayout.CENTER);
@@ -911,7 +1029,7 @@ public class MainFrame extends JFrame {
 
         JMenu mailMenu = new JMenu("Hộp thư");
         mailMenu.setMnemonic(KeyEvent.VK_H);
-        JMenuItem composeItem = new JMenuItem("Soạn thư mới (Ctrl+N)");
+        composeItem = new JMenuItem("Soạn thư mới (Ctrl+N)");
         composeItem.addActionListener(e -> openComposeDialog(null, null));
         JMenuItem refreshItem = new JMenuItem("Làm mới (Ctrl+R)");
         refreshItem.addActionListener(e -> refreshCurrentMailbox());
@@ -974,7 +1092,7 @@ public class MainFrame extends JFrame {
         im.put(KeyStroke.getKeyStroke(KeyEvent.VK_DELETE, 0), "deleteMail");
         am.put("deleteMail", new AbstractAction() {
             @Override public void actionPerformed(ActionEvent e) {
-                if (!(KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner() instanceof JTextField)) {
+                if (!(KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner() instanceof javax.swing.text.JTextComponent)) {
                     deleteSelectedMails();
                 }
             }
@@ -1002,32 +1120,130 @@ public class MainFrame extends JFrame {
     }
 
     private void cancelAllBackgroundTasks() {
+        closing = true;
+        accountsRequestGeneration++;
+        userRequestGeneration++;
+        if (configTimer != null) configTimer.stop();
         if (autoCleanTimer != null) autoCleanTimer.stop();
         autoCleanCancelled.set(true);
         workerCoordinator.cancelAll();
+        if (cancelOAuthLink != null) {
+            cancelOAuthLink.run();
+            cancelOAuthLink = null;
+        }
+        if (activeAdminFrame != null) {
+            activeAdminFrame.dispose();
+            activeAdminFrame = null;
+        }
+        if (activeGmailManager != null) activeGmailManager.dispose();
+        if (activeComposeDialog != null) activeComposeDialog.dispose();
+        if (activeCleanupDialog != null) activeCleanupDialog.dispose();
+    }
+
+    @Override public void dispose() {
+        cancelAllBackgroundTasks();
+        super.dispose();
     }
 
     // ==================== DATA LOADING (SWINGWORKER) ====================
 
     private void loadPublicConfig() {
+        if (closing || configRefreshing) return;
+        configRefreshing = true;
+        long generation = SessionStore.getInstance().getGeneration();
         new SwingWorker<PublicConfigDto, Void>() {
             @Override protected PublicConfigDto doInBackground() throws Exception {
                 return apiClient.getPublicConfig();
             }
             @Override protected void done() {
+                configRefreshing = false;
+                if (closing || generation != SessionStore.getInstance().getGeneration()) return;
                 try {
-                    SessionStore.getInstance().setPublicConfig(get());
-                } catch (Exception ignored) {}
+                    PublicConfigDto config = get();
+                    if (config == null) throw new IllegalStateException("Missing public config");
+                    serverBadgeLabel.setText("Đã kết nối: " + apiClient.getBaseUrl());
+                    applyPublicConfig(config);
+                } catch (Exception ignored) {
+                    serverBadgeLabel.setText("Mất kết nối: " + apiClient.getBaseUrl());
+                    applyPublicConfig(null);
+                }
             }
         }.execute();
     }
 
+    private void startConfigRefresh() {
+        configTimer = new javax.swing.Timer(15000, e -> loadPublicConfig());
+        configTimer.start();
+    }
+
+    private boolean sendEnabled() {
+        PublicConfigDto config = SessionStore.getInstance().getPublicConfig();
+        return config != null && config.sendMailEnabled();
+    }
+
+    private void applyPublicConfig(PublicConfigDto config) {
+        PublicConfigDto old = lastAppliedConfig;
+        lastAppliedConfig = config;
+        SessionStore.getInstance().setPublicConfig(config);
+        oauthLinkAdmission.update(config != null && config.oauth2LinkEnabled());
+        boolean enabled = config != null && config.sendMailEnabled();
+        String disabled = "Tính năng gửi thư bị tắt bởi Admin hoặc chưa tải được cấu hình";
+        if (composeBtn != null) {
+            composeBtn.setEnabled(enabled);
+            composeBtn.setToolTipText(enabled ? "Soạn thư mới (Ctrl+N)" : disabled);
+        }
+        if (composeItem != null) {
+            composeItem.setEnabled(enabled);
+            composeItem.setToolTipText(enabled ? null : disabled);
+        }
+        if (replyBtn != null) replyBtn.setEnabled(enabled);
+        if (replyAllBtn != null) replyAllBtn.setEnabled(enabled);
+        if (forwardBtn != null) forwardBtn.setEnabled(enabled);
+        if (activeGmailManager != null) activeGmailManager.applyPublicConfig(config);
+        if (activeComposeDialog != null) activeComposeDialog.applyPublicConfig(config);
+        updateEmptyActionVisibility();
+        if (config != null && selectedAccount != null && selectedFolder != null && activePageSize != effectivePageSize() && !mockupMode) {
+            loadMails(0, false);
+        }
+        if (selectedAccount != null && !Objects.equals(old, config)) renderAccountCards();
+    }
+
+    private int effectivePageSize() {
+        Integer selected = pageSizeCombo == null ? null : (Integer) pageSizeCombo.getSelectedItem();
+        if (selected != null && selected > 0) return selected;
+        PublicConfigDto config = SessionStore.getInstance().getPublicConfig();
+        return config == null ? 20 : config.effectiveMailPageSize();
+    }
+
+    private void resetMailboxDetail() {
+        workerCoordinator.beginDetailLoad();
+        currentDetail = null;
+        detailCardLayout.show(detailCardPanel, "EMPTY_DETAIL");
+    }
+
+    private void invalidateMailboxSelection() {
+        mailboxGeneration++;
+        mailboxReady = false;
+        currentUidValidity = 0;
+        workerCoordinator.beginMailsLoad();
+        resetMailboxDetail();
+        mailList.clearSelection();
+        mailListModel.clear();
+        loadedUids.clear();
+        previousPageBtn.setEnabled(false);
+        nextPageBtn.setEnabled(false);
+        loadMoreBtn.setEnabled(false);
+    }
+
     public void loadUserInfo() {
+        if (closing) return;
+        long generation = ++userRequestGeneration;
         new SwingWorker<UserDto, Void>() {
             @Override protected UserDto doInBackground() throws Exception {
                 return apiClient.getCurrentUser();
             }
             @Override protected void done() {
+                if (closing || generation != userRequestGeneration) return;
                 try {
                     UserDto user = get();
                     SessionStore.getInstance().updateUser(user);
@@ -1043,34 +1259,58 @@ public class MainFrame extends JFrame {
         if (user == null) return;
         String display = (user.fullName() != null && !user.fullName().isBlank()) ? user.fullName() : user.username();
         userProfileBtn.setText(display);
+        if (userStatusLabel != null) userStatusLabel.setText(user.username() + " (" + user.role() + ")");
         userProfileBtn.setIcon(AvatarUtil.createAvatarIcon(display, user.email(), 20));
         boolean isAdmin = "ADMIN".equalsIgnoreCase(user.role());
         adminMenu.setVisible(isAdmin);
         if (adminToolbarBtn != null) adminToolbarBtn.setVisible(isAdmin);
+        if (!isAdmin && activeAdminFrame != null) {
+            activeAdminFrame.dispose();
+            activeAdminFrame = null;
+        }
         if (user.mustChangePassword() && !mockupMode) {
             promptForcedPasswordChange();
         }
     }
 
     private void openAdminFrame() {
+        if (closing) return;
         UserDto user = SessionStore.getInstance().getCurrentUser();
         if (user == null || !"ADMIN".equalsIgnoreCase(user.role())) {
             JOptionPane.showMessageDialog(this, "Chỉ Quản trị viên (ADMIN) mới có quyền truy cập.",
                     "Không có quyền", JOptionPane.WARNING_MESSAGE);
             return;
         }
-        new AdminFrame(apiClient, this::handleSessionExpired).setVisible(true);
+        if (activeAdminFrame != null && activeAdminFrame.isDisplayable()) {
+            activeAdminFrame.toFront();
+            return;
+        }
+        AdminFrame admin = new AdminFrame(apiClient, this::handleSessionExpired);
+        activeAdminFrame = admin;
+        admin.setOnSettingsChanged(this::loadPublicConfig);
+        admin.setOnPermissionLost(this::loadUserInfo);
+        admin.setVisible(true);
     }
 
     public void promptForcedPasswordChange() {
+        if (closing || forcedPasswordDialogOpen) return;
+        forcedPasswordDialogOpen = true;
         ChangePasswordDialog dialog = new ChangePasswordDialog(this, apiClient, true);
-        dialog.setVisible(true);
-        if (dialog.isPasswordChangedSuccessfully()) {
-            loadUserInfo();
+        try {
+            dialog.setVisible(true);
+            if (!closing && dialog.isPasswordChangedSuccessfully()) {
+                loadUserInfo();
+            } else if (!closing) {
+                returnToLogin();
+            }
+        } finally {
+            forcedPasswordDialogOpen = false;
         }
     }
 
     public void loadGmailAccounts() {
+        if (closing) return;
+        long generation = ++accountsRequestGeneration;
         avatarFetchedIds.clear();
         setStatus("Đang tải danh sách tài khoản Gmail...");
         new SwingWorker<List<GmailAccountDto>, Void>() {
@@ -1078,14 +1318,17 @@ public class MainFrame extends JFrame {
                 return apiClient.getGmailAccounts();
             }
             @Override protected void done() {
+                if (closing || generation != accountsRequestGeneration) return;
                 try {
                     List<GmailAccountDto> accounts = get();
+                    GmailAccountDto target = selectedAccount;
                     displayGmailAccounts(accounts);
                     setStatus("Đã tải " + currentGmailAccounts.size() + " tài khoản Gmail.");
                     if (!currentGmailAccounts.isEmpty()) {
-                        GmailAccountDto target = selectedAccount;
-                        if (target == null || currentGmailAccounts.stream().noneMatch(a -> a.id().equals(target.id()))) {
-                            selectGmailAccount(currentGmailAccounts.get(0));
+                        if (target == null || selectedFolder == null || currentGmailAccounts.stream().noneMatch(a -> a.id().equals(target.id()))) {
+                            selectGmailAccount(currentGmailAccounts.stream()
+                                    .filter(a -> target != null && a.id().equals(target.id()))
+                                    .findFirst().orElse(currentGmailAccounts.get(0)));
                         } else {
                             // Cập nhật bản ghi mới nhất của tài khoản đang chọn
                             currentGmailAccounts.stream().filter(a -> a.id().equals(target.id())).findFirst()
@@ -1093,7 +1336,11 @@ public class MainFrame extends JFrame {
                             renderAccountCards();
                         }
                     } else {
+                        workerCoordinator.cancelAll();
+                        foldersLoading = false;
+                        invalidateMailboxSelection();
                         selectedAccount = null;
+                        selectedFolder = null;
                         folderListModel.clear();
                         loadedUids.clear();
                         mailListModel.clear();
@@ -1210,7 +1457,8 @@ public class MainFrame extends JFrame {
             JPanel warnRow = Theme.createWrapPanel(4, 2);
             warnRow.setAlignmentX(Component.LEFT_ALIGNMENT);
             warnRow.add(Theme.badge(fallbackActive ? "Đang dùng App Password dự phòng" : "Cần cấp lại quyền",
-                    Theme.warningSoft(), Theme.warning()));
+                    fallbackActive ? Theme.warningSoft() : Theme.dangerSoft(),
+                    fallbackActive ? Theme.warning() : Theme.danger()));
             JButton reBtn = new JButton(fallbackActive ? "Cấp lại quyền" : "Cấp lại");
             reBtn.setFont(Theme.fontTiny().deriveFont(Font.BOLD));
             reBtn.setForeground(Theme.primaryText());
@@ -1218,8 +1466,9 @@ public class MainFrame extends JFrame {
             reBtn.setBorderPainted(false);
             reBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
             reBtn.setToolTipText("Cấp lại quyền truy cập Gmail bằng OAuth2");
-            reBtn.addActionListener(e -> initiateOAuth2Flow());
-            warnRow.add(reBtn);
+            reBtn.addActionListener(e -> initiateOAuth2Flow(acc.id()));
+            PublicConfigDto config = SessionStore.getInstance().getPublicConfig();
+            if (hasOAuth && config != null && config.oauth2LinkEnabled()) warnRow.add(reBtn);
             info.add(Box.createVerticalStrut(2));
             info.add(warnRow);
         }
@@ -1234,6 +1483,11 @@ public class MainFrame extends JFrame {
     }
 
     private void selectGmailAccount(GmailAccountDto acc) {
+        if (closing) return;
+        workerCoordinator.cancelAll();
+        foldersLoading = false;
+        invalidateMailboxSelection();
+        folderListModel.clear();
         this.selectedAccount = acc;
         this.selectedFolder = null;
         this.currentDetail = null;
@@ -1241,13 +1495,13 @@ public class MainFrame extends JFrame {
         detailCardLayout.show(detailCardPanel, "EMPTY_DETAIL");
 
         // Nếu NEEDS_REAUTH nhưng có App Password dự phòng (hoặc đang fallbackActive), vẫn cho phép đọc/gửi thư qua dự phòng
-        if ("NEEDS_REAUTH".equalsIgnoreCase(acc.status()) && !acc.hasAppPassword() && !acc.isFallbackActive()) {
+        if (acc.requiresReauthBeforeMail()) {
             folderListModel.clear();
             loadedUids.clear();
             mailListModel.clear();
             showEmptyListState("Tài khoản cần xác thực lại",
                     acc.email() + " đã hết hạn hoặc bị thu hồi quyền. Hãy cấp lại quyền để tiếp tục.",
-                    "Cấp lại quyền (OAuth2)");
+                    acc.hasOAuth() ? "Cấp lại quyền (OAuth2)" : "Quản lý tài khoản Gmail");
             return;
         }
         loadFolders();
@@ -1262,6 +1516,7 @@ public class MainFrame extends JFrame {
                 return javax.imageio.ImageIO.read(new java.io.ByteArrayInputStream(bytes));
             }
             @Override protected void done() {
+                if (closing || currentGmailAccounts.stream().noneMatch(a -> Objects.equals(a.id(), accId))) return;
                 try {
                     java.awt.image.BufferedImage img = get();
                     if (img != null) {
@@ -1284,7 +1539,10 @@ public class MainFrame extends JFrame {
     }
 
     private void loadFolders() {
-        if (selectedAccount == null) return;
+        if (closing || selectedAccount == null) return;
+        foldersLoading = true;
+        invalidateMailboxSelection();
+        folderList.setEnabled(false);
         final Long gid = selectedAccount.id();
         final long gen = workerCoordinator.beginFoldersLoad(null);
         listCardLayout.show(listCardPanel, "LOADING");
@@ -1296,6 +1554,8 @@ public class MainFrame extends JFrame {
             }
             @Override protected void done() {
                 if (isCancelled() || !workerCoordinator.isFoldersCurrent(gen)) return;
+                foldersLoading = false;
+                folderList.setEnabled(true);
                 try {
                     currentFolders = get();
                     folderListModel.clear();
@@ -1316,9 +1576,18 @@ public class MainFrame extends JFrame {
                         selectedFolder = toSelect;
                         folderList.setSelectedValue(toSelect, true);
                         loadMails(0, false);
+                    } else {
+                        selectedFolder = null;
+                        showEmptyListState("Không có thư mục", "Hộp thư chưa có thư mục để hiển thị.", "Làm mới");
                     }
                 } catch (Exception ex) {
-                    if (!isCancelled()) handleCommonError(ex, "Không tải được danh sách thư mục");
+                    if (!isCancelled()) {
+                        selectedFolder = null;
+                        currentFolders = List.of();
+                        folderListModel.clear();
+                        handleCommonError(ex, "Không tải được danh sách thư mục");
+                        showEmptyListState("Không thể tải thư mục", extractMsg(ex), "Thử lại");
+                    }
                 }
             }
         };
@@ -1327,25 +1596,42 @@ public class MainFrame extends JFrame {
     }
 
     private void loadMails(int page, boolean append) {
-        if (selectedAccount == null || selectedFolder == null) return;
+        if (closing || foldersLoading || selectedAccount == null || selectedFolder == null) return;
+        int size = effectivePageSize();
+        var criteria = new MailboxViewModel.SearchCriteria(searchField.getText(),
+                unreadFilterBtn.isSelected(), attachFilterBtn.isSelected());
+        if (activePageSize != size || !criteria.equals(activeSearchCriteria)) {
+            loadMailsAtSize(0, false, size, criteria);
+        } else {
+            loadMailsAtSize(page, append, size, criteria);
+        }
+    }
+
+    private void loadMailsAtSize(int page, boolean append, int size, MailboxViewModel.SearchCriteria criteria) {
+        activePageSize = size;
+        activeSearchCriteria = criteria;
         final Long gid = selectedAccount.id();
         final String folderName = selectedFolder.name();
-        final String query = searchField.getText().trim();
-        final Boolean unreadOnly = unreadFilterBtn.isSelected() ? Boolean.TRUE : null;
-        final Boolean hasAttachOnly = attachFilterBtn.isSelected() ? Boolean.TRUE : null;
-        final long gen = workerCoordinator.beginMailsLoad();
-
+        final String query = criteria.query();
+        final Boolean unreadOnly = criteria.unreadOnly() ? Boolean.TRUE : null;
+        final Boolean hasAttachOnly = criteria.hasAttachment() ? Boolean.TRUE : null;
         if (!append) {
+            invalidateMailboxSelection();
             listCardLayout.show(listCardPanel, "LOADING");
         } else {
             loadMoreBtn.setEnabled(false);
             loadMoreBtn.setText("Đang tải...");
         }
+        final long gen = workerCoordinator.beginMailsLoad();
+        if (!append) mailboxReady = false;
+        previousPageBtn.setEnabled(false);
+        nextPageBtn.setEnabled(false);
+        loadMoreBtn.setEnabled(false);
         setStatus("Đang tải thư trong " + selectedFolder.displayName() + "...");
 
         SwingWorker<MailListResponse, Void> worker = new SwingWorker<>() {
             @Override protected MailListResponse doInBackground() throws Exception {
-                return apiClient.getMails(gid, folderName, page, 30, query, unreadOnly, hasAttachOnly, null, null);
+                return apiClient.getMails(gid, folderName, page, size, query, unreadOnly, hasAttachOnly, null, null);
             }
             @Override protected void done() {
                 if (isCancelled() || !workerCoordinator.isMailsCurrent(gen)) return;
@@ -1353,6 +1639,11 @@ public class MainFrame extends JFrame {
                 loadMoreBtn.setText("Tải thêm...");
                 try {
                     MailListResponse resp = get();
+                    if (page > 0 && resp.total() > 0 && (resp.items() == null || resp.items().isEmpty())
+                            && (long) page * size >= resp.total()) {
+                        loadMails((int) ((resp.total() - 1) / size), false);
+                        return;
+                    }
                     // Nếu hộp thư đổi UIDVALIDITY giữa lúc tải thêm -> đồng bộ lại từ trang 0
                     if (MailboxViewModel.shouldReloadFromFirstPage(currentUidValidity, resp, append)) {
                         loadMails(0, false);
@@ -1364,6 +1655,7 @@ public class MainFrame extends JFrame {
                     if (resp.uidValidity() != 0) {
                         currentUidValidity = resp.uidValidity();
                     }
+                    mailboxReady = currentUidValidity > 0;
 
                     if (!append) {
                         loadedUids.clear();
@@ -1382,11 +1674,15 @@ public class MainFrame extends JFrame {
                         listCardLayout.show(listCardPanel, "LIST");
                     }
 
-                    mailCountLabel.setText("Hiển thị " + mailListModel.size() + " / " + totalMails + " thư");
+                    long totalPages = Math.max(1L, (totalMails + size - 1) / size);
+                    mailCountLabel.setText("Trang " + (currentPage + 1) + "/" + totalPages + " · " + totalMails + " thư");
                     loadMoreBtn.setVisible(hasMoreMails);
+                    previousPageBtn.setEnabled(currentPage > 0);
+                    nextPageBtn.setEnabled(hasMoreMails);
                     setStatus("Đã tải " + mailListModel.size() + " / " + totalMails + " thư (" + selectedFolder.displayName() + ").");
                 } catch (Exception ex) {
                     if (!isCancelled()) {
+                        invalidateMailboxSelection();
                         handleCommonError(ex, "Không tải được danh sách thư");
                         showEmptyListState("Không thể tải danh sách thư", extractMsg(ex), "Thử lại");
                     }
@@ -1398,10 +1694,12 @@ public class MainFrame extends JFrame {
     }
 
     private void loadMailDetail(MailSummaryDto summary, boolean loadRemote) {
-        if (selectedAccount == null || selectedFolder == null || summary == null) return;
+        if (!mailboxReady || selectedAccount == null || selectedFolder == null || summary == null
+                || summary.uidValidity() != currentUidValidity) return;
         final Long gid = selectedAccount.id();
         final String folderName = selectedFolder.name();
         final long gen = workerCoordinator.beginDetailLoad();
+        currentDetail = null;
         detailCardLayout.show(detailCardPanel, "LOADING_DETAIL");
         setStatus("Đang tải thư #" + summary.uid() + "...");
 
@@ -1413,8 +1711,12 @@ public class MainFrame extends JFrame {
                 if (isCancelled() || !workerCoordinator.isDetailCurrent(gen)) return;
                 try {
                     MailDetailResponse detail = get();
+                    if (!isCurrentMailbox(gid, folderName, summary.uidValidity())) return;
+                    if (detail == null || detail.uid() != summary.uid() || detail.uidValidity() != summary.uidValidity()) {
+                        throw new java.io.IOException("Chi tiết thư không khớp UID/UIDVALIDITY đã yêu cầu.");
+                    }
                     displayMailDetail(detail);
-                    updateListItemSeenFlag(summary.uid(), true);
+                    if (detail.flags() != null) updateListItemFlags(summary.uid(), detail.flags());
                     setStatus("Đã mở thư: " + (detail.subject() != null ? detail.subject() : "(Không tiêu đề)"));
                 } catch (Exception ex) {
                     if (isCancelled()) return;
@@ -1440,11 +1742,13 @@ public class MainFrame extends JFrame {
         expandedHeaderPanel.setVisible(false);
         expandHeaderBtn.setText("Chi tiết (+)");
 
+        detailSubjectLabel.putClientProperty("html.disable", Boolean.TRUE);
         detailSubjectLabel.setText((detail.subject() != null && !detail.subject().isBlank()) ? detail.subject() : "(Không có tiêu đề)");
 
         String senderName = detail.from() != null ? detail.from().displayText() : "(Không rõ người gửi)";
         String senderAddr = detail.from() != null ? detail.from().address() : "";
         detailAvatarLabel.setIcon(AvatarUtil.createAvatarIcon(senderName, senderAddr, 40));
+        detailFromLabel.putClientProperty("html.disable", Boolean.TRUE);
         detailFromLabel.setText(senderName);
 
         String toSummary = formatAddressList(detail.to());
@@ -1494,7 +1798,12 @@ public class MainFrame extends JFrame {
         chip.setBackground(Theme.bgSurface());
         chip.setBorder(BorderFactory.createLineBorder(Theme.border(), 1));
 
-        JLabel name = new JLabel(att.filename() + " (" + ComposeDialog.formatBytes(att.size()) + ")");
+        JLabel name = new JLabel(att.filename() + " (" + MailSizeDisplay.attachment(att.size(), att.sizeAccuracy()) + ")");
+        name.setToolTipText(switch (att.sizeAccuracy()) {
+            case EXACT -> "Dung lượng chính xác";
+            case ESTIMATED -> "Dung lượng ước tính từ IMAP; số byte tải thực tế có thể khác";
+            case UNKNOWN -> "Máy chủ chưa xác định được dung lượng tệp";
+        });
         name.setFont(Theme.fontSmall());
         name.setForeground(Theme.textPrimary());
 
@@ -1521,64 +1830,118 @@ public class MainFrame extends JFrame {
     }
 
     private void downloadSingleAttachment(MailDetailResponse detail, MailAttachmentDto att, boolean openAfter) {
-        if (selectedAccount == null || selectedFolder == null) return;
+        if (closing || !mailboxReady || selectedAccount == null || selectedFolder == null
+                || detail == null || currentDetail == null || detail.uid() != currentDetail.uid()
+                || detail.uidValidity() != currentUidValidity) return;
+        SessionStore session = SessionStore.getInstance();
+        final long generation = session.getGeneration();
+        final SessionStore.AttachmentKey key = new SessionStore.AttachmentKey(
+                selectedAccount.id(), selectedFolder.name(), detail.uidValidity(), detail.uid(), att.index());
+        final long selectionGeneration = mailboxGeneration;
+        if (openAfter) {
+            Path cached = session.findDownloadedAttachment(key);
+            if (cached != null) {
+                openDownloadedAttachment(cached.toFile(), key, generation, selectionGeneration);
+                return;
+            }
+        }
+        if (pendingDownloads.contains(key)) {
+            setStatus("Tệp này đang được tải. Vui lòng đợi tải xong.");
+            return;
+        }
         File baseDir = new File(ClientConfig.getInstance().getDownloadDir());
-        Path targetDir = AttachmentCleanupService.buildTargetDirectory(baseDir, selectedAccount.email(), LocalDate.now());
+        Path targetDir = FileUtil.attachmentDirectory(baseDir.toPath(), selectedAccount.email());
         String safeName = AttachmentCleanupService.sanitizeFilename(att.filename());
 
         File targetFile;
         if (!openAfter) {
+            try {
+                // Ensure the first save opens inside the configured mailbox
+                // directory, not the OS default Documents folder.
+                targetDir = FileUtil.prepareAttachmentDirectory(baseDir.toPath(), selectedAccount.email());
+            } catch (java.io.IOException | SecurityException ex) {
+                handleCommonError(ex, "Không tạo được thư mục tải tệp đính kèm");
+                return;
+            }
             JFileChooser fc = new JFileChooser(targetDir.toFile());
             fc.setSelectedFile(new File(targetDir.toFile(), safeName));
             if (fc.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
             targetFile = fc.getSelectedFile();
         } else {
-            targetDir.toFile().mkdirs();
-            targetFile = AttachmentCleanupService.resolveUniqueFilePath(targetDir, safeName).toFile();
+            targetFile = targetDir.resolve(safeName).toFile();
         }
 
-        final Long gid = selectedAccount.id();
-        final String folderName = selectedFolder.name();
+        if (selectionGeneration != mailboxGeneration || generation != session.getGeneration()
+                || !isCurrentAttachmentDetail(key)) return;
+        pendingDownloads.add(key);
         setStatus("Đang tải tệp " + att.filename() + "...");
 
         new SwingWorker<ApiClient.DownloadResult, Void>() {
             @Override protected ApiClient.DownloadResult doInBackground() throws Exception {
-                targetFile.getParentFile().mkdirs();
-                return apiClient.downloadAttachmentToFile(gid, folderName, detail.uid(), att.index(), detail.uidValidity(), targetFile);
+                if (generation != session.getGeneration()) throw new InterruptedException();
+                return FileUtil.download(apiClient, key, targetFile.toPath());
             }
             @Override protected void done() {
+                pendingDownloads.remove(key);
+                if (closing || generation != session.getGeneration()) return;
                 try {
                     ApiClient.DownloadResult res = get();
-                    setStatus("Đã tải xong " + targetFile.getName() + " (" + ComposeDialog.formatBytes(res.bytesWritten()) + ")");
+                    File saved = res.file();
+                    session.rememberDownloadedAttachment(generation, key, saved.toPath());
+                    // Keep a completed download in the same session's cache, but don't
+                    // open a file or show an old dialog after the user selected another mail.
+                    if (selectionGeneration != mailboxGeneration || !isCurrentAttachmentDetail(key)) return;
+                    setStatus("Đã tải xong " + saved.getName() + " (" + ComposeDialog.formatBytes(res.bytesWritten()) + ")");
                     if (openAfter) {
-                        if (ClientSafetyUtil.isDangerousExecutableExtension(targetFile.getName())) {
-                            int warn = JOptionPane.showConfirmDialog(
-                                    MainFrame.this,
-                                    "CẢNH BÁO BẢO MẬT: Tệp '" + targetFile.getName()
-                                            + "' có định dạng có thể thực thi mã độc trên máy tính.\n"
-                                            + "Tệp đã được lưu an toàn tại: " + targetFile.getAbsolutePath()
-                                            + "\n\nBạn có CHẮC CHẮN muốn mở tệp này không?",
-                                    "Cảnh báo tệp đính kèm nguy hiểm",
-                                    JOptionPane.YES_NO_OPTION,
-                                    JOptionPane.WARNING_MESSAGE
-                            );
-                            if (warn != JOptionPane.YES_OPTION) {
-                                return;
-                            }
-                        }
-                        if (Desktop.isDesktopSupported()) {
-                            Desktop.getDesktop().open(targetFile);
-                        }
+                        openDownloadedAttachment(saved, key, generation, selectionGeneration);
                     } else {
                         JOptionPane.showMessageDialog(MainFrame.this,
-                                "Đã lưu tệp thành công:\n" + targetFile.getAbsolutePath() + "\nSHA-256: " + res.sha256Hex().substring(0, 16) + "...",
+                                "Đã lưu tệp thành công:\n" + saved.getAbsolutePath() + "\nSHA-256: " + res.sha256Hex().substring(0, 16) + "...",
                                 "Tải tệp thành công", JOptionPane.INFORMATION_MESSAGE);
                     }
                 } catch (Exception ex) {
-                    handleCommonError(ex, "Lỗi tải tệp đính kèm");
+                    if (selectionGeneration == mailboxGeneration && isCurrentAttachmentDetail(key)) {
+                        handleCommonError(ex, "Lỗi tải tệp đính kèm");
+                    }
                 }
             }
         }.execute();
+    }
+
+    private boolean isCurrentAttachmentDetail(SessionStore.AttachmentKey key) {
+        return isCurrentMailbox(key.gmailId(), key.folder(), key.uidValidity())
+                && currentDetail != null && currentDetail.uid() == key.uid()
+                && currentDetail.uidValidity() == key.uidValidity();
+    }
+
+    private void openDownloadedAttachment(File file, SessionStore.AttachmentKey key,
+                                          long sessionGeneration, long selectionGeneration) {
+        SessionStore session = SessionStore.getInstance();
+        if (ClientSafetyUtil.isDangerousExecutableExtension(file.getName())) {
+            int warn = JOptionPane.showConfirmDialog(this,
+                    "Tệp '" + file.getName() + "' có định dạng có thể thực thi mã.\n"
+                            + "Bạn có chắc chắn muốn mở tệp này không?",
+                    "Cảnh báo tệp đính kèm nguy hiểm", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+            if (warn != JOptionPane.YES_OPTION) return;
+        }
+        // A confirmation dialog runs a nested EDT event loop. Revalidate the
+        // exact cached file and originating session/detail after it closes.
+        if (closing || sessionGeneration != session.getGeneration()
+                || selectionGeneration != mailboxGeneration || !isCurrentAttachmentDetail(key)) return;
+        Path cached = session.findDownloadedAttachment(key);
+        if (cached == null || !cached.equals(file.toPath().toAbsolutePath().normalize())) {
+            setStatus("Tệp đã tải không còn nguyên trạng. Hãy tải lại trước khi mở.");
+            return;
+        }
+        try {
+            if (!Desktop.isDesktopSupported() || !Desktop.getDesktop().isSupported(Desktop.Action.OPEN)) {
+                throw new java.io.IOException("Không có ứng dụng mở tệp mặc định.");
+            }
+            Desktop.getDesktop().open(cached.toFile());
+            setStatus("Đã mở " + file.getName());
+        } catch (Exception ex) {
+            handleCommonError(ex, "Không mở được tệp đã tải");
+        }
     }
 
     private void renderCurrentBody() {
@@ -1655,6 +2018,12 @@ public class MainFrame extends JFrame {
     }
 
     private void openComposeDialog(MailDetailResponse original, String mode) {
+        if (closing) return;
+        if (!sendEnabled()) {
+            JOptionPane.showMessageDialog(this, "Tính năng gửi thư bị tắt bởi Admin hoặc chưa tải được cấu hình.",
+                    "Không thể soạn thư", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
         if (currentGmailAccounts.isEmpty()) {
             int opt = JOptionPane.showConfirmDialog(this,
                     "Bạn chưa liên kết tài khoản Gmail nào.\nBạn có muốn mở Quản lý Tài khoản Gmail để liên kết ngay không?",
@@ -1672,68 +2041,120 @@ public class MainFrame extends JFrame {
         if (original != null && mode != null) {
             dlg.prefillReplyOrForward(original, mode);
         }
-        dlg.setVisible(true);
+        activeComposeDialog = dlg;
+        dlg.setOnSessionExpired(this::handleSessionExpired);
+        try {
+            dlg.setVisible(true);
+        } finally {
+            activeComposeDialog = null;
+        }
     }
 
     private void toggleStarCurrentMail() {
         if (currentDetail == null || selectedAccount == null || selectedFolder == null) return;
-        boolean newFlagged = !(currentDetail.flags() != null && currentDetail.flags().flagged());
-        final Long gid = selectedAccount.id();
-        final String folderName = selectedFolder.name();
-        final long uid = currentDetail.uid();
+        boolean flagged = currentDetail.flags() != null && currentDetail.flags().flagged();
+        updateMailFlags(currentDetail.uid(), currentDetail.uidValidity(), null, !flagged);
+    }
 
-        new SwingWorker<MailFlagsDto, Void>() {
-            @Override protected MailFlagsDto doInBackground() throws Exception {
-                return apiClient.updateMailFlags(gid, folderName, uid, null, newFlagged, currentDetail.uidValidity());
-            }
-            @Override protected void done() {
-                try {
-                    MailFlagsDto updated = get();
-                    currentDetail = new MailDetailResponse(
-                            currentDetail.uid(), currentDetail.uidValidity(), currentDetail.from(), currentDetail.to(),
-                            currentDetail.cc(), currentDetail.bcc(), currentDetail.replyTo(), currentDetail.date(),
-                            currentDetail.messageId(), currentDetail.inReplyTo(), currentDetail.references(),
-                            currentDetail.subject(), currentDetail.textBody(), currentDetail.htmlBody(),
-                            currentDetail.truncated(), currentDetail.hasBlockedRemoteImages(),
-                            currentDetail.attachments(), updated);
-                    starActionBtn.setToolTipText(updated.flagged() ? "Bỏ gắn sao" : "Gắn sao");
-                    starActionBtn.setIcon(AppIcons.vectorIcon(updated.flagged() ? AppIcons.Glyph.STAR_FILLED : AppIcons.Glyph.STAR, 17, Theme.starGold()));
-                    updateListItemFlags(uid, updated);
-                } catch (Exception ex) {
-                    handleCommonError(ex, "Không cập nhật được trạng thái sao");
-                }
-            }
-        }.execute();
+    private void toggleStarForMail(MailSummaryDto item) {
+        if (item == null) return;
+        boolean flagged = item.flags() != null && item.flags().flagged();
+        updateMailFlags(item.uid(), item.uidValidity(), null, !flagged);
     }
 
     private void markCurrentMailUnread() {
         if (currentDetail == null || selectedAccount == null || selectedFolder == null) return;
+        updateMailFlags(currentDetail.uid(), currentDetail.uidValidity(), false, null);
+    }
+
+    private boolean isCurrentMailbox(Long gmailId, String folderName, long uidValidity) {
+        return !closing && mailboxReady && selectedAccount != null && selectedFolder != null
+                && Objects.equals(gmailId, selectedAccount.id()) && Objects.equals(folderName, selectedFolder.name())
+                && currentUidValidity > 0 && uidValidity == currentUidValidity;
+    }
+
+    private void updateMailFlags(long uid, long uidValidity, Boolean seen, Boolean flagged) {
+        if (closing || !mailboxReady || selectedAccount == null || selectedFolder == null
+                || uidValidity != currentUidValidity) return;
         final Long gid = selectedAccount.id();
         final String folderName = selectedFolder.name();
-        final long uid = currentDetail.uid();
-
+        MailIdentity identity = new MailIdentity(gid, folderName, uidValidity, uid);
+        if (!pendingFlagUpdates.add(identity)) return;
+        final SessionStore session = SessionStore.getInstance();
+        final long sessionGeneration = session.getGeneration();
+        final long selectionGeneration = mailboxGeneration;
         new SwingWorker<MailFlagsDto, Void>() {
             @Override protected MailFlagsDto doInBackground() throws Exception {
-                return apiClient.updateMailFlags(gid, folderName, uid, false, null, currentDetail.uidValidity());
+                if (closing || sessionGeneration != session.getGeneration() || selectionGeneration != mailboxGeneration)
+                    throw new java.util.concurrent.CancellationException();
+                return apiClient.updateMailFlags(gid, folderName, uid, seen, flagged, uidValidity);
             }
             @Override protected void done() {
+                pendingFlagUpdates.remove(identity);
+                if (closing || sessionGeneration != session.getGeneration()) return;
+                if (selectionGeneration != mailboxGeneration) {
+                    // A→B→A may restore the same UIDVALIDITY but the old
+                    // response must not overwrite the newly loaded flags.
+                    if (isCurrentMailbox(gid, folderName, uidValidity)) loadMails(0, false);
+                    return;
+                }
+                if (!isCurrentMailbox(gid, folderName, uidValidity)) return;
                 try {
                     MailFlagsDto updated = get();
                     updateListItemFlags(uid, updated);
-                    setStatus("Đã đánh dấu thư là Chưa đọc.");
+                    MailDetailResponse detail = currentDetail;
+                    if (detail != null && detail.uid() == uid && detail.uidValidity() == uidValidity) {
+                        currentDetail = new MailDetailResponse(detail.uid(), detail.uidValidity(), detail.from(),
+                                detail.to(), detail.cc(), detail.bcc(), detail.replyTo(), detail.date(),
+                                detail.messageId(), detail.inReplyTo(), detail.references(), detail.subject(),
+                                detail.textBody(), detail.htmlBody(), detail.truncated(), detail.hasBlockedRemoteImages(),
+                                detail.attachments(), updated);
+                        starActionBtn.setToolTipText(updated.flagged() ? "Bỏ gắn sao" : "Gắn sao");
+                        starActionBtn.setIcon(AppIcons.vectorIcon(updated.flagged() ? AppIcons.Glyph.STAR_FILLED
+                                : AppIcons.Glyph.STAR, 17, Theme.starGold()));
+                    }
+                    setStatus(seen != null && !seen ? "Đã đánh dấu thư là Chưa đọc." : "Đã cập nhật trạng thái sao.");
                 } catch (Exception ex) {
-                    handleCommonError(ex, "Không cập nhật được trạng thái đọc");
+                    Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+                    if (cause instanceof ApiException apiEx && "UID_VALIDITY_CHANGED".equalsIgnoreCase(apiEx.getCode())) {
+                        setStatus("Hộp thư đã thay đổi cấu trúc — đang tự động đồng bộ lại...");
+                        loadMails(0, false);
+                        return;
+                    }
+                    if (ApiException.isMutationOutcomeUncertain(ex)) {
+                        setStatus("Chưa xác định được kết quả cập nhật cờ thư. Đang tải lại danh sách; không tự thử lại.");
+                        currentDetail = null;
+                        detailCardLayout.show(detailCardPanel, "EMPTY_DETAIL");
+                        loadMails(0, false);
+                        return;
+                    }
+                    handleCommonError(ex, "Không cập nhật được trạng thái thư");
                 }
             }
         }.execute();
     }
 
     private void deleteSelectedMails() {
-        if (selectedAccount == null || selectedFolder == null) return;
-        List<MailSummaryDto> selected = mailList.getSelectedValuesList();
-        if (selected.isEmpty()) return;
+        deleteMailTargets(List.copyOf(mailList.getSelectedValuesList()));
+    }
 
-        boolean inTrash = "TRASH".equalsIgnoreCase(selectedFolder.name());
+    private void deleteCurrentDetail() {
+        deleteMailTargets(MailboxViewModel.detailMutationTarget(currentDetail,
+                List.copyOf(mailList.getSelectedValuesList()), currentUidValidity));
+    }
+
+    private void deleteMailTargets(List<MailSummaryDto> selected) {
+        if (closing || deleting || autoCleanRunning.get() || activeCleanupDialog != null
+                || !mailboxReady || selectedAccount == null || selectedFolder == null) return;
+        final Long gid = selectedAccount.id();
+        final String folderName = selectedFolder.name();
+        final long uidValidity = currentUidValidity;
+        final long generation = mailboxGeneration;
+        final SessionStore session = SessionStore.getInstance();
+        final long sessionGeneration = session.getGeneration();
+        if (!MailboxViewModel.validMutationSelection(selected, uidValidity)) return;
+
+        boolean inTrash = "TRASH".equalsIgnoreCase(selectedFolder.name()) || "TRASH".equalsIgnoreCase(selectedFolder.type());
         String msg = inTrash
                 ? "Bạn có chắc chắn muốn XÓA VĨNH VIỄN " + selected.size() + " thư trong Thùng rác?"
                 : "Chuyển " + selected.size() + " thư đã chọn vào Thùng rác?";
@@ -1742,28 +2163,51 @@ public class MainFrame extends JFrame {
             return;
         }
 
-        final Long gid = selectedAccount.id();
-        final String folderName = selectedFolder.name();
+        if (generation != mailboxGeneration || sessionGeneration != session.getGeneration()
+                || deleting || autoCleanRunning.get() || activeCleanupDialog != null
+                || !isCurrentMailbox(gid, folderName, uidValidity)) return;
+        deleting = true;
         setStatus("Đang xóa " + selected.size() + " thư...");
 
-        new SwingWorker<Integer, Void>() {
-            @Override protected Integer doInBackground() throws Exception {
-                int ok = 0;
-                for (MailSummaryDto m : selected) {
-                    apiClient.deleteMail(gid, folderName, m.uid(), inTrash, m.uidValidity());
-                    ok++;
-                }
-                return ok;
+        new SwingWorker<MailboxViewModel.DeleteBatchResult, Void>() {
+            @Override protected MailboxViewModel.DeleteBatchResult doInBackground() {
+                return MailboxViewModel.deleteConfirmedBatch(selected,
+                        () -> !closing && sessionGeneration == session.getGeneration() && generation == mailboxGeneration,
+                        m -> apiClient.deleteMail(gid, folderName, m.uid(), inTrash, m.uidValidity()));
             }
             @Override protected void done() {
+                deleting = false;
                 try {
-                    int ok = get();
-                    setStatus("Đã xóa " + ok + " thư.");
+                    var result = get();
+                    Exception failure = result.failure();
+                    if (failure != null && ApiException.isDeleteOutcomeUncertain(failure)) {
+                        disableAutoCleanWithWarning("Đã xác nhận " + result.acknowledged() + "/" + result.requested()
+                                + " thư. Chưa xác định kết quả thư tiếp theo; đã dừng lô và tự động dọn. Kiểm tra nguồn và Thùng rác, không tự thử lại.");
+                        if (!closing && sessionGeneration == session.getGeneration()
+                                && selectedAccount != null && Objects.equals(selectedAccount.id(), gid)) loadFolders();
+                        return;
+                    }
+                    if (closing || sessionGeneration != session.getGeneration()) return;
+                    if (failure != null) {
+                        handleCommonError(failure, "Đã xác nhận " + result.acknowledged() + "/" + result.requested() + " thư, dừng lô");
+                        if (isCurrentMailbox(gid, folderName, uidValidity)) loadMails(0, false);
+                        return;
+                    }
+                    if (!isCurrentMailbox(gid, folderName, uidValidity)) return;
+                    setStatus(result.stopped() ? "Đã dừng lô: xác nhận " + result.acknowledged() + "/" + result.requested() + " thư."
+                            : "Đã xóa " + result.acknowledged() + " thư.");
                     detailCardLayout.show(detailCardPanel, "EMPTY_DETAIL");
                     currentDetail = null;
                     loadMails(0, false);
                 } catch (Exception ex) {
-                    handleCommonError(ex, "Lỗi khi xóa thư");
+                    if (ApiException.isDeleteOutcomeUncertain(ex)) {
+                        disableAutoCleanWithWarning("Không xác định được kết quả xóa của lô thư. Đã dừng tự động dọn, không tự động thử lại. Hãy kiểm tra thư mục nguồn và Thùng rác trước khi thao tác tiếp.");
+                        if (!closing && selectedAccount != null && Objects.equals(selectedAccount.id(), gid)) loadFolders();
+                    } else {
+                        if (closing || !isCurrentMailbox(gid, folderName, uidValidity)) return;
+                        handleCommonError(ex, "Lỗi khi xóa thư");
+                        if (!closing) loadMails(0, false);
+                    }
                 }
             }
         }.execute();
@@ -1772,6 +2216,7 @@ public class MainFrame extends JFrame {
     // ==================== CORE FEATURE: DOWNLOAD ATTACHMENTS THEN DELETE ====================
 
     private void openCleanupForSelectedMails() {
+        if (closing) return;
         if (currentGmailAccounts.isEmpty()) {
             int opt = JOptionPane.showConfirmDialog(this,
                     "Bạn chưa liên kết tài khoản Gmail nào.\nMở Quản lý Tài khoản Gmail để liên kết ngay?",
@@ -1781,32 +2226,42 @@ public class MainFrame extends JFrame {
             }
             return;
         }
-        if (selectedAccount == null || selectedFolder == null) {
+        if (!mailboxReady || selectedAccount == null || selectedFolder == null) {
             JOptionPane.showMessageDialog(this, "Vui lòng chọn tài khoản Gmail và thư mục trước.", "Thông báo", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
         List<MailSummaryDto> targets = mailList.getSelectedValuesList();
-        if (targets.isEmpty()) {
+        if (!MailboxViewModel.validMutationSelection(targets, currentUidValidity)) {
             JOptionPane.showMessageDialog(this, "Hãy chọn một hoặc nhiều thư trong danh sách (giữ Ctrl/Shift để chọn nhiều).",
                     "Chưa chọn thư", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
-        CleanupPreviewDialog dlg = new CleanupPreviewDialog(
-                this, cleanupService, selectedAccount.id(), selectedAccount.email(),
-                selectedFolder.name(), targets, this::refreshCurrentMailbox);
-        dlg.setVisible(true);
+        showCleanupDialog(targets);
     }
 
     private void openCleanupForCurrentMail() {
-        MailSummaryDto sel = mailList.getSelectedValue();
-        if (sel == null) {
-            openCleanupForSelectedMails();
-            return;
-        }
+        if (closing || !mailboxReady || selectedAccount == null || selectedFolder == null) return;
+        List<MailSummaryDto> target = MailboxViewModel.detailMutationTarget(currentDetail,
+                List.copyOf(mailList.getSelectedValuesList()), currentUidValidity);
+        if (!target.isEmpty()) showCleanupDialog(target);
+    }
+
+    private void showCleanupDialog(List<MailSummaryDto> targets) {
+        if (closing || deleting || autoCleanRunning.get() || activeCleanupDialog != null) return;
+        long generation = mailboxGeneration;
+        long sessionGeneration = SessionStore.getInstance().getGeneration();
         CleanupPreviewDialog dlg = new CleanupPreviewDialog(
                 this, cleanupService, selectedAccount.id(), selectedAccount.email(),
-                selectedFolder.name(), List.of(sel), this::refreshCurrentMailbox);
-        dlg.setVisible(true);
+                selectedFolder.name(), List.copyOf(targets), this::refreshAfterCleanup,
+                () -> !closing && generation == mailboxGeneration
+                        && sessionGeneration == SessionStore.getInstance().getGeneration());
+        activeCleanupDialog = dlg;
+        try {
+            dlg.setVisible(true);
+        } finally {
+            activeCleanupDialog = null;
+            dlg.dispose();
+        }
     }
 
     private void configureAutoCleanTimer() {
@@ -1829,8 +2284,9 @@ public class MainFrame extends JFrame {
     }
 
     private void triggerScheduledAutoClean() {
-        if (mockupMode || selectedAccount == null || autoCleanRunning.get()) return;
-        if ("NEEDS_REAUTH".equalsIgnoreCase(selectedAccount.status())) {
+        if (closing || mockupMode || selectedAccount == null || autoCleanRunning.get()
+                || deleting || activeCleanupDialog != null) return;
+        if (selectedAccount.requiresReauthBeforeMail()) {
             disableAutoCleanWithWarning("Tài khoản " + selectedAccount.email() + " đang ở trạng thái NEEDS_REAUTH. Tự động dọn đã được tắt.");
             return;
         }
@@ -1850,6 +2306,8 @@ public class MainFrame extends JFrame {
         final String senderFilter = cfg.getAutoCleanSenderFilter();
         final int minAgeDays = cfg.getAutoCleanMinAgeDays();
         final File baseDir = new File(cfg.getDownloadDir());
+        final long generation = mailboxGeneration;
+        final long sessionGeneration = SessionStore.getInstance().getGeneration();
 
         new SwingWorker<List<MailCleanupResult>, String>() {
             @Override protected List<MailCleanupResult> doInBackground() throws Exception {
@@ -1859,16 +2317,15 @@ public class MainFrame extends JFrame {
                 Instant cutoff = minAgeDays > 0 ? Instant.now().minus(Duration.ofDays(minAgeDays)) : null;
                 if (list.items() != null) {
                     for (MailSummaryDto m : list.items()) {
-                        if (cutoff != null && m.date() != null) {
-                            try {
-                                if (Instant.parse(m.date()).isAfter(cutoff)) continue;
-                            } catch (Exception ignored) {}
-                        }
+                        if (!MailboxViewModel.passesCleanupAge(m.date(), cutoff)) continue;
                         candidates.add(m);
                     }
                 }
                 return cleanupService.processMails(gid, email, "INBOX", candidates, baseDir,
-                        false, dryRun, autoCleanCancelled, this::publish);
+                        false, dryRun, autoCleanCancelled, this::publish,
+                        () -> !closing && generation == mailboxGeneration
+                                && sessionGeneration == SessionStore.getInstance().getGeneration()
+                                && ClientConfig.getInstance().isAutoCleanEnabled());
             }
 
             @Override protected void process(List<String> chunks) {
@@ -1883,7 +2340,10 @@ public class MainFrame extends JFrame {
                     long ok = res.stream().filter(r -> r.status() == AttachmentCleanupService.ItemStatus.SUCCESS).count();
                     long fail = res.stream().filter(r -> r.status() == AttachmentCleanupService.ItemStatus.FAILED).count();
                     setStatus("Tự động dọn hoàn tất: " + ok + " thành công, " + fail + " lỗi.");
-                    if (cleanupService.getConsecutiveErrors() >= 3) {
+                    if (res.stream().anyMatch(r -> r.status() == AttachmentCleanupService.ItemStatus.DELETE_UNCERTAIN)) {
+                        disableAutoCleanWithWarning("Chưa xác nhận được kết quả xóa. Đã dừng tự động dọn; hãy kiểm tra thư mục nguồn và Thùng rác trước khi bật lại.");
+                        if (!closing && selectedAccount != null && java.util.Objects.equals(selectedAccount.id(), gid)) loadFolders();
+                    } else if (cleanupService.getConsecutiveErrors() >= 3) {
                         disableAutoCleanWithWarning("Tự động dọn gặp 3 lỗi liên tiếp và đã tự tắt để bảo vệ dữ liệu.");
                     } else if (ok > 0) {
                         loadFolders();
@@ -1900,19 +2360,37 @@ public class MainFrame extends JFrame {
     }
 
     private void disableAutoCleanWithWarning(String reason) {
+        autoCleanCancelled.set(true);
         ClientConfig.getInstance().setAutoCleanEnabled(false);
+        if (closing) return;
         configureAutoCleanTimer();
         setStatus(reason);
         JOptionPane.showMessageDialog(this, reason, "Tự động dọn đã tắt", JOptionPane.WARNING_MESSAGE);
     }
 
+    private void refreshAfterCleanup() {
+        if (!ClientConfig.getInstance().isAutoCleanEnabled()) autoCleanCancelled.set(true);
+        if (closing) return;
+        configureAutoCleanTimer();
+        if (selectedAccount != null) loadFolders();
+        else loadGmailAccounts();
+    }
+
     // ==================== DIALOGS & OAUTH2 ====================
 
     private void openGmailManagerDialog() {
+        if (closing) return;
+        loadPublicConfig();
         GmailManagerDialog dlg = new GmailManagerDialog(
                 this, apiClient, SessionStore.getInstance().getPublicConfig(),
                 this::initiateOAuth2Flow, this::loadGmailAccounts);
-        dlg.setVisible(true);
+        activeGmailManager = dlg;
+        dlg.setOnSessionExpired(this::handleSessionExpired);
+        try {
+            dlg.setVisible(true);
+        } finally {
+            activeGmailManager = null;
+        }
     }
 
     private void openProfileDialog() {
@@ -1941,6 +2419,7 @@ public class MainFrame extends JFrame {
         String savedQuery = searchField != null ? searchField.getText() : "";
         boolean savedUnread = unreadFilterBtn != null && unreadFilterBtn.isSelected();
         boolean savedAttach = attachFilterBtn != null && attachFilterBtn.isSelected();
+        Integer savedPageSize = (Integer) pageSizeCombo.getSelectedItem();
 
         MainFrame fresh = new MainFrame(apiClient, false);
         fresh.setBounds(getBounds());
@@ -1956,7 +2435,10 @@ public class MainFrame extends JFrame {
         fresh.searchField.setText(savedQuery);
         fresh.unreadFilterBtn.setSelected(savedUnread);
         fresh.attachFilterBtn.setSelected(savedAttach);
+        fresh.pageSizeCombo.setSelectedItem(savedPageSize);
         fresh.setVisible(true);
+        fresh.startConfigRefresh();
+        fresh.loadPublicConfig();
         if (fresh.selectedAccount != null) {
             fresh.loadFolders();
         } else {
@@ -1969,19 +2451,26 @@ public class MainFrame extends JFrame {
     }
 
     public void initiateOAuth2Flow() {
-        PublicConfigDto config = SessionStore.getInstance().getPublicConfig();
-        if (config != null && !config.oauth2LinkEnabled()) {
+        initiateOAuth2Flow(null);
+    }
+
+    public void initiateOAuth2Flow(Long accountId) {
+        SessionStore session = SessionStore.getInstance();
+        if (closing || cancelOAuthLink != null || !session.hasActiveSession()) return;
+        if (!oauthLinkAdmission.isAllowed()) {
             JOptionPane.showMessageDialog(this,
                     "Tính năng liên kết Google OAuth2 hiện đang bị tắt bởi Quản trị viên.",
                     "Tính năng bị tắt", JOptionPane.WARNING_MESSAGE);
             return;
         }
+        final long generation = session.getGeneration();
+        FeatureAdmission.Ticket admission = oauthLinkAdmission.capture();
 
         JDialog pollDialog = new JDialog(this, "Liên Kết Google OAuth2 — " + AppIcons.BRAND_FULL, true);
         pollDialog.setIconImages(AppIcons.getWindowIcons());
         pollDialog.setSize(490, 210);
         pollDialog.setLocationRelativeTo(this);
-        pollDialog.setDefaultCloseOperation(JDialog.DISPOSE_ON_CLOSE);
+        pollDialog.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
 
         JPanel dialogPanel = new JPanel(new BorderLayout(10, 12));
         dialogPanel.setBorder(new EmptyBorder(18, 20, 15, 20));
@@ -1996,7 +2485,6 @@ public class MainFrame extends JFrame {
         progressBar.setString("Đang chuẩn bị...");
 
         JButton cancelButton = Theme.secondaryButton("Hủy bỏ", null);
-        cancelButton.addActionListener(e -> pollDialog.dispose());
         JPanel btnPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
         btnPanel.setOpaque(false);
         btnPanel.add(cancelButton);
@@ -2006,104 +2494,125 @@ public class MainFrame extends JFrame {
         dialogPanel.add(btnPanel, BorderLayout.SOUTH);
         pollDialog.setContentPane(dialogPanel);
 
-        final int initialCount = currentGmailAccounts.size();
-        final Set<Long> initialActiveOAuthIds = new HashSet<>();
-        for (GmailAccountDto acc : currentGmailAccounts) {
-            if ("OAUTH2".equalsIgnoreCase(acc.authType()) && "ACTIVE".equalsIgnoreCase(acc.status())) {
-                initialActiveOAuthIds.add(acc.id());
-            }
-        }
         final AtomicBoolean pollCancelled = new AtomicBoolean(false);
+        java.util.function.BooleanSupplier current = () -> !closing && !pollCancelled.get()
+                && generation == session.getGeneration() && session.hasActiveSession();
 
-        SwingWorker<Void, Integer> oauthWorker = new SwingWorker<>() {
-            @Override protected Void doInBackground() throws Exception {
-                String authUrl = apiClient.getOAuth2AuthorizeUrl();
+        SwingWorker<ApiClient.OAuthLinkPollDto, Integer> oauthWorker = new SwingWorker<>() {
+            @Override protected ApiClient.OAuthLinkPollDto doInBackground() throws Exception {
+                MailboxViewModel.preflightOAuthLink(oauthLinkAdmission, admission, current, apiClient::getPublicConfig);
+                MailboxViewModel.requireOAuthLinkAdmission(oauthLinkAdmission, admission, current);
+                ApiClient.OAuthLinkStartDto start = apiClient.startOAuth2Link(accountId);
+                MailboxViewModel.requireOAuthLinkAdmission(oauthLinkAdmission, admission, current);
+                if (start == null || start.pollToken() == null || start.pollToken().isBlank()
+                        || start.authorizeUrl() == null || start.authorizeUrl().isBlank()) {
+                    throw new ApiException(500, "PARSE_ERROR", "Máy chủ chưa hỗ trợ kiểm tra kết quả liên kết OAuth2.");
+                }
                 boolean opened = false;
                 try {
                     if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {
-                        Desktop.getDesktop().browse(new URI(authUrl));
+                        URI uri = new URI(start.authorizeUrl());
+                        if (uri.getHost() == null || uri.getUserInfo() != null
+                                || !("https".equalsIgnoreCase(uri.getScheme())
+                                || ("http".equalsIgnoreCase(uri.getScheme())
+                                && ("localhost".equalsIgnoreCase(uri.getHost()) || "127.0.0.1".equals(uri.getHost()))))) {
+                            throw new IllegalArgumentException("Invalid authorization URL");
+                        }
+                        MailboxViewModel.requireOAuthLinkAdmission(oauthLinkAdmission, admission, current);
+                        Desktop.getDesktop().browse(uri);
                         opened = true;
                     }
-                } catch (Exception ignored) {}
+                } catch (InterruptedException | ApiException ex) {
+                    throw ex;
+                } catch (Exception ignored) {
+                    // Do not expose a raw authorization URL or provider exception in Swing.
+                }
 
-                final boolean isOpened = opened;
-                SwingUtilities.invokeLater(() -> statusLabel.setText(isOpened
-                        ? "<html><b>Trình duyệt đã mở.</b><br>Hãy chọn tài khoản Google và giữ nguyên dấu tick quyền Gmail.</html>"
-                        : "<html><b>Hãy mở liên kết sau bằng trình duyệt:</b><br><small>" + authUrl + "</small></html>"));
+                if (!opened) {
+                    return new ApiClient.OAuthLinkPollDto("FAILED", "BROWSER_UNAVAILABLE",
+                            "Không thể mở trình duyệt mặc định. Hãy kiểm tra trình duyệt rồi thực hiện liên kết lại.", null);
+                }
+                // Once the browser is opened, do not invent cancellation of a remote consent.
+                // Continue reading the actual result while the local session is current.
+                SwingUtilities.invokeLater(() -> {
+                    if (current.getAsBoolean() && pollDialog.isDisplayable()) {
+                        statusLabel.setText("<html><b>Trình duyệt đã mở.</b><br>Hãy chọn tài khoản Google và giữ nguyên dấu tick quyền Gmail.</html>");
+                    }
+                });
 
-                MailboxViewModel.OAuthPollStatus status = MailboxViewModel.pollForOAuthAccount(
-                        apiClient::getGmailAccounts,
-                        initialCount,
-                        initialActiveOAuthIds,
+                return MailboxViewModel.pollForOAuthLink(
+                        () -> apiClient.pollOAuth2Link(start.pollToken()),
                         90,
                         2000L,
                         pollCancelled,
+                        current,
                         this::publish
                 );
 
-                if (status == MailboxViewModel.OAuthPollStatus.LINKED) {
-                    SwingUtilities.invokeLater(() -> {
-                        pollDialog.dispose();
-                        loadGmailAccounts();
-                        JOptionPane.showMessageDialog(MainFrame.this,
-                                "Liên kết tài khoản Google OAuth2 thành công!",
-                                "Thành công", JOptionPane.INFORMATION_MESSAGE);
-                    });
-                } else if (status == MailboxViewModel.OAuthPollStatus.TIMEOUT && pollDialog.isVisible()) {
-                    SwingUtilities.invokeLater(() -> {
-                        pollDialog.dispose();
-                        JOptionPane.showMessageDialog(MainFrame.this,
-                                "Hết thời gian chờ xác thực Google (3 phút). Vui lòng thử lại.",
-                                "Hết thời gian", JOptionPane.WARNING_MESSAGE);
-                    });
-                }
-                return null;
             }
             @Override protected void process(List<Integer> chunks) {
+                if (!current.getAsBoolean() || !pollDialog.isDisplayable() || chunks.isEmpty()) return;
                 int v = chunks.get(chunks.size() - 1);
                 progressBar.setValue(v);
                 progressBar.setString("Đang chờ xác nhận (" + (v * 2) + "s / 180s)...");
             }
             @Override protected void done() {
-                if (isCancelled() || pollCancelled.get()) return;
                 try {
-                    get();
+                    if (isCancelled() || !current.getAsBoolean()) return;
+                    ApiClient.OAuthLinkPollDto result = get();
+                    pollDialog.dispose();
+                    if (!current.getAsBoolean() || result == null || "CANCELLED".equalsIgnoreCase(result.status())) return;
+                    if ("SUCCESS".equalsIgnoreCase(result.status())
+                            && result.accountId() != null && result.accountId() > 0
+                            && (accountId == null || Objects.equals(accountId, result.accountId()))) {
+                        loadGmailAccounts();
+                        JOptionPane.showMessageDialog(MainFrame.this, "Liên kết tài khoản Google OAuth2 thành công!",
+                                "Thành công", JOptionPane.INFORMATION_MESSAGE);
+                    } else {
+                        JOptionPane.showMessageDialog(MainFrame.this,
+                                result.message() != null ? result.message() : "Liên kết Google OAuth2 không thành công.",
+                                "Không thể liên kết", JOptionPane.WARNING_MESSAGE);
+                    }
                 } catch (Exception ex) {
-                    if (isCancelled() || pollCancelled.get()) return;
+                    if (isCancelled() || !current.getAsBoolean()) return;
                     pollDialog.dispose();
                     handleCommonError(ex, "Lỗi liên kết Google OAuth2");
+                } finally {
+                    pollDialog.dispose();
                 }
             }
         };
-        cancelButton.addActionListener(e -> {
+        Runnable cancel = () -> {
             pollCancelled.set(true);
             oauthWorker.cancel(true);
+            pollDialog.dispose();
+        };
+        cancelOAuthLink = cancel;
+        cancelButton.addActionListener(e -> {
+            cancel.run();
+            if (!closing) setStatus("Đã dừng chờ liên kết. Nếu đã xác nhận trên trình duyệt, hãy làm mới danh sách để kiểm tra kết quả.");
         });
         pollDialog.addWindowListener(new WindowAdapter() {
-            @Override public void windowClosed(WindowEvent e) {
-                pollCancelled.set(true);
-                oauthWorker.cancel(true);
+            @Override public void windowClosing(WindowEvent e) {
+                cancelButton.doClick();
             }
         });
-        oauthWorker.execute();
-
-        pollDialog.setVisible(true);
-    }
-
-    private boolean hasNewActiveOAuth2(List<GmailAccountDto> list) {
-        for (GmailAccountDto acc : list) {
-            if ("OAUTH2".equalsIgnoreCase(acc.authType()) && "ACTIVE".equalsIgnoreCase(acc.status())) {
-                boolean wasActive = currentGmailAccounts.stream()
-                        .anyMatch(o -> Objects.equals(o.id(), acc.id()) && "ACTIVE".equalsIgnoreCase(o.status()));
-                if (!wasActive) return true;
-            }
+        try {
+            oauthWorker.execute();
+            pollDialog.setVisible(true);
+        } finally {
+            if (!oauthWorker.isDone()) cancel.run();
+            if (cancelOAuthLink == cancel) cancelOAuthLink = null;
         }
-        return false;
     }
 
     private void refreshCurrentMailbox() {
+        loadPublicConfig();
+        loadUserInfo();
         if (selectedAccount == null) {
             loadGmailAccounts();
+        } else if (selectedFolder == null) {
+            if (!foldersLoading) loadFolders();
         } else {
             // Refresh chỉ cần tải lại danh sách thư. Gọi loadFolders() ở đây từng gây
             // thêm một request IMAP đắt đỏ (~8s với Gmail) cho mỗi lần bấm Làm mới.
@@ -2114,29 +2623,44 @@ public class MainFrame extends JFrame {
     private void handleLogout() {
         if (JOptionPane.showConfirmDialog(this, "Bạn có chắc chắn muốn đăng xuất?",
                 "Đăng xuất", JOptionPane.YES_NO_OPTION) == JOptionPane.YES_OPTION) {
-            cancelAllBackgroundTasks();
-            SessionStore.getInstance().clearSession();
-            apiClient.clearAccessToken();
-            new LoginFrame(apiClient).setVisible(true);
-            dispose();
+            returnToLogin();
         }
     }
 
-    private void handleSessionExpired() {
+    private void returnToLogin() {
         cancelAllBackgroundTasks();
-        JOptionPane.showMessageDialog(this, "Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.",
-                "Hết phiên đăng nhập", JOptionPane.WARNING_MESSAGE);
         SessionStore.getInstance().clearSession();
         apiClient.clearAccessToken();
-        new LoginFrame(apiClient).setVisible(true);
+        new LoginFrame(apiClient.newUnauthenticatedClient()).setVisible(true);
+        dispose();
+    }
+
+    private void handleSessionExpired() {
+        if (closing) return;
+        cancelAllBackgroundTasks();
+        SessionStore.getInstance().clearSession();
+        apiClient.clearAccessToken();
+        JOptionPane.showMessageDialog(this, "Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.",
+                "Hết phiên đăng nhập", JOptionPane.WARNING_MESSAGE);
+        new LoginFrame(apiClient.newUnauthenticatedClient()).setVisible(true);
         dispose();
     }
 
     private void handleCommonError(Exception ex, String fallbackTitle) {
+        if (closing) return;
         Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
         if (cause instanceof ApiException apiEx) {
             if (apiEx.getStatusCode() == 401) {
                 handleSessionExpired();
+                return;
+            }
+            if ("MAINTENANCE_MODE".equalsIgnoreCase(apiEx.getCode())) {
+                cancelAllBackgroundTasks();
+                JOptionPane.showMessageDialog(this, apiEx.getMessage(), "Hệ thống đang bảo trì", JOptionPane.WARNING_MESSAGE);
+                SessionStore.getInstance().clearSession();
+                apiClient.clearAccessToken();
+                new LoginFrame(apiClient.newUnauthenticatedClient()).setVisible(true);
+                dispose();
                 return;
             }
             if ("PASSWORD_CHANGE_REQUIRED".equalsIgnoreCase(apiEx.getCode())) {
@@ -2148,23 +2672,37 @@ public class MainFrame extends JFrame {
                 loadGmailAccounts();
                 return;
             }
+            if ("GMAIL_ACCOUNT_CHANGED".equalsIgnoreCase(apiEx.getCode())) {
+                setStatus("Liên kết Gmail đã thay đổi. Đang tải lại thông tin; không tự gửi lại thao tác.");
+                loadGmailAccounts();
+                return;
+            }
         }
         setStatus(fallbackTitle + ": " + extractMsg(ex));
     }
 
     private void showEmptyListState(String title, String sub, String ctaText) {
         listEmptyTitle.setText(title);
-        listEmptySub.setText("<html><div style='text-align:center;width:210px;'>" + sub + "</div></html>");
+        listEmptySub.setText("<html><div style='text-align:center;width:210px;'>" + escapeHtml(sub) + "</div></html>");
         listEmptyActionBtn.setText(ctaText);
+        reauthCta = ctaText.contains("Cấp lại");
+        updateEmptyActionVisibility();
         for (ActionListener al : listEmptyActionBtn.getActionListeners()) {
             listEmptyActionBtn.removeActionListener(al);
         }
         listEmptyActionBtn.addActionListener(e -> {
-            if (ctaText.contains("Cấp lại")) initiateOAuth2Flow();
+            if (ctaText.contains("Cấp lại") && selectedAccount != null) initiateOAuth2Flow(selectedAccount.id());
             else if (ctaText.contains("Liên kết") || ctaText.contains("Quản lý")) openGmailManagerDialog();
             else refreshCurrentMailbox();
         });
         listCardLayout.show(listCardPanel, "EMPTY");
+    }
+
+    private void updateEmptyActionVisibility() {
+        if (listEmptyActionBtn == null) return;
+        PublicConfigDto config = SessionStore.getInstance().getPublicConfig();
+        listEmptyActionBtn.setVisible(!reauthCta || (selectedAccount != null && selectedAccount.hasOAuth()
+                && config != null && config.oauth2LinkEnabled()));
     }
 
     private void updateListItemSeenFlag(long uid, boolean seen) {
@@ -2330,6 +2868,7 @@ public class MainFrame extends JFrame {
         private final JLabel senderLbl = new JLabel();
         private final JLabel dateLbl = new JLabel();
         private final JLabel iconsLbl = new JLabel();
+        private final JLabel starLbl = new JLabel();
         private final JLabel subjectLbl = new JLabel();
         private final JLabel snippetLbl = new JLabel();
         private boolean isUnreadRow;
@@ -2378,6 +2917,9 @@ public class MainFrame extends JFrame {
 
             add(avWrap, BorderLayout.WEST);
             add(center, BorderLayout.CENTER);
+            starLbl.setHorizontalAlignment(SwingConstants.CENTER);
+            starLbl.setPreferredSize(new Dimension(22, 22));
+            add(starLbl, BorderLayout.EAST);
         }
 
         private static String cleanDisplayText(String raw) {
@@ -2410,9 +2952,8 @@ public class MainFrame extends JFrame {
 
             iconsLbl.setIcon(null);
             iconsLbl.setText("");
-            if (starred) {
-                iconsLbl.setIcon(AppIcons.vectorIcon(AppIcons.Glyph.STAR_FILLED, 13, Theme.starGold()));
-            } else if (m.hasAttachment()) {
+            starLbl.setIcon(AppIcons.vectorIcon(starred ? AppIcons.Glyph.STAR_FILLED : AppIcons.Glyph.STAR, 16, Theme.starGold()));
+            if (m.hasAttachment()) {
                 iconsLbl.setIcon(AppIcons.vectorIcon(AppIcons.Glyph.ATTACHMENT, 13, Theme.textSecondary()));
             }
 
@@ -2423,7 +2964,7 @@ public class MainFrame extends JFrame {
 
             String snip = (m.snippet() != null && !m.snippet().isBlank())
                     ? cleanDisplayText(m.snippet())
-                    : (m.hasAttachment() ? "Có tệp đính kèm • " + ComposeDialog.formatBytes(m.size()) : ComposeDialog.formatBytes(m.size()));
+                    : (m.hasAttachment() ? "Có tệp đính kèm • " + MailSizeDisplay.message(m.size()) : MailSizeDisplay.message(m.size()));
             snippetLbl.setText(snip);
             snippetLbl.setFont(Theme.fontTiny());
             snippetLbl.setForeground(Theme.textMuted());

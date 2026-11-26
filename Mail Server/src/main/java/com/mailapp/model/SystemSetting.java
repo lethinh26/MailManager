@@ -14,7 +14,7 @@ public class SystemSetting {
     @Column(name = "setting_key", nullable = false, length = 100)
     private String key;
 
-    @Column(name = "setting_value", nullable = false, length = 255)
+    @Column(name = "setting_value", nullable = false, columnDefinition = "TEXT")
     private String value;
 
     @Column(length = 255)

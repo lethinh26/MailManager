@@ -1,11 +1,14 @@
 package com.mailapp.client;
 
 import com.mailapp.client.model.GmailAccountDto;
+import com.mailapp.client.model.PublicConfigDto;
 import com.mailapp.client.model.MailClientDtos.*;
+import com.mailapp.client.net.ApiException;
 import com.mailapp.client.ui.frames.MailboxViewModel;
-import com.mailapp.client.ui.frames.MailboxViewModel.OAuthPollStatus;
+import com.mailapp.client.net.ApiClient.OAuthLinkPollDto;
 import com.mailapp.client.ui.frames.MailboxViewModel.PageMergeResult;
 import com.mailapp.client.ui.frames.MailboxViewModel.WorkerCoordinator;
+import com.mailapp.client.util.FeatureAdmission;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -38,6 +41,70 @@ class MailboxRegressionTest {
                 false,
                 0
         );
+    }
+
+    @Test
+    void destructiveActionsRequireCurrentPositiveUidValidity() {
+        assertTrue(MailboxViewModel.validMutationSelection(List.of(sampleMail(1, 77, "current")), 77));
+        assertFalse(MailboxViewModel.validMutationSelection(List.of(sampleMail(1, 76, "stale")), 77));
+        assertFalse(MailboxViewModel.validMutationSelection(List.of(sampleMail(1, 0, "unknown")), 0));
+        assertFalse(MailboxViewModel.validMutationSelection(List.of(), 77));
+        assertFalse(MailboxViewModel.validMutationSelection(List.of(sampleMail(0, 77, "invalid")), 77));
+    }
+
+    @Test
+    void detailActionsNeverTurnIntoBatchOrRetargetAnotherUid() {
+        var first = sampleMail(1, 77, "first");
+        var second = sampleMail(2, 77, "second");
+        var detail = new MailDetailResponse(2, 77, second.from(), second.to(),
+                List.of(), List.of(), List.of(), second.date(), null, null, null,
+                second.subject(), "", null, false, false, List.of(), second.flags());
+        assertEquals(List.of(second),
+                MailboxViewModel.detailMutationTarget(detail, List.of(first, second), 77));
+        assertTrue(MailboxViewModel.detailMutationTarget(detail, List.of(first), 77).isEmpty());
+        assertTrue(MailboxViewModel.detailMutationTarget(detail, List.of(second), 78).isEmpty());
+        assertTrue(MailboxViewModel.detailMutationTarget(null, List.of(second), 77).isEmpty());
+    }
+
+    @Test
+    void deleteBatchStopsAfterSelectionChangesAndPreservesAcknowledgedCount() {
+        AtomicBoolean current = new AtomicBoolean(true);
+        AtomicInteger calls = new AtomicInteger();
+        var result = MailboxViewModel.deleteConfirmedBatch(
+                List.of(sampleMail(1, 77, "first"), sampleMail(2, 77, "second")),
+                current::get, item -> {
+                    calls.incrementAndGet();
+                    current.set(false);
+                });
+        assertEquals(1, calls.get());
+        assertEquals(1, result.acknowledged());
+        assertEquals(2, result.requested());
+        assertTrue(result.stopped());
+        assertNull(result.failure());
+    }
+
+    @Test
+    void deleteBatchDoesNotRepeatAnUncertainMutation() {
+        AtomicInteger calls = new AtomicInteger();
+        java.io.IOException lostResponse = new java.io.IOException("response lost");
+        var result = MailboxViewModel.deleteConfirmedBatch(
+                List.of(sampleMail(1, 77, "first"), sampleMail(2, 77, "second"),
+                        sampleMail(3, 77, "third")), () -> true, item -> {
+                    if (calls.incrementAndGet() == 2) throw lostResponse;
+                });
+        assertEquals(2, calls.get());
+        assertEquals(1, result.acknowledged());
+        assertSame(lostResponse, result.failure());
+    }
+
+    @Test
+    void autoCleanupAgeFilterFailsClosedOnMissingOrInvalidDate() {
+        Instant cutoff = Instant.parse("2026-11-22T00:00:00Z");
+        assertTrue(MailboxViewModel.passesCleanupAge("2026-11-21T00:00:00Z", cutoff));
+        assertFalse(MailboxViewModel.passesCleanupAge("2026-11-23T00:00:00Z", cutoff));
+        assertFalse(MailboxViewModel.passesCleanupAge(null, cutoff));
+        assertFalse(MailboxViewModel.passesCleanupAge("invalid", cutoff));
+        assertTrue(MailboxViewModel.passesCleanupAge(null, null));
     }
 
     @Test
@@ -166,23 +233,81 @@ class MailboxRegressionTest {
     }
 
     @Test
+    void oauthPreflightRejectsInvalidatedClickAndUnavailableConfig() throws Exception {
+        FeatureAdmission admission = new FeatureAdmission(true);
+        PublicConfigDto enabled = new PublicConfigDto(true, true, true, false, true, 5, 25);
+        PublicConfigDto disabled = new PublicConfigDto(true, false, true, false, true, 5, 25);
+        FeatureAdmission.Ticket initial = admission.capture();
+        AtomicInteger reads = new AtomicInteger();
+        ApiException stale = assertThrows(ApiException.class, () ->
+                MailboxViewModel.preflightOAuthLink(admission, initial, () -> true, () -> {
+                    reads.incrementAndGet();
+                    admission.update(false);
+                    admission.update(true);
+                    return enabled;
+                }));
+        assertEquals("FORM_INVALIDATED", stale.getCode());
+        assertEquals(1, reads.get());
+        FeatureAdmission.Ticket fresh = admission.capture();
+        assertEquals("CONFIG_UNAVAILABLE", assertThrows(ApiException.class, () ->
+                MailboxViewModel.preflightOAuthLink(admission, fresh, () -> true, () -> null)).getCode());
+        assertEquals("FEATURE_DISABLED", assertThrows(ApiException.class, () ->
+                MailboxViewModel.preflightOAuthLink(admission, fresh, () -> true, () -> disabled)).getCode());
+        assertThrows(InterruptedException.class, () ->
+                MailboxViewModel.preflightOAuthLink(admission, fresh, () -> false, () -> {
+                    fail("Stale session must not fetch config");
+                    return enabled;
+                }));
+        AtomicBoolean current = new AtomicBoolean(true);
+        assertThrows(InterruptedException.class, () ->
+                MailboxViewModel.preflightOAuthLink(admission, fresh, current::get, () -> {
+                    current.set(false);
+                    return enabled;
+                }));
+        MailboxViewModel.preflightOAuthLink(admission, fresh, () -> true, () -> enabled);
+    }
+
+    @Test
+    void oauthPollStopsBeforeDispatchAndDiscardsLateSuccessAfterSessionChange() throws Exception {
+        AtomicBoolean current = new AtomicBoolean(false);
+        AtomicBoolean cancelled = new AtomicBoolean(false);
+        AtomicInteger calls = new AtomicInteger();
+        MailboxViewModel.LinkResultFetcher fetch = () -> {
+            calls.incrementAndGet();
+            current.set(false);
+            return new OAuthLinkPollDto("SUCCESS", null, null, 17L);
+        };
+        assertEquals("CANCELLED", MailboxViewModel.pollForOAuthLink(
+                fetch, 3, 0, cancelled, current::get, null).status());
+        assertEquals(0, calls.get());
+        current.set(true);
+        assertEquals("CANCELLED", MailboxViewModel.pollForOAuthLink(
+                fetch, 3, 0, cancelled, current::get, i -> current.set(false)).status());
+        assertEquals(0, calls.get());
+        current.set(true);
+        OAuthLinkPollDto late = MailboxViewModel.pollForOAuthLink(
+                fetch, 3, 0, cancelled, current::get, null);
+        assertEquals("CANCELLED", late.status());
+        assertNull(late.accountId());
+        assertEquals(1, calls.get());
+    }
+
+    @Test
     @DisplayName("(c) Hồi quy OAuth2 poll: Hủy tức thì trong lúc đang sleep (< 300ms, không gọi thêm API)")
     void testOAuth2PollCancelsImmediately() throws Exception {
         AtomicBoolean cancelled = new AtomicBoolean(false);
         AtomicInteger apiCalls = new AtomicInteger(0);
         CountDownLatch pollStarted = new CountDownLatch(1);
-        AtomicReference<OAuthPollStatus> statusRef = new AtomicReference<>();
+        AtomicReference<OAuthLinkPollDto> statusRef = new AtomicReference<>();
 
         Thread pollThread = new Thread(() -> {
             pollStarted.countDown();
             try {
-                OAuthPollStatus st = MailboxViewModel.pollForOAuthAccount(
+                OAuthLinkPollDto st = MailboxViewModel.pollForOAuthLink(
                         () -> {
                             apiCalls.incrementAndGet();
-                            return List.<GmailAccountDto>of();
+                            return new OAuthLinkPollDto("PENDING", null, null, null);
                         },
-                        0,
-                        Set.of(),
                         90,
                         5000L, // sleep 5 giây mỗi vòng — nếu không hủy tức thì sẽ kẹt 5 giây!
                         cancelled,
@@ -206,7 +331,7 @@ class MailboxRegressionTest {
         long elapsedMs = System.currentTimeMillis() - startMs;
 
         assertFalse(pollThread.isAlive(), "Luồng OAuth2 poll phải dừng ngay khi hủy!");
-        assertEquals(OAuthPollStatus.CANCELLED, statusRef.get());
+        assertEquals("CANCELLED", statusRef.get().status());
         assertEquals(0, apiCalls.get(), "Hủy trong lúc chờ không được gọi thêm API nào!");
         assertTrue(elapsedMs < 800, "Phải hủy tức thì dưới 800ms (thực tế: " + elapsedMs + "ms)");
     }

@@ -42,7 +42,7 @@ public class JtiDenylistService {
             return;
         }
         denylistCache.put(jti, Boolean.TRUE);
-        log.info("Đã đưa JTI [{}] vào danh sách thu hồi token", jti);
+        log.info("Đã đưa token vào danh sách thu hồi");
     }
 
     /**

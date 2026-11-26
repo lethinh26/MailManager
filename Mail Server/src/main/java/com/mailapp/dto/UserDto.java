@@ -2,6 +2,7 @@ package com.mailapp.dto;
 
 import com.mailapp.model.Role;
 import com.mailapp.model.User;
+import java.time.LocalDateTime;
 
 /**
  * DTO thông tin người dùng trả về sau khi đăng nhập, đăng ký hoặc gọi EP-A3 /api/auth/me.
@@ -13,8 +14,13 @@ public record UserDto(
     String fullName,
     String email,
     Role role,
-    boolean mustChangePassword
+    boolean mustChangePassword,
+    LocalDateTime createdAt
 ) {
+    public UserDto(Long id, String username, String fullName, String email,
+                   Role role, boolean mustChangePassword) {
+        this(id, username, fullName, email, role, mustChangePassword, null);
+    }
     public static UserDto from(User user) {
         if (user == null) {
             return null;
@@ -25,7 +31,8 @@ public record UserDto(
             user.getFullName(),
             user.getEmail(),
             user.getRole(),
-            user.isMustChangePassword()
+            user.isMustChangePassword(),
+            user.getCreatedAt()
         );
     }
 }

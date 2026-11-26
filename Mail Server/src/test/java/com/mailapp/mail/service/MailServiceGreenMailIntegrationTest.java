@@ -17,6 +17,7 @@ import com.mailapp.service.SystemSettingService;
 import jakarta.activation.DataHandler;
 import jakarta.mail.Message;
 import jakarta.mail.Session;
+import jakarta.mail.Part;
 import jakarta.mail.internet.*;
 import jakarta.mail.util.ByteArrayDataSource;
 import org.junit.jupiter.api.BeforeEach;
@@ -65,10 +66,12 @@ class MailServiceGreenMailIntegrationTest {
         aesCipher = new AesCipher("dCPN0qIeMrPFVyn/9c05Pq1O65Re+wsVplG7fEFU4dU=");
         MailConnectionProperties props = new MailConnectionProperties();
         props.setImapHost("127.0.0.1");
+        props.setLocalTestTransport(true);
         props.setImapPort(greenMail.getImaps().getPort());
         props.setSmtpHost("127.0.0.1");
         props.setSmtpPort(greenMail.getSmtp().getPort());
         props.setRetryEnabled(false);
+        props.setPoolEnabled(false);
 
         DefaultMailConnectionFactory factory = new DefaultMailConnectionFactory(
                 props, aesCipher, mock(AccessTokenProvider.class), null);
@@ -80,6 +83,7 @@ class MailServiceGreenMailIntegrationTest {
         when(systemSettingService.isMaintenanceMode()).thenReturn(false);
         when(systemSettingService.isSendMailEnabled()).thenReturn(true);
         when(systemSettingService.getMaxAttachmentSizeMb()).thenReturn(25);
+        when(systemSettingService.getMailPageSize()).thenReturn(20);
 
         userAlice = new User(1L, "alice", "alice@mailapp.local", Role.USER);
         userBob = new User(2L, "bob", "bob@mailapp.local", Role.USER);
@@ -93,7 +97,7 @@ class MailServiceGreenMailIntegrationTest {
         aliceGmail.setAppPasswordEncrypted(aesCipher.encrypt("alicePass123"));
         aliceGmail.setStatus(AccountStatus.ACTIVE);
 
-        when(gmailAccountRepository.findById(10L)).thenReturn(Optional.of(aliceGmail));
+        when(gmailAccountRepository.findByIdAndUserId(10L, 1L)).thenReturn(Optional.of(aliceGmail));
 
         mailService = new MailServiceImpl(
                 gmailAccountRepository,
@@ -102,8 +106,46 @@ class MailServiceGreenMailIntegrationTest {
                 systemSettingService,
                 auditLogService,
                 new HtmlSanitizerService(),
-                new MailHeaderAndRateGuard(30, 15)
+                new MailHeaderAndRateGuard(30, 15),
+                true // isolated GreenMail does not implement UIDPLUS
         );
+    }
+
+    @Test
+    void previewDoesNotMarkUnreadMailSeenButDefaultDetailDoes() throws Exception {
+        MimeMessage message = new MimeMessage(Session.getInstance(new Properties()));
+        message.setFrom(new InternetAddress("sender@test.local"));
+        message.setRecipient(Message.RecipientType.TO, new InternetAddress("alice@test.local"));
+        message.setSubject("Preview unread");
+        message.setText("Preview body", "UTF-8");
+        message.saveChanges();
+        greenMail.getUserManager().getUser("alice@test.local").deliver(message);
+
+        MailListResponse unread = mailService.listMails(userAlice, 10L, "INBOX", 0, 20,
+                null, true, null, null, null);
+        assertEquals(1, unread.total());
+        long uid = unread.items().getFirst().uid();
+        long validity = unread.uidValidity();
+
+        MailDetailResponse preview = mailService.getMailDetail(
+                userAlice, 10L, "INBOX", uid, false, validity, false);
+        assertEquals("Preview body", preview.textBody().trim());
+        assertFalse(preview.flags().seen());
+        AppException stale = assertThrows(AppException.class, () -> mailService.getMailDetail(
+                userAlice, 10L, "INBOX", uid, false, validity + 1, false));
+        assertEquals("UID_VALIDITY_CHANGED", stale.getCode());
+        MailListResponse stillUnread = mailService.listMails(userAlice, 10L, "INBOX", 0, 20,
+                null, true, null, null, null);
+        assertEquals(1, stillUnread.total());
+        assertFalse(stillUnread.items().getFirst().flags().seen());
+
+        MailDetailResponse read = mailService.getMailDetail(
+                userAlice, 10L, "INBOX", uid, false, validity);
+        assertTrue(read.flags().seen());
+        assertEquals(0, mailService.listMails(userAlice, 10L, "INBOX", 0, 20,
+                null, true, null, null, null).total());
+        assertTrue(mailService.getMailDetail(
+                userAlice, 10L, "INBOX", uid, false, validity, false).flags().seen());
     }
 
     @Test
@@ -233,7 +275,8 @@ class MailServiceGreenMailIntegrationTest {
             assertEquals("SENT", sent.status());
             assertNotNull(sent.messageId());
         }
-        verify(auditLogService, times(3)).log(eq(1L), eq("SEND_MAIL"), contains("a***@test.local"), eq("127.0.0.1"));
+        verify(auditLogService, times(3)).prepareMailMutation(eq(1L), eq("SEND_MAIL"), contains("a***@test.local"), eq("127.0.0.1"));
+        verify(auditLogService, times(3)).finishMailMutation(isNull(), eq(true), isNull());
 
         // Phân trang (size=2, mới nhất trước)
         MailListResponse page0 = mailService.listMails(userAlice, 10L, "INBOX", 0, 2, null, null, null, null, null);
@@ -253,9 +296,11 @@ class MailServiceGreenMailIntegrationTest {
 
         // Cập nhật cờ (M17: seen=true, flagged=true)
         MailFlagsDto updatedFlags = mailService.updateFlags(userAlice, 10L, "INBOX", targetUid,
-                new UpdateFlagsRequest(true, true), page0.uidValidity());
+                new UpdateFlagsRequest(true, true), page0.uidValidity(), "127.0.0.1");
         assertTrue(updatedFlags.seen());
         assertTrue(updatedFlags.flagged());
+        verify(auditLogService).prepareMailMutation(eq(1L), eq("MAIL_FLAG_CHANGE"), contains("uid=" + targetUid), eq("127.0.0.1"));
+        verify(auditLogService).finishMailMutation(isNull(), eq(true), contains("starred=true, seen=true"));
 
         // Chặn xóa vĩnh viễn khi thư đang ở INBOX
         AppException permEx = assertThrows(AppException.class, () ->
@@ -279,7 +324,247 @@ class MailServiceGreenMailIntegrationTest {
 
         MailListResponse trashAfter = mailService.listMails(userAlice, 10L, "TRASH", 0, 10, null, null, null, null, null);
         assertEquals(0, trashAfter.items().size());
-        verify(auditLogService, times(2)).log(eq(1L), eq("DELETE_MAIL"), anyString(), eq("127.0.0.1"));
+        verify(auditLogService, times(2)).prepareMailMutation(eq(1L), eq("MAIL_DELETE"), anyString(), eq("127.0.0.1"));
+        verify(auditLogService, times(5)).finishMailMutation(isNull(), eq(true), isNull());
+    }
+
+    @Test
+    void attachmentFilteringAndDownloadUseIdenticalRecursiveMimeOrder() throws Exception {
+        Session session = greenMail.getSmtp().createSession();
+        MimeMessage outer = new MimeMessage(session);
+        outer.setFrom(new InternetAddress("sender@test.local"));
+        outer.setRecipient(Message.RecipientType.TO, new InternetAddress("alice@test.local"));
+        outer.setSubject("UTF-8 nested attachments", "UTF-8");
+
+        MimeMessage embedded = new MimeMessage(session);
+        embedded.setSubject("Nested");
+        MimeMultipart embeddedParts = new MimeMultipart("mixed");
+        MimeBodyPart embeddedText = new MimeBodyPart();
+        embeddedText.setText("Nested plain text", "UTF-8");
+        embeddedParts.addBodyPart(embeddedText);
+        byte[] pdf = "%PDF-1.4\nfixture\n%%EOF".getBytes(StandardCharsets.UTF_8);
+        embeddedParts.addBodyPart(attachment("nested.pdf", "application/pdf", pdf));
+        byte[] secondPdf = "%PDF-1.4\nsecond fixture\n%%EOF".getBytes(StandardCharsets.UTF_8);
+        embeddedParts.addBodyPart(attachment("nested.pdf", "application/pdf", secondPdf));
+        embedded.setContent(embeddedParts);
+        embedded.saveChanges();
+
+        MimeMultipart outerParts = new MimeMultipart("mixed");
+        MimeBodyPart forwarded = new MimeBodyPart();
+        forwarded.setContent(embedded, "message/rfc822");
+        outerParts.addBodyPart(forwarded);
+        byte[] text = "Xin chào".getBytes(StandardCharsets.UTF_8);
+        outerParts.addBodyPart(attachment("notes.txt", "text/plain", text));
+        outer.setContent(outerParts);
+        outer.saveChanges();
+        greenMail.getUserManager().getUser("alice@test.local").deliver(outer);
+
+        // multipart/mixed alone does not mean the message has an attachment.
+        MimeMessage noAttachments = new MimeMessage(session);
+        noAttachments.setFrom(new InternetAddress("sender@test.local"));
+        noAttachments.setRecipient(Message.RecipientType.TO, new InternetAddress("alice@test.local"));
+        noAttachments.setSubject("No attachments");
+        MimeMultipart plainParts = new MimeMultipart("mixed");
+        MimeBodyPart plain = new MimeBodyPart();
+        plain.setText("Plain content", "UTF-8");
+        plainParts.addBodyPart(plain);
+        noAttachments.setContent(plainParts);
+        noAttachments.saveChanges();
+        greenMail.getUserManager().getUser("alice@test.local").deliver(noAttachments);
+
+        MailListResponse yes = mailService.listMails(userAlice, 10L, "INBOX", 0, 0,
+                null, null, true, null, null);
+        assertEquals(20, yes.size());
+        assertEquals(1, yes.total());
+        assertEquals(3, yes.items().getFirst().attachmentCount());
+        MailListResponse no = mailService.listMails(userAlice, 10L, "INBOX", 0, 20,
+                null, null, false, null, null);
+        assertEquals(1, no.total());
+        assertEquals("No attachments", no.items().getFirst().subject());
+
+        long uid = yes.items().getFirst().uid();
+        MailDetailResponse detail = mailService.getMailDetail(userAlice, 10L, "INBOX", uid, false, yes.uidValidity());
+        assertEquals(List.of("nested.pdf", "nested.pdf", "notes.txt"), detail.attachments().stream().map(MailAttachmentDto::filename).toList());
+        assertEquals(List.of(0, 1, 2), detail.attachments().stream().map(MailAttachmentDto::index).toList());
+        assertTrue(detail.attachments().stream().allMatch(a -> a.size() == a.sizeBytes()
+                && !"EXACT".equals(a.sizeAccuracy().name())));
+        for (int i = 0; i < 3; i++) {
+            MailService.AttachmentDownloadHandle handle = mailService.prepareAttachmentDownload(
+                    userAlice, 10L, "INBOX", uid, i, yes.uidValidity());
+            ByteArrayOutputStream downloaded = new ByteArrayOutputStream();
+            handle.streamer().streamTo(downloaded);
+            assertArrayEquals(i == 0 ? pdf : i == 1 ? secondPdf : text, downloaded.toByteArray());
+            assertEquals(downloaded.size(), handle.estimatedSize());
+        }
+    }
+
+    @Test
+    void rejectsOversizedSubjectAndBodyBeforeSending() {
+        SendMailRequest subjectTooLong = new SendMailRequest(10L, List.of("alice@test.local"),
+                null, null, "x".repeat(201), "body", null, null, null);
+        SendMailRequest bodyTooLong = new SendMailRequest(10L, List.of("alice@test.local"),
+                null, null, "subject", "é".repeat(524_289), null, null, null);
+        for (SendMailRequest request : List.of(subjectTooLong, bodyTooLong)) {
+            AppException failure = assertThrows(AppException.class,
+                    () -> mailService.sendMail(userAlice, request, List.of(), "127.0.0.1"));
+            assertEquals(HttpStatus.BAD_REQUEST, failure.getStatus());
+            assertEquals("VALIDATION_ERROR", failure.getCode());
+        }
+        verifyNoInteractions(auditLogService);
+        assertEquals(0, greenMail.getReceivedMessages().length);
+    }
+
+    @Test
+    void attachmentLimitIsCheckedAgainstDecodedBytesBeforeResponse() throws Exception {
+        when(systemSettingService.getMaxAttachmentSizeMb()).thenReturn(1);
+        Session session = greenMail.getSmtp().createSession();
+        MimeMessage message = new MimeMessage(session);
+        message.setFrom(new InternetAddress("sender@test.local"));
+        message.setRecipient(Message.RecipientType.TO, new InternetAddress("alice@test.local"));
+        message.setSubject("attachment limit");
+        MimeMultipart parts = new MimeMultipart("mixed");
+        MimeBodyPart text = new MimeBodyPart();
+        text.setText("body");
+        parts.addBodyPart(text);
+        parts.addBodyPart(attachment("too-large.bin", "application/octet-stream", new byte[1024 * 1024 + 1]));
+        message.setContent(parts);
+        message.saveChanges();
+        greenMail.getUserManager().getUser("alice@test.local").deliver(message);
+        MailListResponse list = mailService.listMails(userAlice, 10L, "INBOX", 0, 10, null, null, null, null, null);
+        long uid = list.items().getFirst().uid();
+        AppException failure = assertThrows(AppException.class, () -> mailService.prepareAttachmentDownload(
+                userAlice, 10L, "INBOX", uid, 0, list.uidValidity()));
+        assertEquals(HttpStatus.PAYLOAD_TOO_LARGE, failure.getStatus());
+        assertEquals("PAYLOAD_TOO_LARGE", failure.getCode());
+    }
+
+    private static MimeBodyPart attachment(String filename, String type, byte[] bytes) throws Exception {
+        MimeBodyPart part = new MimeBodyPart();
+        part.setDataHandler(new DataHandler(new ByteArrayDataSource(bytes, type)));
+        part.setFileName(filename);
+        part.setDisposition(Part.ATTACHMENT);
+        // Explicit MIME base64 keeps every attachment byte, including a PDF's
+        // terminal LF, distinct from the multipart boundary's framing CRLF.
+        part.setHeader("Content-Transfer-Encoding", "base64");
+        return part;
+    }
+
+    @Test
+    void fiveIndependentIncomingMimeFixturesCoverOriginalAcceptanceCases() throws Exception {
+        Session session = greenMail.getSmtp().createSession();
+        byte[] pdf = validSmallPdf();
+        ByteArrayOutputStream pngOutput = new ByteArrayOutputStream();
+        assertTrue(javax.imageio.ImageIO.write(new java.awt.image.BufferedImage(1, 1,
+                java.awt.image.BufferedImage.TYPE_INT_RGB), "png", pngOutput));
+        byte[] png = pngOutput.toByteArray();
+        byte[] text = "fixture attachment".getBytes(StandardCharsets.UTF_8);
+        List<String> subjects = List.of("fixture plain", "fixture HTML only", "fixture PDF", "fixture multiple", "fixture tiếng Việt");
+        for (int i = 0; i < subjects.size(); i++) {
+            MimeMessage message = new MimeMessage(session);
+            message.setFrom(new InternetAddress("fixture@test.local", "Người gửi", "UTF-8"));
+            message.setRecipient(Message.RecipientType.TO, new InternetAddress("alice@test.local"));
+            message.setSubject(subjects.get(i), "UTF-8");
+            if (i == 1) {
+                // True incoming HTML-only MIME, not our outgoing text alternative.
+                message.setContent("<p>fixture HTML</p>", "text/html; charset=UTF-8");
+            } else if (i == 2 || i == 3) {
+                MimeMultipart mixed = new MimeMultipart("mixed");
+                MimeBodyPart body = new MimeBodyPart();
+                body.setText("fixture body", "UTF-8");
+                mixed.addBodyPart(body);
+                if (i == 2) mixed.addBodyPart(attachment("report.pdf", "application/pdf", pdf));
+                else {
+                    mixed.addBodyPart(attachment("image.png", "image/png", png));
+                    mixed.addBodyPart(attachment("notes.txt", "text/plain", text));
+                }
+                message.setContent(mixed);
+            } else {
+                message.setText(i == 4 ? "Tiếng Việt có dấu" : "fixture plain body", "UTF-8");
+            }
+            message.saveChanges();
+            greenMail.getUserManager().getUser("alice@test.local").deliver(message);
+        }
+        MailListResponse all = mailService.listMails(userAlice, 10L, "INBOX", 0, 20, null, null, null, null, null);
+        assertEquals(5, all.total());
+        for (MailSummaryDto summary : all.items()) {
+            int fixture = subjects.indexOf(summary.subject());
+            assertTrue(fixture >= 0);
+            MailDetailResponse detail = mailService.getMailDetail(userAlice, 10L, "INBOX", summary.uid(),
+                    false, all.uidValidity(), false);
+            assertEquals(summary.subject(), detail.subject());
+            assertEquals(fixture == 2 ? 1 : fixture == 3 ? 2 : 0, summary.attachmentCount());
+            assertEquals(summary.attachmentCount(), detail.attachments().size());
+            if (fixture == 0) assertEquals("fixture plain body", detail.textBody().trim());
+            if (fixture == 1) assertTrue(detail.htmlBody().contains("fixture HTML"));
+            if (fixture == 4) assertEquals("Tiếng Việt có dấu", detail.textBody().trim());
+            for (MailAttachmentDto metadata : detail.attachments()) {
+                byte[] expected = fixture == 2 ? pdf : metadata.index() == 0 ? png : text;
+                ByteArrayOutputStream downloaded = new ByteArrayOutputStream();
+                try (var handle = mailService.prepareAttachmentDownload(userAlice, 10L, "INBOX", summary.uid(),
+                        metadata.index(), all.uidValidity())) {
+                    handle.streamer().streamTo(downloaded);
+                }
+                assertArrayEquals(expected, downloaded.toByteArray());
+            }
+        }
+    }
+
+    // Minimal valid one-page PDF with correctly computed xref offsets; this is
+    // a real file fixture rather than arbitrary bytes beginning with %PDF.
+    private static byte[] validSmallPdf() {
+        String[] objects = {
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 72] /Resources << >> /Contents 4 0 R >>",
+                "<< /Length 4 >>\nstream\nq\nQ\nendstream"
+        };
+        StringBuilder pdf = new StringBuilder("%PDF-1.4\n");
+        int[] offsets = new int[objects.length];
+        for (int i = 0; i < objects.length; i++) {
+            offsets[i] = pdf.length();
+            pdf.append(i + 1).append(" 0 obj\n").append(objects[i]).append("\nendobj\n");
+        }
+        int xref = pdf.length();
+        pdf.append("xref\n0 5\n0000000000 65535 f \n");
+        for (int offset : offsets) pdf.append(String.format(java.util.Locale.ROOT, "%010d 00000 n \n", offset));
+        pdf.append("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n").append(xref).append("\n%%EOF\n");
+        return pdf.toString().getBytes(StandardCharsets.US_ASCII);
+    }
+
+    @Test
+    void outgoingAttachmentsPreserveExactBytesAcrossSmtpAndImap() throws Exception {
+        byte[] pdf = validSmallPdf();
+        byte[] text = "Tiếng Việt\nsecond line\r\nlast line\n".getBytes(StandardCharsets.UTF_8);
+        ByteArrayOutputStream image = new ByteArrayOutputStream();
+        assertTrue(javax.imageio.ImageIO.write(new java.awt.image.BufferedImage(1, 1,
+                java.awt.image.BufferedImage.TYPE_INT_RGB), "png", image));
+        byte[] png = image.toByteArray();
+        List<byte[]> expected = List.of(pdf, png, text, new byte[0]);
+        List<MultipartFile> files = List.of(
+                new MockMultipartFile("attachments", "report.pdf", "application/pdf", pdf),
+                new MockMultipartFile("attachments", "image.png", "image/png", png),
+                new MockMultipartFile("attachments", "notes.txt", "text/plain", text),
+                new MockMultipartFile("attachments", "empty.txt", "text/plain", new byte[0]));
+        SendMailRequest request = new SendMailRequest(10L, List.of("alice@test.local"),
+                null, null, "Byte preservation", "Nội dung tiếng Việt", "<p>Tiếng Việt</p>", null, null);
+        assertEquals("SENT", mailService.sendMail(userAlice, request, files, "127.0.0.1").status());
+        MailListResponse list = mailService.listMails(userAlice, 10L, "INBOX", 0, 10,
+                "Byte preservation", null, null, null, null);
+        assertEquals(1, list.total());
+        long uid = list.items().getFirst().uid();
+        MailDetailResponse detail = mailService.getMailDetail(userAlice, 10L, "INBOX", uid,
+                false, list.uidValidity(), false);
+        assertEquals(4, detail.attachments().size());
+        assertEquals("Nội dung tiếng Việt", detail.textBody().trim());
+        for (int index = 0; index < expected.size(); index++) {
+            ByteArrayOutputStream downloaded = new ByteArrayOutputStream();
+            try (var handle = mailService.prepareAttachmentDownload(userAlice, 10L, "INBOX", uid,
+                    index, list.uidValidity())) {
+                handle.streamer().streamTo(downloaded);
+                assertEquals(expected.get(index).length, handle.estimatedSize());
+            }
+            assertArrayEquals(expected.get(index), downloaded.toByteArray(), "Attachment index " + index);
+        }
     }
 
     @Test
@@ -288,14 +573,19 @@ class MailServiceGreenMailIntegrationTest {
         // 1. Chống IDOR: Bob không được đọc Gmail của Alice
         AppException idorEx = assertThrows(AppException.class, () ->
                 mailService.listFolders(userBob, 10L));
-        assertEquals(HttpStatus.FORBIDDEN, idorEx.getStatus());
-        assertEquals("FORBIDDEN", idorEx.getCode());
+        assertEquals(HttpStatus.NOT_FOUND, idorEx.getStatus());
+        assertEquals("GMAIL_NOT_OWNED", idorEx.getCode());
+        AppException missingEx = assertThrows(AppException.class, () ->
+                mailService.listFolders(userBob, 999L));
+        assertEquals(idorEx.getStatus(), missingEx.getStatus());
+        assertEquals(idorEx.getCode(), missingEx.getCode());
+        assertEquals(idorEx.getMessage(), missingEx.getMessage());
 
-        // 2. NEEDS_REAUTH -> 409 GMAIL_NEEDS_REAUTH
+        // 2. NEEDS_REAUTH -> 422 GMAIL_NEEDS_REAUTH
         aliceGmail.setStatus(AccountStatus.NEEDS_REAUTH);
         AppException reauthEx = assertThrows(AppException.class, () ->
                 mailService.listFolders(userAlice, 10L));
-        assertEquals(HttpStatus.CONFLICT, reauthEx.getStatus());
+        assertEquals(HttpStatus.UNPROCESSABLE_ENTITY, reauthEx.getStatus());
         assertEquals("GMAIL_NEEDS_REAUTH", reauthEx.getCode());
         aliceGmail.setStatus(AccountStatus.ACTIVE);
 
@@ -334,8 +624,10 @@ class MailServiceGreenMailIntegrationTest {
         // Tạo cấu trúc thư mục giống Gmail thật trên GreenMail
         MailConnectionProperties props = new MailConnectionProperties();
         props.setImapHost("127.0.0.1");
+        props.setLocalTestTransport(true);
         props.setImapPort(greenMail.getImaps().getPort());
         props.setRetryEnabled(false);
+        props.setPoolEnabled(false);
         DefaultMailConnectionFactory factory = new DefaultMailConnectionFactory(
                 props, aesCipher, mock(AccessTokenProvider.class), null);
 

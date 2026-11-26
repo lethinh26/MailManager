@@ -11,6 +11,7 @@ public record PublicConfigResponse(
     boolean maintenanceMode,
     boolean sendMailEnabled,
     int maxGmailPerUser,
-    int maxAttachmentSizeMb
+    int maxAttachmentSizeMb,
+    int mailPageSize
 ) {}
 

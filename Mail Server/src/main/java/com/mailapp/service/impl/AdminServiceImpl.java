@@ -54,9 +54,9 @@ public class AdminServiceImpl implements AdminService {
             new SettingSpec("ALLOW_APP_PASSWORD_LINK", "BOOLEAN", "true", null, null, "Cho phép liên kết Gmail bằng App Password"),
             new SettingSpec("ALLOW_SEND_MAIL", "BOOLEAN", "true", null, null, "Cho phép gửi thư qua SMTP"),
             new SettingSpec("MAINTENANCE_MODE", "BOOLEAN", "false", null, null, "Chế độ bảo trì hệ thống (chỉ Admin đăng nhập được)"),
-            new SettingSpec("MAX_GMAIL_PER_USER", "INTEGER", "5", 0, 50, "Số tài khoản Gmail tối đa mỗi người dùng (0 = không giới hạn)"),
+            new SettingSpec("MAX_GMAIL_PER_USER", "INTEGER", "5", 0, 50, "Số tài khoản Gmail tối đa mỗi người dùng (giá trị cũ 0 = không giới hạn; giá trị mới phải dương)"),
             new SettingSpec("MAX_ATTACHMENT_SIZE_MB", "INTEGER", "25", 1, 50, "Kích thước tệp đính kèm tối đa (MB)"),
-            new SettingSpec("MAIL_PAGE_SIZE", "INTEGER", "30", 10, 100, "Số thư mặc định trên mỗi trang"),
+            new SettingSpec("MAIL_PAGE_SIZE", "INTEGER", "20", 10, 100, "Số thư mặc định trên mỗi trang"),
             new SettingSpec("LOGIN_MAX_FAILED_ATTEMPTS", "INTEGER", "5", 3, 20, "Số lần đăng nhập sai tối đa trước khi chặn tạm thời")
     );
 
@@ -99,10 +99,15 @@ public class AdminServiceImpl implements AdminService {
     @Override
     @Transactional
     public AdminCreateUserResponse createUser(User adminActor, AdminCreateUserRequest request, String ipAddress) {
+        adminActor = requireCurrentAdmin(adminActor, userRepository.lockActiveAdminIds());
         String username = request.username().trim();
         if (userRepository.existsByUsername(username)) {
             throw new AppException(HttpStatus.CONFLICT, "USERNAME_TAKEN",
                     "Tên đăng nhập '" + username + "' đã tồn tại.");
+        }
+        String email = request.email().trim().toLowerCase(Locale.ROOT);
+        if (userRepository.existsByEmailIgnoreCase(email)) {
+            throw new AppException(HttpStatus.CONFLICT, "EMAIL_TAKEN", "Email đã tồn tại trên hệ thống.");
         }
 
         Role role = parseRoleOrDefault(request.role(), Role.USER);
@@ -121,7 +126,7 @@ public class AdminServiceImpl implements AdminService {
         User user = new User();
         user.setUsername(username);
         user.setFullName(request.fullName().trim());
-        user.setEmail(request.email().trim());
+        user.setEmail(email);
         user.setRole(role);
         user.setEnabled(true);
         user.setMustChangePassword(true); // Luôn bắt đổi mật khẩu khi đăng nhập lần đầu
@@ -197,8 +202,10 @@ public class AdminServiceImpl implements AdminService {
             throw new AppException(HttpStatus.BAD_REQUEST, "SELF_ACTION_FORBIDDEN",
                     "Quản trị viên không thể tự khóa tài khoản của chính mình.");
         }
-        User target = findUserOrThrow(targetUserId);
-        ensureNotLastActiveAdmin(target, "khóa");
+        List<Long> activeAdminIds = userRepository.lockActiveAdminIds();
+        adminActor = requireCurrentAdmin(adminActor, activeAdminIds);
+        User target = lockUserOrThrow(targetUserId);
+        ensureNotLastActiveAdmin(target, activeAdminIds, "khóa");
 
         target.setEnabled(false);
         User saved = userRepository.save(target);
@@ -213,7 +220,8 @@ public class AdminServiceImpl implements AdminService {
     @Override
     @Transactional
     public AdminUserSummary unlockUser(User adminActor, Long targetUserId, String ipAddress) {
-        User target = findUserOrThrow(targetUserId);
+        adminActor = requireCurrentAdmin(adminActor, userRepository.lockActiveAdminIds());
+        User target = lockUserOrThrow(targetUserId);
         target.setEnabled(true);
         User saved = userRepository.save(target);
 
@@ -228,14 +236,16 @@ public class AdminServiceImpl implements AdminService {
     @Transactional
     public AdminUserSummary updateUserRole(User adminActor, Long targetUserId, String newRoleStr, String ipAddress) {
         Role newRole = parseRoleStrict(newRoleStr);
-        User target = findUserOrThrow(targetUserId);
+        List<Long> activeAdminIds = userRepository.lockActiveAdminIds();
+        adminActor = requireCurrentAdmin(adminActor, activeAdminIds);
+        User target = lockUserOrThrow(targetUserId);
 
-        if (Objects.equals(adminActor.getId(), targetUserId) && newRole != Role.ADMIN) {
+        if (Objects.equals(adminActor.getId(), targetUserId)) {
             throw new AppException(HttpStatus.BAD_REQUEST, "SELF_ACTION_FORBIDDEN",
-                    "Quản trị viên không thể tự hạ quyền của chính mình.");
+                    "Quản trị viên không thể tự đổi vai trò của chính mình.");
         }
         if (target.getRole() == Role.ADMIN && newRole != Role.ADMIN) {
-            ensureNotLastActiveAdmin(target, "hạ quyền");
+            ensureNotLastActiveAdmin(target, activeAdminIds, "hạ quyền");
         }
 
         Role oldRole = target.getRole();
@@ -252,8 +262,18 @@ public class AdminServiceImpl implements AdminService {
     @Override
     @Transactional
     public AdminResetPasswordResponse resetPassword(User adminActor, Long targetUserId, String ipAddress) {
-        User target = findUserOrThrow(targetUserId);
-        String tempPassword = generateSecureTempPassword();
+        return resetPassword(adminActor, targetUserId, null, ipAddress);
+    }
+
+    @Override
+    @Transactional
+    public AdminResetPasswordResponse resetPassword(User adminActor, Long targetUserId, String newPassword, String ipAddress) {
+        if (newPassword != null) {
+            validatePasswordPolicy(newPassword);
+        }
+        adminActor = requireCurrentAdmin(adminActor, userRepository.lockActiveAdminIds());
+        User target = lockUserOrThrow(targetUserId);
+        String tempPassword = newPassword == null ? generateSecureTempPassword() : newPassword;
 
         target.setPasswordHash(passwordEncoder.encode(tempPassword));
         target.setMustChangePassword(true);
@@ -268,9 +288,11 @@ public class AdminServiceImpl implements AdminService {
         return new AdminResetPasswordResponse(
                 target.getId(),
                 target.getUsername(),
-                tempPassword,
+                newPassword == null ? tempPassword : null,
                 true,
-                "Đã tạo mật khẩu tạm mới (chỉ hiển thị một lần). Người dùng bắt buộc đổi mật khẩu ở lần đăng nhập kế tiếp."
+                newPassword == null
+                        ? "Đã tạo mật khẩu tạm mới (chỉ hiển thị một lần). Người dùng bắt buộc đổi mật khẩu ở lần đăng nhập kế tiếp."
+                        : "Đặt lại mật khẩu thành công"
         );
     }
 
@@ -281,20 +303,25 @@ public class AdminServiceImpl implements AdminService {
             throw new AppException(HttpStatus.BAD_REQUEST, "SELF_ACTION_FORBIDDEN",
                     "Quản trị viên không thể tự xóa tài khoản của chính mình.");
         }
-        User target = findUserOrThrow(targetUserId);
-        ensureNotLastActiveAdmin(target, "xóa");
+        List<Long> activeAdminIds = userRepository.lockActiveAdminIds();
+        adminActor = requireCurrentAdmin(adminActor, activeAdminIds);
+        User target = lockUserOrThrow(targetUserId);
+        ensureNotLastActiveAdmin(target, activeAdminIds, "xóa");
 
         String targetUsername = target.getUsername();
 
         // 1. Thu hồi OAuth2 token dạng best-effort cho toàn bộ Gmail OAuth2 của user
         List<GmailAccount> gmails = gmailAccountRepository.findByUserId(targetUserId);
         for (GmailAccount acc : gmails) {
-            if (acc.getAuthType() == AuthType.OAUTH2) {
+            if (acc.hasOAuth() || acc.getAuthType() == AuthType.OAUTH2) {
                 try {
                     oauth2Service.revokeToken(acc);
                 } catch (Exception ex) {
                     log.warn("Thu hồi OAuth2 token best-effort thất bại khi xóa user id={}, gmailId={}: {}",
-                            targetUserId, acc.getId(), ex.getMessage());
+                            targetUserId, acc.getId(), ex.getClass().getSimpleName());
+                    auditLogService.log(adminActor.getId(), "REVOKE_TOKEN_FAILED",
+                            "Thu hồi OAuth2 thất bại cho Gmail id=" + acc.getId() + " của user id=" + targetUserId,
+                            ipAddress);
                 }
             }
         }
@@ -332,15 +359,22 @@ public class AdminServiceImpl implements AdminService {
             String desc = (entity != null && entity.getDescription() != null && !entity.getDescription().isBlank())
                     ? entity.getDescription() : spec.description();
 
-            result.add(new AdminSettingItem(spec.key(), val, spec.type(), spec.min(), spec.max(),
+            Integer min = spec.min();
+            if ("MAX_GMAIL_PER_USER".equals(spec.key())) {
+                min = "0".equals(val) ? 0 : 1;
+                desc = spec.description();
+            }
+            result.add(new AdminSettingItem(spec.key(), val, spec.type(), min, spec.max(),
                     desc, updatedBy, updatedAt));
         }
+        result.sort(Comparator.comparing(AdminSettingItem::key));
         return result;
     }
 
     @Override
     @Transactional
     public List<AdminSettingItem> updateSettings(User adminActor, AdminUpdateSettingsRequest request, String ipAddress) {
+        adminActor = requireCurrentAdmin(adminActor, userRepository.lockActiveAdminIds());
         Map<String, String> incoming = request.settings();
         if (incoming == null || incoming.isEmpty()) {
             throw new AppException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR",
@@ -360,16 +394,32 @@ public class AdminServiceImpl implements AdminService {
         }
 
         // Kiểm tra ràng buộc liên khóa: KHÔNG cho tắt cả OAuth2 và App Password cùng lúc
+        // Serialize changes to the pair and read persisted values, never a stale cache.
+        Map<String, String> currentLinkSettings = new HashMap<>();
+        for (SystemSetting setting : systemSettingRepository.lockLinkSettings()) {
+            currentLinkSettings.put(setting.getKey(), setting.getValue());
+        }
         boolean effectiveOAuth2 = normalized.containsKey("ALLOW_OAUTH2_LINK")
                 ? Boolean.parseBoolean(normalized.get("ALLOW_OAUTH2_LINK"))
-                : systemSettingService.isOAuth2LinkEnabled();
+                : Boolean.parseBoolean(currentLinkSettings.getOrDefault("ALLOW_OAUTH2_LINK", "true"));
         boolean effectiveAppPass = normalized.containsKey("ALLOW_APP_PASSWORD_LINK")
                 ? Boolean.parseBoolean(normalized.get("ALLOW_APP_PASSWORD_LINK"))
-                : systemSettingService.isAppPasswordLinkEnabled();
+                : Boolean.parseBoolean(currentLinkSettings.getOrDefault("ALLOW_APP_PASSWORD_LINK", "true"));
 
         if (!effectiveOAuth2 && !effectiveAppPass) {
             throw new AppException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR",
                     "Không được tắt đồng thời cả ALLOW_OAUTH2_LINK và ALLOW_APP_PASSWORD_LINK.");
+        }
+
+        // The original update contract requires positive quotas. Do not overwrite
+        // a persisted legacy unlimited quota or reject unchanged full-form saves.
+        if ("0".equals(normalized.get("MAX_GMAIL_PER_USER"))) {
+            String persistedQuota = systemSettingRepository.findById("MAX_GMAIL_PER_USER")
+                    .map(SystemSetting::getValue).orElse("5");
+            if (!"0".equals(persistedQuota)) {
+                throw new AppException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR",
+                        "MAX_GMAIL_PER_USER phải là số nguyên dương; chỉ giữ được giá trị cũ 0 nếu đã được cấu hình.");
+            }
         }
 
         // Lưu từng khóa, ghi updated_by, làm mới cache tức thì, ghi audit cũ -> mới
@@ -389,7 +439,6 @@ public class AdminServiceImpl implements AdminService {
                 entity.setValue(newVal);
                 entity.setUpdatedBy(adminActor);
                 systemSettingRepository.save(entity);
-                systemSettingService.updateSetting(key, newVal, adminActor);
 
                 if (!Objects.equals(oldVal, newVal)) {
                     auditLogService.log(adminActor.getId(), "ADMIN_CHANGE_SETTING",
@@ -532,11 +581,30 @@ public class AdminServiceImpl implements AdminService {
                         "Không tìm thấy người dùng với ID: " + id));
     }
 
-    private void ensureNotLastActiveAdmin(User target, String actionVerb) {
-        if (target.getRole() == Role.ADMIN && target.isEnabled()) {
-            long activeAdmins = userRepository.countByRoleAndEnabledTrue(Role.ADMIN);
-            if (activeAdmins <= 1) {
-                throw new AppException(HttpStatus.CONFLICT, "LAST_ADMIN",
+    private User lockUserOrThrow(Long id) {
+        return userRepository.lockUserById(id)
+                .orElseThrow(() -> new AppException(HttpStatus.NOT_FOUND, "USER_NOT_FOUND",
+                        "Không tìm thấy người dùng với ID: " + id));
+    }
+
+    /** Recheck after the serialization lock, not just at HTTP-filter time.
+     * A concurrent demotion, lock or deletion must invalidate a waiting actor. */
+    private User requireCurrentAdmin(User actor, List<Long> activeAdminIds) {
+        if (actor == null || actor.getId() == null || !activeAdminIds.contains(actor.getId())) {
+            throw new AppException(HttpStatus.FORBIDDEN, "FORBIDDEN", "Quyền quản trị không còn hiệu lực.");
+        }
+        User current = userRepository.lockUserById(actor.getId()).orElseThrow(() ->
+                new AppException(HttpStatus.FORBIDDEN, "FORBIDDEN", "Quyền quản trị không còn hiệu lực."));
+        if (!current.isEnabled() || current.getRole() != Role.ADMIN || current.isMustChangePassword()) {
+            throw new AppException(HttpStatus.FORBIDDEN, "FORBIDDEN", "Quyền quản trị không còn hiệu lực.");
+        }
+        return current;
+    }
+
+    private void ensureNotLastActiveAdmin(User target, List<Long> activeAdminIds, String actionVerb) {
+        if (activeAdminIds.contains(target.getId())) {
+            if (activeAdminIds.size() <= 1) {
+                throw new AppException(HttpStatus.BAD_REQUEST, "LAST_ADMIN",
                         "Không thể " + actionVerb + " Quản trị viên đang hoạt động cuối cùng của hệ thống.");
             }
         }
@@ -554,7 +622,8 @@ public class AdminServiceImpl implements AdminService {
     private AdminAuditLogItem toAuditItem(AuditLog a) {
         Long uid = a.getUser() != null ? a.getUser().getId() : null;
         String uname = a.getUser() != null ? a.getUser().getUsername() : "(system)";
-        return new AdminAuditLogItem(a.getId(), uid, uname, a.getAction(), a.getDetail(), a.getIpAddress(), a.getCreatedAt());
+        return new AdminAuditLogItem(a.getId(), uid, uname, a.getAction(), a.getDetail(), a.getIpAddress(),
+                a.getCreatedAt(), a.getMailEventId(), a.getMailActorId());
     }
 
     private Role parseRoleOrDefault(String roleStr, Role defaultRole) {
@@ -572,6 +641,9 @@ public class AdminServiceImpl implements AdminService {
     }
 
     private void validatePasswordPolicy(String password) {
+        if (!com.mailapp.security.PasswordPolicy.fitsBcrypt(password)) {
+            throw new AppException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "Mật khẩu tối đa 72 byte UTF-8.");
+        }
         if (password.length() < 8 || password.length() > 128
                 || !password.matches(".*[A-Za-z].*")
                 || !password.matches(".*[0-9].*")) {

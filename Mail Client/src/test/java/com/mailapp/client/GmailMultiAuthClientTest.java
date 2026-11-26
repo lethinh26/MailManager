@@ -26,6 +26,28 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class GmailMultiAuthClientTest {
 
+    @Test
+    void diagnosticsNeverTreatPartialProtocolFailureAsSuccess() {
+        assertTrue(GmailManagerDialog.bothMailProtocolsVerified(Map.of("imapOk", true, "smtpOk", true)));
+        assertFalse(GmailManagerDialog.bothMailProtocolsVerified(Map.of("imapOk", true, "smtpOk", false)));
+        assertFalse(GmailManagerDialog.bothMailProtocolsVerified(Map.of("imapOk", true)));
+        assertFalse(GmailManagerDialog.bothMailProtocolsVerified(Map.of("imapOk", "true", "smtpOk", true)));
+    }
+
+    @Test
+    void reauthGateRequiresAnActuallyAvailableAlternativeMethod() {
+        var appOnly = new GmailAccountDto(1L, "mail@example.test", "Mail", "APP_PASSWORD", "NEEDS_REAUTH", null, null, null);
+        var oauthOnly = new GmailAccountDto(2L, "mail@example.test", "Mail", "OAUTH2", "NEEDS_REAUTH", null, null, null);
+        assertTrue(appOnly.requiresReauthBeforeMail());
+        assertTrue(oauthOnly.requiresReauthBeforeMail());
+        for (String preferred : List.of("OAUTH2", "APP_PASSWORD")) {
+            var dual = new GmailAccountDto(3L, "mail@example.test", "mail@example.test", "Mail", preferred,
+                    preferred, preferred, false, new GmailAccountDto.MethodsInfo(true, true),
+                    "NEEDS_REAUTH", null, null, null, null, null, null);
+            assertFalse(dual.requiresReauthBeforeMail());
+        }
+    }
+
     private HttpServer server;
     private ApiClient apiClient;
     private final AtomicReference<String> lastRequestMethod = new AtomicReference<>();
@@ -159,6 +181,7 @@ class GmailMultiAuthClientTest {
         assertEquals("application/json", lastRequestContentType.get(),
                 "Body JSON bắt buộc gửi kèm Content-Type application/json, nếu không Spring trả 500 INTERNAL_SERVER_ERROR");
         assertEquals("METHOD_ADDED", linked.outcome());
+        assertTrue(lastRequestBody.get().contains("\"intent\":\"UPSERT\""));
         assertTrue(linked.hasOAuth());
         assertTrue(linked.hasAppPassword());
 

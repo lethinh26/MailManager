@@ -12,9 +12,14 @@ public record ErrorResponse(
     String error,
     String message,
     String code,
-    String errorCode
+    String errorCode,
+    String path
 ) {
     public static ErrorResponse of(int status, String error, String message, String code) {
-        return new ErrorResponse(LocalDateTime.now(), status, error, message, code, code);
+        return of(status, error, message, code, null);
+    }
+
+    public static ErrorResponse of(int status, String error, String message, String code, String path) {
+        return new ErrorResponse(LocalDateTime.now(), status, error, message, code, code, path);
     }
 }

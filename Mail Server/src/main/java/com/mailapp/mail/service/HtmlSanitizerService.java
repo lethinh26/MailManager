@@ -31,14 +31,24 @@ public class HtmlSanitizerService {
             .addProtocols("img", "src", "http", "https", "cid", "data");
 
     public SanitizeResult sanitize(String rawHtml, boolean loadRemote) {
+        return sanitize(rawHtml, loadRemote, MAX_BODY_CHARS);
+    }
+
+    // Outgoing messages have their own 1 MiB validation, so don't silently
+    // truncate them at the smaller display-only limit.
+    public SanitizeResult sanitizeOutgoing(String rawHtml) {
+        return sanitize(rawHtml, true, 1024 * 1024);
+    }
+
+    private SanitizeResult sanitize(String rawHtml, boolean loadRemote, int maxChars) {
         if (rawHtml == null || rawHtml.isBlank()) {
             return new SanitizeResult(null, false, false);
         }
 
         boolean truncated = false;
         String input = rawHtml;
-        if (input.length() > MAX_BODY_CHARS) {
-            input = input.substring(0, MAX_BODY_CHARS);
+        if (input.length() > maxChars) {
+            input = input.substring(0, maxChars);
             truncated = true;
         }
 

@@ -39,4 +39,21 @@ class OAuth2StateStoreTest {
         assertTrue(stateStore.validateAndConsumeState("").isEmpty());
         assertTrue(stateStore.validateAndConsumeState("non-existent-state").isEmpty());
     }
+
+    @Test
+    void stateAndPendingPollExpireAfterFiveMinutesWithoutSleeping() {
+        var ticks = new java.util.concurrent.atomic.AtomicLong();
+        OAuth2StateStore store = new OAuth2StateStore(ticks::get);
+        var expiredLink = store.generateLinkState(42L, "verifier", null);
+        var expiredLogin = store.generateGoogleLoginState("verifier");
+        var beforeExpiry = store.generateState(42L, "verifier");
+        ticks.set(java.util.concurrent.TimeUnit.SECONDS.toNanos(299));
+        assertTrue(store.validateAndConsumeState(beforeExpiry).isPresent());
+        assertTrue(store.pollLinkSession(expiredLink.pollToken(), 42L).isPresent());
+        ticks.set(java.util.concurrent.TimeUnit.MINUTES.toNanos(5));
+        assertTrue(store.validateAndConsumeState(expiredLink.state()).isEmpty());
+        assertTrue(store.pollLinkSession(expiredLink.pollToken(), 42L).isEmpty());
+        assertTrue(store.validateAndConsumeState(expiredLogin.state()).isEmpty());
+        assertTrue(store.pollLoginSession(expiredLogin.pollToken()).isEmpty());
+    }
 }

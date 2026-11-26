@@ -51,6 +51,16 @@ class EndpointSecurityAuditTest {
     private PasswordEncoder passwordEncoder;
 
     @Autowired
+    private org.springframework.context.ApplicationContext context;
+
+    @Test
+    void noUnusedDefaultSecurityUserIsCreated() {
+        assertTrue(context.getBeansOfType(
+                org.springframework.security.core.userdetails.UserDetailsService.class).isEmpty(),
+                "Database/JWT authentication must not create a generated in-memory user");
+    }
+
+    @Autowired
     @Qualifier("requestMappingHandlerMapping")
     private RequestMappingHandlerMapping handlerMapping;
 

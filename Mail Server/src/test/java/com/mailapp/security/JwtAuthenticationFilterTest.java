@@ -12,6 +12,11 @@ import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.util.ReflectionTestUtils;
+import io.jsonwebtoken.Jwts;
+import javax.crypto.SecretKey;
+import java.time.Instant;
+import java.util.Date;
 
 import java.util.Optional;
 
@@ -51,6 +56,51 @@ class JwtAuthenticationFilterTest {
                         .header("Authorization", "Bearer invalid-tampered-token-12345"))
                 .andExpect(status().isUnauthorized())
                 .andExpect(jsonPath("$.error").value("UNAUTHORIZED"));
+    }
+
+    @Test
+    void expiredCorrectlySignedJwtCannotAccessMe() throws Exception {
+        SecretKey signingKey = (SecretKey) ReflectionTestUtils.getField(jwtProvider, "signingKey");
+        Instant now = Instant.now();
+        String expired = Jwts.builder().subject("42").claim("username", "expired_user")
+                .claim("role", "USER").issuedAt(Date.from(now.minusSeconds(3600)))
+                .expiration(Date.from(now.minusSeconds(60))).signWith(signingKey, Jwts.SIG.HS256).compact();
+
+        mockMvc.perform(get("/api/auth/me").header("Authorization", "Bearer " + expired))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.code").value("UNAUTHORIZED"))
+                .andExpect(jsonPath("$.errorCode").value("UNAUTHORIZED"))
+                .andExpect(jsonPath("$.path").value("/api/auth/me"));
+        verify(userRepository, never()).findById(42L);
+    }
+
+    @Test
+    void legacyNumericSubjectUsesDatabaseIdentityAndRole() throws Exception {
+        SecretKey signingKey = (SecretKey) ReflectionTestUtils.getField(jwtProvider, "signingKey");
+        User user = new User(42L, "legacy_user", "legacy@example.com", Role.USER);
+        when(userRepository.findById(42L)).thenReturn(Optional.of(user));
+        String legacy = Jwts.builder().subject("42").claim("uid", 42L)
+                .claim("username", "legacy_user").claim("role", "ADMIN")
+                .expiration(Date.from(Instant.now().plusSeconds(3600)))
+                .signWith(signingKey, Jwts.SIG.HS256).compact();
+
+        mockMvc.perform(get("/api/auth/me").header("Authorization", "Bearer " + legacy))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.id").value(42))
+                .andExpect(jsonPath("$.role").value("USER"));
+        mockMvc.perform(get("/api/admin/users").header("Authorization", "Bearer " + legacy))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    void usernameSubjectCannotAuthenticateAfterDatabaseIdentityChanges() throws Exception {
+        User former = new User(42L, "former_name", "former@example.com", Role.USER);
+        String token = jwtProvider.generateToken(former);
+        User current = new User(42L, "current_name", "current@example.com", Role.USER);
+        when(userRepository.findById(42L)).thenReturn(Optional.of(current));
+
+        mockMvc.perform(get("/api/auth/me").header("Authorization", "Bearer " + token))
+                .andExpect(status().isUnauthorized());
     }
 
     @Test

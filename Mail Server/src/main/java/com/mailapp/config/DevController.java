@@ -98,25 +98,32 @@ public class DevController {
         boolean smtpOk = false;
 
         try (ImapConnection imap = mailConnectionFactory.openImap(account)) {
-            imapOk = imap.isConnected();
             try {
                 Folder inbox = imap.folder("INBOX");
-                if (inbox != null && inbox.exists()) {
+                if (imap.isConnected() && inbox != null && inbox.exists()) {
                     inbox.open(Folder.READ_ONLY);
-                    inboxCount = inbox.getMessageCount();
-                    inbox.close(false);
+                    try {
+                        inboxCount = inbox.getMessageCount();
+                    } finally {
+                        inbox.close(false);
+                    }
+                    imapOk = inboxCount >= 0;
+                    if (!imapOk) imap.markBroken();
                 }
             } catch (Exception e) {
-                log.warn("Selftest IMAP mở inbox thất bại: {}", e.getMessage());
+                imap.markBroken();
+                imapOk = false;
+                inboxCount = -1;
+                log.warn("Selftest IMAP mở inbox thất bại: {}", e.getClass().getSimpleName());
             }
         } catch (Exception e) {
-            log.warn("Selftest IMAP thất bại: {}", e.getMessage());
+            log.warn("Selftest IMAP thất bại: {}", e.getClass().getSimpleName());
         }
 
         try (SmtpConnection smtp = mailConnectionFactory.openSmtp(account)) {
             smtpOk = smtp.isConnected();
         } catch (Exception e) {
-            log.warn("Selftest SMTP thất bại: {}", e.getMessage());
+            log.warn("Selftest SMTP thất bại: {}", e.getClass().getSimpleName());
         }
 
         long durationMs = System.currentTimeMillis() - startTime;

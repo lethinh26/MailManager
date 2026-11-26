@@ -75,6 +75,7 @@ public class SecurityConfig {
                     errorBody.put("error", "UNAUTHORIZED");
                     errorBody.put("code", "UNAUTHORIZED");
                     errorBody.put("errorCode", "UNAUTHORIZED");
+                    errorBody.put("path", request.getRequestURI());
                     errorBody.put("message", "Yêu cầu xác thực. Vui lòng cung cấp Bearer Token hợp lệ.");
 
                     response.getWriter().write(objectMapper.writeValueAsString(errorBody));
@@ -90,6 +91,7 @@ public class SecurityConfig {
                     errorBody.put("error", "FORBIDDEN");
                     errorBody.put("code", "FORBIDDEN");
                     errorBody.put("errorCode", "FORBIDDEN");
+                    errorBody.put("path", request.getRequestURI());
                     errorBody.put("message", "Bạn không có quyền truy cập tài nguyên này.");
 
                     response.getWriter().write(objectMapper.writeValueAsString(errorBody));

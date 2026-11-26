@@ -62,7 +62,7 @@ class AuthServiceTest {
     }
 
     @Test
-    @DisplayName("Đăng nhập thành công: Trả JWT, đúng role, reset rate limiter, audit log LOGIN_SUCCESS")
+    @DisplayName("Đăng nhập thành công: Trả JWT, đúng role, reset rate limiter, audit log LOGIN")
     void testLoginSuccess() {
         LoginRequest request = new LoginRequest("cuongle", "ValidPassword123!");
         User user = new User(1L, "cuongle", "cuongle@ptit.edu.vn", Role.USER);
@@ -70,6 +70,7 @@ class AuthServiceTest {
         user.setEnabled(true);
 
         when(userRepository.findByUsername("cuongle")).thenReturn(Optional.of(user));
+        when(userRepository.lockUserById(1L)).thenReturn(Optional.of(user));
         when(passwordEncoder.matches("ValidPassword123!", "hashed_password")).thenReturn(true);
         when(systemSettingService.isMaintenanceMode()).thenReturn(false);
         when(jwtProvider.generateToken(user)).thenReturn("mock.jwt.token");
@@ -86,7 +87,7 @@ class AuthServiceTest {
 
         verify(loginRateLimiter).checkLimit("cuongle", CLIENT_IP);
         verify(loginRateLimiter).recordSuccess("cuongle", CLIENT_IP);
-        verify(auditLogService).log(1L, "LOGIN_SUCCESS", "SUCCESS", CLIENT_IP);
+        verify(auditLogService).log(1L, "LOGIN", "SUCCESS", CLIENT_IP);
     }
 
     @Test
@@ -98,36 +99,37 @@ class AuthServiceTest {
         AppException ex = assertThrows(AppException.class, () -> authService.login(request, CLIENT_IP));
 
         assertEquals(HttpStatus.UNAUTHORIZED, ex.getStatus());
-        assertEquals("INVALID_CREDENTIALS", ex.getCode());
-        assertEquals("Sai tên đăng nhập hoặc mật khẩu.", ex.getMessage());
+        assertEquals("UNAUTHORIZED", ex.getCode());
+        assertEquals("Sai tài khoản hoặc mật khẩu", ex.getMessage());
 
         // Khẳng định passwordEncoder.matches ĐÃ ĐƯỢC GỌI với hash giả
         verify(passwordEncoder).matches(eq("AnyPassword123!"), anyString());
         verify(loginRateLimiter).recordFailedAttempt("unknown_user", CLIENT_IP);
-        verify(auditLogService).log(isNull(), eq("LOGIN_FAILED"), contains("UNKNOWN_USER"), eq(CLIENT_IP));
+        verify(auditLogService).log(isNull(), eq("LOGIN_FAILED"), eq("UNKNOWN_USER"), eq(CLIENT_IP));
     }
 
     @Test
-    @DisplayName("Sai mật khẩu: Ném INVALID_CREDENTIALS, ghi nhận rate limit và audit log")
+    @DisplayName("Sai mật khẩu: Ném UNAUTHORIZED, ghi nhận rate limit và audit log")
     void testLoginWrongPassword() {
         LoginRequest request = new LoginRequest("cuongle", "WrongPassword!");
         User user = new User(1L, "cuongle", "cuongle@ptit.edu.vn", Role.USER);
         user.setPasswordHash("hashed_password");
 
         when(userRepository.findByUsername("cuongle")).thenReturn(Optional.of(user));
+        when(userRepository.lockUserById(1L)).thenReturn(Optional.of(user));
         when(passwordEncoder.matches("WrongPassword!", "hashed_password")).thenReturn(false);
 
         AppException ex = assertThrows(AppException.class, () -> authService.login(request, CLIENT_IP));
 
         assertEquals(HttpStatus.UNAUTHORIZED, ex.getStatus());
-        assertEquals("INVALID_CREDENTIALS", ex.getCode());
+        assertEquals("UNAUTHORIZED", ex.getCode());
 
         verify(loginRateLimiter).recordFailedAttempt("cuongle", CLIENT_IP);
         verify(auditLogService).log(1L, "LOGIN_FAILED", "BAD_PASSWORD", CLIENT_IP);
     }
 
     @Test
-    @DisplayName("Tài khoản bị khóa (enabled=false): Chỉ ném ACCOUNT_LOCKED sau khi mật khẩu đã đúng")
+    @DisplayName("Tài khoản bị khóa (enabled=false): Chỉ ném ACCOUNT_DISABLED sau khi mật khẩu đã đúng")
     void testLoginAccountLockedOnlyAfterPasswordMatches() {
         LoginRequest request = new LoginRequest("locked_user", "CorrectPassword123!");
         User user = new User(2L, "locked_user", "locked@ptit.edu.vn", Role.USER);
@@ -135,12 +137,13 @@ class AuthServiceTest {
         user.setEnabled(false); // Bị khóa
 
         when(userRepository.findByUsername("locked_user")).thenReturn(Optional.of(user));
+        when(userRepository.lockUserById(2L)).thenReturn(Optional.of(user));
         when(passwordEncoder.matches("CorrectPassword123!", "hashed_password")).thenReturn(true);
 
         AppException ex = assertThrows(AppException.class, () -> authService.login(request, CLIENT_IP));
 
         assertEquals(HttpStatus.FORBIDDEN, ex.getStatus());
-        assertEquals("ACCOUNT_LOCKED", ex.getCode());
+        assertEquals("ACCOUNT_DISABLED", ex.getCode());
         assertTrue(ex.getMessage().contains("khóa"));
 
         verify(auditLogService).log(2L, "LOGIN_FAILED", "ACCOUNT_LOCKED", CLIENT_IP);
@@ -155,12 +158,13 @@ class AuthServiceTest {
         user.setEnabled(true);
 
         when(userRepository.findByUsername("normal_user")).thenReturn(Optional.of(user));
+        when(userRepository.lockUserById(3L)).thenReturn(Optional.of(user));
         when(passwordEncoder.matches("ValidPassword123!", "hashed_password")).thenReturn(true);
         when(systemSettingService.isMaintenanceMode()).thenReturn(true);
 
         AppException ex = assertThrows(AppException.class, () -> authService.login(request, CLIENT_IP));
 
-        assertEquals(HttpStatus.SERVICE_UNAVAILABLE, ex.getStatus());
+        assertEquals(HttpStatus.FORBIDDEN, ex.getStatus());
         assertEquals("MAINTENANCE_MODE", ex.getCode());
         assertTrue(ex.getMessage().contains("bảo trì"));
 
@@ -176,6 +180,7 @@ class AuthServiceTest {
         admin.setEnabled(true);
 
         when(userRepository.findByUsername("admin")).thenReturn(Optional.of(admin));
+        when(userRepository.lockUserById(1L)).thenReturn(Optional.of(admin));
         when(passwordEncoder.matches("AdminPassword123!", "hashed_admin")).thenReturn(true);
         when(systemSettingService.isMaintenanceMode()).thenReturn(true);
         when(jwtProvider.generateToken(admin)).thenReturn("admin.jwt.token");
@@ -185,7 +190,7 @@ class AuthServiceTest {
 
         assertNotNull(response);
         assertEquals(Role.ADMIN, response.user().role());
-        verify(auditLogService).log(1L, "LOGIN_SUCCESS", "SUCCESS", CLIENT_IP);
+        verify(auditLogService).log(1L, "LOGIN", "SUCCESS", CLIENT_IP);
     }
 
     @Test
@@ -198,6 +203,7 @@ class AuthServiceTest {
         user.setEnabled(true);
 
         when(userRepository.findByUsername("cuongle")).thenReturn(Optional.of(user));
+        when(userRepository.lockUserById(1L)).thenReturn(Optional.of(user));
         when(passwordEncoder.matches(sampleInput, "old_hash")).thenReturn(true);
         when(passwordEncoder.upgradeEncoding("old_hash")).thenReturn(true);
         when(passwordEncoder.encode(sampleInput)).thenReturn("new_stronger_hash");
@@ -221,6 +227,18 @@ class AuthServiceTest {
         assertEquals(300L, ex.getRetryAfterSeconds());
         verifyNoInteractions(userRepository);
         verifyNoInteractions(passwordEncoder);
+    }
+
+    @Test
+    void overlongUnicodePasswordIsRejectedBeforeBcryptOrLookup() {
+        String raw = "Aa1" + "\u00e9".repeat(35);
+        AppException ex = assertThrows(AppException.class,
+                () -> authService.login(new LoginRequest("known_user", raw), CLIENT_IP));
+        assertEquals(HttpStatus.UNAUTHORIZED, ex.getStatus());
+        assertEquals("UNAUTHORIZED", ex.getCode());
+        verifyNoInteractions(userRepository, passwordEncoder);
+        verify(loginRateLimiter).recordFailedAttempt("known_user", CLIENT_IP);
+        verify(auditLogService).log(null, "LOGIN_FAILED", "BAD_PASSWORD_LENGTH", CLIENT_IP);
     }
 }
 

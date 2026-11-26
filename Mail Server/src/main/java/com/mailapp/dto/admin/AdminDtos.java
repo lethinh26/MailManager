@@ -28,17 +28,17 @@ public final class AdminDtos {
 
     public record AdminCreateUserRequest(
             @NotBlank(message = "Tên đăng nhập không được để trống.")
-            @Size(min = 3, max = 50, message = "Tên đăng nhập phải từ 3 đến 50 ký tự.")
+            @Size(min = 3, max = 64, message = "Tên đăng nhập phải từ 3 đến 64 ký tự.")
             @Pattern(regexp = "^[a-zA-Z0-9_]+$", message = "Tên đăng nhập chỉ được gồm chữ cái, chữ số và dấu gạch dưới (_).")
             String username,
 
             @NotBlank(message = "Họ và tên không được để trống.")
-            @Size(max = 100, message = "Họ và tên tối đa 100 ký tự.")
+            @Size(max = 255, message = "Họ và tên tối đa 255 ký tự.")
             String fullName,
 
             @NotBlank(message = "Email không được để trống.")
             @Email(message = "Định dạng email không hợp lệ.")
-            @Size(max = 100, message = "Email tối đa 100 ký tự.")
+            @Size(max = 255, message = "Email tối đa 255 ký tự.")
             String email,
 
             String role,
@@ -104,6 +104,16 @@ public final class AdminDtos {
             String role
     ) {}
 
+    /** Optional reset body. An absent body retains generated-password behavior. */
+    public record AdminResetPasswordRequest(
+            @NotBlank(message = "Mật khẩu mới không được để trống.")
+            @Size(min = 8, max = 128, message = "Mật khẩu mới phải từ 8 đến 128 ký tự.")
+            String newPassword
+    ) {
+        @Override
+        public String toString() { return "AdminResetPasswordRequest[newPassword=***]"; }
+    }
+
     public record AdminResetPasswordResponse(
             Long userId,
             String username,
@@ -121,7 +131,10 @@ public final class AdminDtos {
             String description,
             String updatedByUsername,
             LocalDateTime updatedAt
-    ) {}
+    ) {
+        @com.fasterxml.jackson.annotation.JsonProperty("updatedBy")
+        public String updatedBy() { return updatedByUsername; }
+    }
 
     public record AdminUpdateSettingsRequest(
             @NotEmpty(message = "Danh sách cấu hình cần cập nhật không được để trống.")
@@ -156,7 +169,11 @@ public final class AdminDtos {
             String action,
             String detail,
             String ipAddress,
-            LocalDateTime createdAt
+            LocalDateTime createdAt,
+            @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+            String mailEventId,
+            @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+            Long mailActorId
     ) {}
 }
 

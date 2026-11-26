@@ -1,6 +1,7 @@
 package com.mailapp.mail.folder;
 
 import jakarta.mail.Folder;
+import jakarta.mail.MessagingException;
 import org.eclipse.angus.mail.imap.IMAPFolder;
 import org.eclipse.angus.mail.imap.protocol.Status;
 import org.junit.jupiter.api.DisplayName;
@@ -9,6 +10,7 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -48,6 +50,13 @@ class FolderCountReaderTest {
 
         assertEquals(10, counts.total());
         assertEquals(3, counts.unread());
+    }
+
+    @Test
+    void propagatesUnavailableCountsRatherThanReportingEmptyFolder() throws Exception {
+        Folder folder = mock(Folder.class);
+        when(folder.getMessageCount()).thenThrow(new MessagingException("connection lost"));
+        assertThrows(MessagingException.class, () -> FolderCountReader.read(folder));
     }
 
     @Test

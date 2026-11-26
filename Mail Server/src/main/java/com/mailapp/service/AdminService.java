@@ -20,6 +20,7 @@ public interface AdminService {
     AdminUserSummary updateUserRole(User adminActor, Long targetUserId, String newRoleStr, String ipAddress);
 
     AdminResetPasswordResponse resetPassword(User adminActor, Long targetUserId, String ipAddress);
+    AdminResetPasswordResponse resetPassword(User adminActor, Long targetUserId, String newPassword, String ipAddress);
 
     void deleteUser(User adminActor, Long targetUserId, String ipAddress);
 

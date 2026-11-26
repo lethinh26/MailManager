@@ -3,17 +3,20 @@ package com.mailapp.client.service;
 import com.mailapp.client.model.MailClientDtos.*;
 import com.mailapp.client.net.ApiClient;
 import com.mailapp.client.net.ApiException;
+import com.mailapp.client.util.FileUtil;
 
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
+import java.nio.file.LinkOption;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.HashSet;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
 /**
@@ -22,8 +25,9 @@ import java.util.function.Consumer;
  * Quy tắc an toàn tuyệt đối:
  * 1. Lưu vào <downloadBase>/MailManager/<sanitized-email>/<yyyy-MM-dd>/.
  * 2. Chống Path Traversal (../), làm sạch tên tệp, tự đổi tên chống ghi đè trùng tên.
- * 3. Tải ra tệp tạm (.part), xác minh dung lượng ghi xuống (> 0 và khớp khai báo nếu có) + tính SHA-256,
- *    chuyển tên nguyên tử sang đích.
+ * 3. Tải ra tệp tạm (.part), xác minh số byte thực nhận/ghi (> 0, khớp HTTP Content-Length nếu có)
+ *    + tính SHA-256; không so sánh với dung lượng ước tính từ IMAP,
+ *    chuyển tên sang đích mà không ghi đè tệp có sẵn.
  * 4. CHỈ KHI MỌI TỆP ĐÍNH KÈM của thư tải & xác minh thành công mới gọi xóa thư.
  *    Nếu tải lỗi hoặc bị hủy giữa chừng -> TUYỆT ĐỐI KHÔNG XÓA thư!
  */
@@ -31,9 +35,14 @@ public class AttachmentCleanupService {
 
     private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd");
 
-    public enum ItemStatus { SUCCESS, DRY_RUN, SKIPPED, FAILED, CANCELLED }
+    public enum ItemStatus { SUCCESS, DRY_RUN, SKIPPED, FAILED, CANCELLED, DELETE_UNCERTAIN }
 
-    public record DownloadedFileInfo(String filename, Path savedPath, long bytes, String sha256) {}
+    public record DownloadedFileInfo(String filename, Path savedPath, long bytes, String sha256,
+                                     AttachmentSizeAccuracy sizeAccuracy) {
+        public DownloadedFileInfo(String filename, Path savedPath, long bytes, String sha256) {
+            this(filename, savedPath, bytes, sha256, AttachmentSizeAccuracy.EXACT);
+        }
+    }
 
     public record MailCleanupResult(
             long uid,
@@ -71,6 +80,25 @@ public class AttachmentCleanupService {
                                                 boolean dryRun,
                                                 AtomicBoolean cancelled,
                                                 Consumer<String> progressCallback) {
+        return processMails(gmailId, accountEmail, folder, targets, downloadBaseDir,
+                permanentDelete, dryRun, cancelled, progressCallback, () -> true);
+    }
+
+    private static boolean stopped(AtomicBoolean cancelled, BooleanSupplier stillCurrent) {
+        return Thread.currentThread().isInterrupted()
+                || (cancelled != null && cancelled.get()) || !stillCurrent.getAsBoolean();
+    }
+
+    public List<MailCleanupResult> processMails(Long gmailId,
+                                                String accountEmail,
+                                                String folder,
+                                                List<MailSummaryDto> targets,
+                                                File downloadBaseDir,
+                                                boolean permanentDelete,
+                                                boolean dryRun,
+                                                AtomicBoolean cancelled,
+                                                Consumer<String> progressCallback,
+                                                BooleanSupplier stillCurrent) {
         List<MailCleanupResult> results = new ArrayList<>();
         if (targets == null || targets.isEmpty()) {
             return results;
@@ -91,10 +119,16 @@ public class AttachmentCleanupService {
         }
 
         for (MailSummaryDto summary : targets) {
-            if (cancelled != null && cancelled.get()) {
+            if (stopped(cancelled, stillCurrent)) {
                 results.add(new MailCleanupResult(summary.uid(), summary.subject(), ItemStatus.CANCELLED,
                         List.of(), false, "Đã hủy bởi người dùng (không xóa thư)."));
                 continue;
+            }
+            if (summary.uid() <= 0 || summary.uidValidity() <= 0) {
+                results.add(new MailCleanupResult(summary.uid(), summary.subject(), ItemStatus.FAILED,
+                        List.of(), false, "Thiếu định danh UID/UIDVALIDITY hợp lệ; dừng lô, không xóa thư."));
+                consecutiveErrors++;
+                break;
             }
 
             if (progressCallback != null) {
@@ -102,13 +136,38 @@ public class AttachmentCleanupService {
             }
 
             try {
+                if (stopped(cancelled, stillCurrent)) {
+                    results.add(new MailCleanupResult(summary.uid(), summary.subject(), ItemStatus.CANCELLED,
+                            List.of(), false, "Phiên hoặc lựa chọn đã thay đổi; không xóa thư."));
+                    break;
+                }
                 MailDetailResponse detail = apiClient.getMailDetail(
-                        gmailId, folder, summary.uid(), false, summary.uidValidity());
+                        gmailId, folder, summary.uid(), false, summary.uidValidity(), false);
+
+                if (detail == null || detail.uid() != summary.uid()
+                        || detail.uidValidity() != summary.uidValidity()) {
+                    consecutiveErrors++;
+                    results.add(new MailCleanupResult(summary.uid(), summary.subject(), ItemStatus.FAILED,
+                            List.of(), false, "Định danh thư trả về không khớp lựa chọn; dừng lô, không xóa thư."));
+                    break;
+                }
+                if (stopped(cancelled, stillCurrent)) {
+                    results.add(new MailCleanupResult(summary.uid(), summary.subject(), ItemStatus.CANCELLED,
+                            List.of(), false, "Phiên hoặc lựa chọn đã thay đổi; không xóa thư."));
+                    break;
+                }
 
                 List<MailAttachmentDto> realAttachments = detail.attachments() == null ? List.of()
-                        : detail.attachments().stream().filter(a -> !a.inline()).toList();
+                        : detail.attachments();
+                var indices = new HashSet<Integer>();
+                if (realAttachments.stream().anyMatch(a -> a == null || a.index() < 0 || !indices.add(a.index()))) {
+                    consecutiveErrors++;
+                    results.add(new MailCleanupResult(summary.uid(), summary.subject(), ItemStatus.FAILED,
+                            List.of(), false, "Danh sách tệp không hợp lệ hoặc trùng chỉ số; dừng lô, không xóa thư."));
+                    break;
+                }
 
-                if (realAttachments.isEmpty()) {
+                if (realAttachments.stream().noneMatch(a -> !a.inline())) {
                     results.add(new MailCleanupResult(summary.uid(), detail.subject(), ItemStatus.SKIPPED,
                             List.of(), false, "Thư không có tệp đính kèm — bỏ qua, không xóa."));
                     continue;
@@ -118,7 +177,7 @@ public class AttachmentCleanupService {
                     List<DownloadedFileInfo> preview = new ArrayList<>();
                     for (MailAttachmentDto a : realAttachments) {
                         preview.add(new DownloadedFileInfo(sanitizeFilename(a.filename()),
-                                dayDir.resolve(sanitizeFilename(a.filename())), a.size(), "DRY_RUN"));
+                                dayDir.resolve(sanitizeFilename(a.filename())), a.size(), "DRY_RUN", a.sizeAccuracy()));
                     }
                     results.add(new MailCleanupResult(summary.uid(), detail.subject(), ItemStatus.DRY_RUN,
                             preview, false,
@@ -132,76 +191,88 @@ public class AttachmentCleanupService {
                 String failureReason = null;
 
                 for (MailAttachmentDto att : realAttachments) {
-                    if (cancelled != null && cancelled.get()) {
+                    if (stopped(cancelled, stillCurrent)) {
                         allOk = false;
                         failureReason = "Đã hủy giữa chừng khi đang tải tệp — KHÔNG xóa thư.";
                         break;
                     }
 
                     String safeName = sanitizeFilename(att.filename());
-                    Path finalPath = resolveUniqueFilePath(dayDir, safeName);
-                    Path partPath = dayDir.resolve(finalPath.getFileName().toString() + ".part");
-
                     try {
-                        ApiClient.DownloadResult dl = apiClient.downloadAttachmentToFile(
-                                gmailId, folder, summary.uid(), att.index(), detail.uidValidity(), partPath.toFile());
-
-                        // Xác minh dung lượng ghi xuống phải > 0 và tệp tồn tại thực sự
-                        long actualSize = Files.size(partPath);
-                        if (actualSize <= 0 || actualSize != dl.bytesWritten()) {
-                            Files.deleteIfExists(partPath);
-                            allOk = false;
-                            failureReason = "Dung lượng tệp tải xuống không khớp (" + actualSize + " vs " + dl.bytesWritten() + ") — KHÔNG xóa thư.";
-                            break;
-                        }
-                        if (att.size() > 0 && actualSize == 0) {
-                            Files.deleteIfExists(partPath);
-                            allOk = false;
-                            failureReason = "Tệp tải về rỗng so với dung lượng khai báo — KHÔNG xóa thư.";
-                            break;
-                        }
-
-                        // Chuyển nguyên tử từ .part sang đích cuối cùng
-                        Files.move(partPath, finalPath, StandardCopyOption.REPLACE_EXISTING);
-                        savedFiles.add(new DownloadedFileInfo(finalPath.getFileName().toString(), finalPath, actualSize, dl.sha256Hex()));
+                        ApiClient.DownloadResult dl = FileUtil.saveUnique(dayDir.resolve(safeName), partPath -> {
+                            if (stopped(cancelled, stillCurrent)) throw new InterruptedException("Đã hủy tải.");
+                            ApiClient.DownloadResult result = apiClient.downloadAttachmentToFile(
+                                    gmailId, folder, summary.uid(), att.index(), summary.uidValidity(), partPath.toFile());
+                            if (Files.size(partPath) <= 0) {
+                                throw new IOException("Tệp tải về rỗng; không xóa thư.");
+                            }
+                            if (stopped(cancelled, stillCurrent)) throw new InterruptedException("Đã hủy tải.");
+                            return result;
+                        });
+                        Path finalPath = dl.file().toPath();
+                        savedFiles.add(new DownloadedFileInfo(finalPath.getFileName().toString(), finalPath, dl.bytesWritten(), dl.sha256Hex()));
                     } catch (Exception ex) {
-                        try { Files.deleteIfExists(partPath); } catch (IOException ignored) {}
                         allOk = false;
                         failureReason = "Lỗi tải tệp '" + safeName + "': " + ex.getMessage() + " — KHÔNG xóa thư.";
+                        if (ex instanceof ApiException apiEx && mustStopBatch(apiEx)) {
+                            consecutiveErrors++;
+                            results.add(new MailCleanupResult(summary.uid(), detail.subject(), ItemStatus.FAILED,
+                                    List.copyOf(savedFiles), false, "Phiên hoặc định danh không còn hợp lệ; dừng lô, không xóa thư."));
+                            return results;
+                        }
                         break;
                     }
                 }
 
                 // CHỈ KHI MỌI TỆP LƯU THÀNH CÔNG VÀ KHÔNG BỊ HỦY mới xóa thư
-                if (allOk && (cancelled == null || !cancelled.get())) {
-                    apiClient.deleteMail(gmailId, folder, summary.uid(), permanentDelete, detail.uidValidity());
+                if (allOk && !stopped(cancelled, stillCurrent)) {
+                    try {
+                        apiClient.deleteMail(gmailId, folder, summary.uid(), permanentDelete, summary.uidValidity());
+                    } catch (Exception ex) {
+                        if (!ApiException.isDeleteOutcomeUncertain(ex)) throw ex;
+                        if (ex instanceof InterruptedException) Thread.currentThread().interrupt();
+                        consecutiveErrors++;
+                        results.add(new MailCleanupResult(summary.uid(), detail.subject(), ItemStatus.DELETE_UNCERTAIN,
+                                List.copyOf(savedFiles), false,
+                                "Đã lưu tệp nhưng chưa xác nhận được kết quả xóa. Dừng lô; kiểm tra thư mục nguồn và Thùng rác trước khi thao tác lại."));
+                        // A subsequent automatic run must not blindly retry an ambiguous COPY/MOVE.
+                        break;
+                    }
                     consecutiveErrors = 0;
                     results.add(new MailCleanupResult(
                             summary.uid(), detail.subject(), ItemStatus.SUCCESS, savedFiles, true,
                             "Đã tải & xác minh " + savedFiles.size() + " tệp, sau đó "
                                     + (permanentDelete ? "xóa vĩnh viễn" : "chuyển vào Thùng rác") + "."));
                 } else {
-                    ItemStatus st = (cancelled != null && cancelled.get()) ? ItemStatus.CANCELLED : ItemStatus.FAILED;
+                    ItemStatus st = stopped(cancelled, stillCurrent) ? ItemStatus.CANCELLED : ItemStatus.FAILED;
                     if (st == ItemStatus.FAILED) consecutiveErrors++;
-                    results.add(new MailCleanupResult(summary.uid(), detail.subject(), st, savedFiles, false, failureReason));
+                    results.add(new MailCleanupResult(summary.uid(), detail.subject(), st, savedFiles, false,
+                            failureReason != null ? failureReason : "Phiên hoặc lựa chọn đã thay đổi; không xóa thư."));
                 }
 
             } catch (ApiException apiEx) {
                 consecutiveErrors++;
                 results.add(new MailCleanupResult(summary.uid(), summary.subject(), ItemStatus.FAILED,
-                        List.of(), false, "Lỗi API [" + apiEx.getCode() + "]: " + apiEx.getMessage() + " — KHÔNG xóa thư."));
-                if ("GMAIL_NEEDS_REAUTH".equalsIgnoreCase(apiEx.getCode()) || apiEx.getStatusCode() == 401) {
+                        List.of(), false, "Lỗi API [" + apiEx.getCode() + "]: " + apiEx.getMessage() + " — không xác nhận xóa thành công."));
+                if (mustStopBatch(apiEx)) {
                     // Dừng ngay toàn bộ lô khi mất quyền hoặc hết phiên
                     break;
                 }
             } catch (Exception ex) {
                 consecutiveErrors++;
                 results.add(new MailCleanupResult(summary.uid(), summary.subject(), ItemStatus.FAILED,
-                        List.of(), false, "Lỗi không xác định: " + ex.getMessage() + " — KHÔNG xóa thư."));
+                        List.of(), false, "Lỗi không xác định: " + ex.getMessage() + " — không xác nhận xóa thành công."));
             }
         }
 
         return results;
+    }
+
+    private static boolean mustStopBatch(ApiException ex) {
+        return ex.getStatusCode() == 401 || ex.getStatusCode() == 403
+                || "GMAIL_NEEDS_REAUTH".equalsIgnoreCase(ex.getCode())
+                || "GMAIL_ACCOUNT_CHANGED".equalsIgnoreCase(ex.getCode())
+                || "UID_VALIDITY_CHANGED".equalsIgnoreCase(ex.getCode());
     }
 
     public static Path buildTargetDirectory(File baseDownloadsDir, String email, LocalDate date) {
@@ -264,7 +335,7 @@ public class AttachmentCleanupService {
         }
 
         Path candidate = directory.resolve(name);
-        if (!Files.exists(candidate)) {
+        if (!Files.exists(candidate, LinkOption.NOFOLLOW_LINKS)) {
             return candidate;
         }
         String base = name;
@@ -277,7 +348,7 @@ public class AttachmentCleanupService {
         int counter = 1;
         while (true) {
             Path next = directory.resolve(base + " (" + counter + ")" + ext);
-            if (!Files.exists(next)) {
+            if (!Files.exists(next, LinkOption.NOFOLLOW_LINKS)) {
                 return next;
             }
             counter++;

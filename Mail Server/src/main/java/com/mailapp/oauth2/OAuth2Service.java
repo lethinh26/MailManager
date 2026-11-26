@@ -1,8 +1,10 @@
 package com.mailapp.oauth2;
 
 import com.mailapp.dto.AuthorizeUrlResponse;
+import com.mailapp.dto.GmailAccountResponse.LinkOutcome;
 import com.mailapp.dto.LoginResponse;
 import com.mailapp.model.GmailAccount;
+import com.mailapp.model.LinkIntent;
 
 import java.util.Optional;
 
@@ -25,6 +27,14 @@ public interface OAuth2Service {
 
     default AuthorizeUrlResponse getAuthorizeUrl(Long userId, Long existingAccountId) {
         return getAuthorizeUrl(userId);
+    }
+
+    AuthorizeUrlResponse getAuthorizeUrl(Long userId, Long existingAccountId, LinkIntent intent);
+
+    record LinkPollResponse(String status, Long accountId, LinkOutcome outcome, String code, String message) {}
+
+    default LinkPollResponse pollLink(String pollToken, Long userId) {
+        throw new UnsupportedOperationException("Google OAuth2 link polling chưa được cấu hình.");
     }
 
     /**

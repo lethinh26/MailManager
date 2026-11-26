@@ -38,16 +38,22 @@ public class ImapConnection implements AutoCloseable {
     }
 
     public Store getStore() {
+        if (closed.get()) throw new IllegalStateException("IMAP lease already closed");
         return store;
     }
 
     public Folder folder(String folderName) throws MessagingException {
-        return store.getFolder(folderName);
+        return getStore().getFolder(folderName);
     }
 
     public boolean isConnected() {
-        return !broken && store != null && store.isConnected();
+        return !closed.get() && !broken && store.isConnected();
     }
+
+    // Only the pool may access the transport after the logical lease closes.
+    Store storeForRelease() { return store; }
+
+    boolean isReusable() { return !broken && store.isConnected(); }
 
     /**
      * Đánh dấu kết nối đã gặp lỗi mạng để không trả lại vào pool.
@@ -66,12 +72,10 @@ public class ImapConnection implements AutoCloseable {
     void forceCloseStore() {
         if (store != null) {
             try {
-                if (store.isConnected()) {
-                    store.close();
-                }
+                store.close();
                 log.debug("Đã đóng vật lý kết nối IMAP cho: {}", maskedEmail);
             } catch (Exception e) {
-                log.debug("Nuốt lỗi khi đóng IMAP Store cho {}: {}", maskedEmail, e.getMessage());
+                log.debug("Nuốt lỗi khi đóng IMAP Store cho {}: {}", maskedEmail, e.getClass().getSimpleName());
             }
         }
     }
@@ -86,7 +90,7 @@ public class ImapConnection implements AutoCloseable {
                 releaseCallback.accept(this);
                 return;
             } catch (Exception e) {
-                log.debug("Lỗi trả IMAP Store về pool cho {}: {}", maskedEmail, e.getMessage());
+                log.debug("Lỗi trả IMAP Store về pool cho {}: {}", maskedEmail, e.getClass().getSimpleName());
             }
         }
         forceCloseStore();

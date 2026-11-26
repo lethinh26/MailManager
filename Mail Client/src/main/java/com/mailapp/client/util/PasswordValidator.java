@@ -25,7 +25,9 @@ public class PasswordValidator {
     }
 
     public static boolean meetsPolicy(String password) {
-        if (password == null || password.length() < 8) {
+        if (password == null || password.length() < 8
+                || password.length() > 72
+                || password.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 72) {
             return false;
         }
         boolean hasLetter = password.matches(".*[a-zA-Z].*");

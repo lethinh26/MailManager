@@ -13,10 +13,12 @@ import java.time.LocalDateTime;
 import java.util.Optional;
 
 @Repository
-public interface UserRepository extends JpaRepository<User, Long> {
-    Optional<User> findByUsername(String username);
+public interface UserRepository extends JpaRepository<User, Long>, UserLockRepository {
+    @Query("SELECT u FROM User u WHERE LOWER(u.username) = LOWER(:username)")
+    Optional<User> findByUsername(@Param("username") String username);
     Optional<User> findByEmailIgnoreCase(String email);
-    boolean existsByUsername(String username);
+    @Query("SELECT CASE WHEN COUNT(u) > 0 THEN true ELSE false END FROM User u WHERE LOWER(u.username) = LOWER(:username)")
+    boolean existsByUsername(@Param("username") String username);
     boolean existsByEmailIgnoreCase(String email);
     boolean existsByRole(Role role);
 
@@ -25,6 +27,16 @@ public interface UserRepository extends JpaRepository<User, Long> {
     long countByEnabledTrue();
     long countByEnabledFalse();
     long countByCreatedAtAfter(LocalDateTime since);
+
+    // Scalar locking read deliberately bypasses any stale authenticated User in the persistence context.
+    @Query(value = "SELECT id FROM users WHERE role = 'ADMIN' AND enabled = true ORDER BY id FOR UPDATE", nativeQuery = true)
+    java.util.List<Long> lockActiveAdminIds();
+
+    // Update only profile metadata; do not merge an authenticated User snapshot.
+    @org.springframework.data.jpa.repository.Modifying(clearAutomatically = true)
+    @org.springframework.transaction.annotation.Transactional
+    @Query("UPDATE User u SET u.fullName = :name, u.updatedAt = :now WHERE u.id = :id AND (u.fullName IS NULL OR TRIM(u.fullName) = '')")
+    int fillMissingFullName(@Param("id") Long id, @Param("name") String name, @Param("now") LocalDateTime now);
 
     @Query("""
             SELECT u FROM User u

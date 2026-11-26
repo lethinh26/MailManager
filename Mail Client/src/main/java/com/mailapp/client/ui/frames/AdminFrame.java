@@ -12,6 +12,7 @@ import com.mailapp.client.ui.theme.AvatarUtil;
 import com.mailapp.client.ui.theme.Theme;
 import com.mailapp.client.util.ClientConfig;
 import com.mailapp.client.util.ClientSafetyUtil;
+import com.mailapp.client.util.ComposeValidation;
 import com.mailapp.client.util.SessionStore;
 
 import javax.swing.*;
@@ -35,6 +36,12 @@ public class AdminFrame extends JFrame {
     private final ApiClient apiClient;
     private final Runnable onSessionExpired;
     private final boolean autoLoad;
+    private Runnable onSettingsChanged;
+    private Runnable onPermissionLost;
+    private volatile boolean disposed;
+    private final long windowGeneration;
+    private boolean exportingLogs;
+    private boolean userMutationBusy;
 
     private JTabbedPane tabbedPane;
     private JLabel statusLabel;
@@ -56,7 +63,10 @@ public class AdminFrame extends JFrame {
     private JButton detailUserBtn;
     private int userPage = 0;
     private int userTotalPages = 1;
-    private long currentTotalUsers = 0;
+    private long usersRequestGeneration;
+    private boolean usersLoading;
+    private UserSearchCriteria activeUserCriteria;
+    private record UserSearchCriteria(String query, String role, Boolean enabled, String sortBy, String sortDir) {}
 
     // Tab 2: Cấu hình hệ thống
     private JLabel regUserCountLabel;
@@ -66,10 +76,15 @@ public class AdminFrame extends JFrame {
     private JCheckBox chkAllowSendMail;
     private JCheckBox chkMaintenanceMode;
     private JSpinner spnMaxGmail;
+    private boolean legacyUnlimitedQuota;
     private JSpinner spnMaxAttachMb;
     private JSpinner spnMailPageSize;
     private JSpinner spnLoginMaxFailed;
     private JLabel settingsUpdatedMetaLabel;
+    private JButton settingsReloadBtn;
+    private JButton settingsSaveBtn;
+    private boolean settingsLoaded;
+    private boolean settingsBusy;
     private boolean lastMaintenanceValue = false;
 
     // Tab 3: Thống kê
@@ -84,6 +99,7 @@ public class AdminFrame extends JFrame {
 
     // Tab 4: Nhật ký
     private JTextField logUserField;
+    private JTextField logUserIdField;
     private JComboBox<String> logActionCombo;
     private JTextField logFromField;
     private JTextField logToField;
@@ -94,6 +110,10 @@ public class AdminFrame extends JFrame {
     private JButton logNextBtn;
     private int logPage = 0;
     private int logTotalPages = 1;
+    private long logRequestGeneration;
+    private long statsRequestGeneration;
+    private LogSearchCriteria activeLogCriteria;
+    private record LogSearchCriteria(Long userId, String username, String action, String from, String to) {}
 
     public AdminFrame(ApiClient apiClient, Runnable onSessionExpired) {
         this(apiClient, onSessionExpired, true);
@@ -104,6 +124,7 @@ public class AdminFrame extends JFrame {
         this.apiClient = apiClient;
         this.onSessionExpired = onSessionExpired;
         this.autoLoad = autoLoad;
+        this.windowGeneration = SessionStore.getInstance().getGeneration();
 
         setIconImages(AppIcons.getWindowIcons());
         setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
@@ -127,6 +148,14 @@ public class AdminFrame extends JFrame {
             loadStats();
             loadLogs();
         }
+    }
+
+    public void setOnSettingsChanged(Runnable callback) {
+        onSettingsChanged = callback;
+    }
+
+    public void setOnPermissionLost(Runnable callback) {
+        onPermissionLost = callback;
     }
 
     private void initUI() {
@@ -329,7 +358,7 @@ public class AdminFrame extends JFrame {
         chkMaintenanceMode = styledCheck("MAINTENANCE_MODE — Chế độ bảo trì hệ thống (CHỈ Admin đăng nhập được)");
         chkMaintenanceMode.setForeground(Theme.danger());
 
-        spnMaxGmail = new JSpinner(new SpinnerNumberModel(5, 0, 50, 1));
+        spnMaxGmail = new JSpinner(new SpinnerNumberModel(5, 1, 50, 1));
         spnMaxAttachMb = new JSpinner(new SpinnerNumberModel(25, 1, 50, 1));
         spnMailPageSize = new JSpinner(new SpinnerNumberModel(30, 10, 100, 5));
         spnLoginMaxFailed = new JSpinner(new SpinnerNumberModel(5, 3, 20, 1));
@@ -344,7 +373,7 @@ public class AdminFrame extends JFrame {
         g.gridy = row++; card.add(chkMaintenanceMode, g);
 
         g.gridwidth = 1;
-        addSpinnerRow(card, g, row++, "MAX_GMAIL_PER_USER (0 = không giới hạn, tối đa 50):", spnMaxGmail);
+        addSpinnerRow(card, g, row++, "MAX_GMAIL_PER_USER (1 – 50; giữ 0 cũ nếu có):", spnMaxGmail);
         addSpinnerRow(card, g, row++, "MAX_ATTACHMENT_SIZE_MB (1 – 50 MB):", spnMaxAttachMb);
         addSpinnerRow(card, g, row++, "MAIL_PAGE_SIZE (10 – 100 thư/trang):", spnMailPageSize);
         addSpinnerRow(card, g, row++, "LOGIN_MAX_FAILED_ATTEMPTS (3 – 20 lần):", spnLoginMaxFailed);
@@ -357,12 +386,13 @@ public class AdminFrame extends JFrame {
 
         JPanel footer = new JPanel(new FlowLayout(FlowLayout.RIGHT, Theme.SP_2, 0));
         footer.setOpaque(false);
-        JButton reloadBtn = Theme.secondaryButton("Tải lại", AppIcons.vectorIcon(AppIcons.Glyph.REFRESH, 14, Theme.textPrimary()));
-        reloadBtn.addActionListener(e -> loadSettings());
-        JButton saveBtn = Theme.primaryButton("Lưu cấu hình", null);
-        saveBtn.addActionListener(e -> saveSettings());
-        footer.add(reloadBtn);
-        footer.add(saveBtn);
+        settingsReloadBtn = Theme.secondaryButton("Tải lại", AppIcons.vectorIcon(AppIcons.Glyph.REFRESH, 14, Theme.textPrimary()));
+        settingsReloadBtn.addActionListener(e -> loadSettings());
+        settingsSaveBtn = Theme.primaryButton("Lưu cấu hình", null);
+        settingsSaveBtn.addActionListener(e -> saveSettings());
+        footer.add(settingsReloadBtn);
+        footer.add(settingsSaveBtn);
+        updateSettingsControls();
 
         outer.add(new JScrollPane(card), BorderLayout.CENTER);
         outer.add(footer, BorderLayout.SOUTH);
@@ -393,14 +423,14 @@ public class AdminFrame extends JFrame {
         kpiActiveLockedVal = new JLabel("0 / 0");
         kpiAdminsVal = new JLabel("0");
         kpiGmailVal = new JLabel("0");
-        kpiRegVal = new JLabel("0 / 0");
+        kpiRegVal = new JLabel("0 / 0 / 0");
         kpiFailedLoginVal = new JLabel("0");
 
         kpiGrid.add(buildKpiCard("Tổng người dùng", kpiTotalUsersVal, Theme.primary()));
         kpiGrid.add(buildKpiCard("Hoạt động / Đang khóa", kpiActiveLockedVal, Theme.success()));
         kpiGrid.add(buildKpiCard("Quản trị viên (ADMIN)", kpiAdminsVal, Theme.warning()));
         kpiGrid.add(buildKpiCard("Gmail liên kết (OAuth2 / AppPass)", kpiGmailVal, Theme.primary()));
-        kpiGrid.add(buildKpiCard("Đăng ký mới (7 ngày / 30 ngày)", kpiRegVal, Theme.success()));
+        kpiGrid.add(buildKpiCard("Đăng ký mới (hôm nay / 7 ngày / 30 ngày)", kpiRegVal, Theme.success()));
         kpiGrid.add(buildKpiCard("Đăng nhập thất bại (24h)", kpiFailedLoginVal, Theme.danger()));
 
         // 2 Java2D Charts
@@ -447,17 +477,23 @@ public class AdminFrame extends JFrame {
         panel.setBackground(Theme.bgApp());
         panel.setBorder(new EmptyBorder(Theme.SP_3, Theme.SP_3, Theme.SP_3, Theme.SP_3));
 
-        JPanel filters = new JPanel(new FlowLayout(FlowLayout.LEFT, Theme.SP_2, 4));
+        JPanel filters = Theme.createWrapPanel(Theme.SP_2, 4);
         filters.setOpaque(false);
 
         logUserField = new JTextField(12);
         Theme.styleTextField(logUserField);
         logUserField.setToolTipText("Lọc theo username");
+        logUserIdField = new JTextField(6);
+        Theme.styleTextField(logUserIdField);
+        logUserIdField.setToolTipText("ID người dùng (số nguyên dương)");
 
         logActionCombo = new JComboBox<>(new String[]{
-                "", "LOGIN", "LOGIN_FAILED", "REGISTER", "CHANGE_PASSWORD",
-                "LINK_GMAIL", "LINK_GMAIL_DENIED_SCOPE", "UNLINK_GMAIL",
-                "SEND_MAIL", "DELETE_MAIL",
+                "", "LOGIN", "LOGIN_FAILED", "REGISTER", "CHANGE_PASSWORD", "CHANGE_PASSWORD_FAILED",
+                "GOOGLE_LOGIN_NEW", "GOOGLE_LOGIN_MERGED", "GOOGLE_LOGIN_FAILED",
+                "LINK_GMAIL", "LINK_GMAIL_DENIED_SCOPE", "OAUTH2_CALLBACK", "UNLINK_GMAIL",
+                "ADD_GMAIL_METHOD", "UPDATE_GMAIL_METHOD", "REMOVE_GMAIL_METHOD", "CHANGE_PREFERRED_METHOD",
+                "REVOKE_TOKEN_FAILED", "FALLBACK_TO_APP_PASSWORD",
+                "SEND_MAIL", "MAIL_DELETE", "MAIL_FLAG_CHANGE",
                 "ADMIN_CREATE_USER", "ADMIN_LOCK_USER", "ADMIN_UNLOCK_USER",
                 "ADMIN_CHANGE_ROLE", "ADMIN_RESET_PASSWORD", "ADMIN_DELETE_USER", "ADMIN_CHANGE_SETTING"
         });
@@ -477,6 +513,7 @@ public class AdminFrame extends JFrame {
         JButton clearBtn = Theme.secondaryButton("Xóa lọc", null);
         clearBtn.addActionListener(e -> {
             logUserField.setText("");
+            logUserIdField.setText("");
             logActionCombo.setSelectedItem("");
             logFromField.setText("");
             logToField.setText("");
@@ -489,6 +526,8 @@ public class AdminFrame extends JFrame {
 
         filters.add(new JLabel("User:"));
         filters.add(logUserField);
+        filters.add(new JLabel("ID:"));
+        filters.add(logUserIdField);
         filters.add(new JLabel("Hành động:"));
         filters.add(logActionCombo);
         filters.add(new JLabel("Từ:"));
@@ -539,6 +578,7 @@ public class AdminFrame extends JFrame {
     // ==================== SWINGWORKER DATA OPERATIONS ====================
 
     public void loadUsers() {
+        if (!currentWindow()) return;
         String q = userSearchField.getText().trim();
         String roleSel = (String) userRoleFilter.getSelectedItem();
         String role = ("ADMIN".equals(roleSel) || "USER".equals(roleSel)) ? roleSel : null;
@@ -547,18 +587,38 @@ public class AdminFrame extends JFrame {
         int sortIdx = userSortCombo.getSelectedIndex();
         String sortBy = sortIdx == 2 ? "username" : "createdAt";
         String sortDir = sortIdx == 0 ? "desc" : "asc";
+        UserSearchCriteria criteria = new UserSearchCriteria(q, role, enabled, sortBy, sortDir);
+        if (!criteria.equals(activeUserCriteria)) userPage = 0;
+        activeUserCriteria = criteria;
+        int requestedPage = userPage;
+        long generation = ++usersRequestGeneration;
+        usersLoading = true;
+        userTable.clearSelection();
+        userPrevBtn.setEnabled(false);
+        userNextBtn.setEnabled(false);
+        updateSelectedUserButtons();
 
         setStatus("Đang tải danh sách người dùng...");
         new SwingWorker<AdminPageResponse<AdminUserSummary>, Void>() {
             @Override protected AdminPageResponse<AdminUserSummary> doInBackground() throws Exception {
-                return apiClient.adminListUsers(q, role, enabled, userPage, 20, sortBy, sortDir);
+                requireCurrentWindow();
+                return apiClient.adminListUsers(q, role, enabled, requestedPage, 20, sortBy, sortDir);
             }
             @Override protected void done() {
+                if (!currentWindow() || generation != usersRequestGeneration) return;
+                usersLoading = false;
                 try {
                     AdminPageResponse<AdminUserSummary> page = get();
+                    if (page.page() > 0 && page.page() >= Math.max(1, page.totalPages())) {
+                        userPage = Math.max(0, page.totalPages() - 1);
+                        loadUsers();
+                        return;
+                    }
                     applyUsersPage(page);
                     setStatus("Đã tải " + page.content().size() + " / " + page.totalElements() + " người dùng.");
                 } catch (Exception ex) {
+                    userTableModel.setRows(List.of());
+                    updateSelectedUserButtons();
                     handleAdminError(ex, "Không tải được danh sách người dùng");
                 }
             }
@@ -569,33 +629,35 @@ public class AdminFrame extends JFrame {
         userTableModel.setRows(page.content() != null ? page.content() : List.of());
         userPage = page.page();
         userTotalPages = Math.max(1, page.totalPages());
-        currentTotalUsers = page.totalElements();
         userPageLabel.setText("Trang " + (userPage + 1) + " / " + userTotalPages + " (" + page.totalElements() + " người dùng)");
         userPrevBtn.setEnabled(userPage > 0);
         userNextBtn.setEnabled(userPage + 1 < userTotalPages);
-        regUserCountLabel.setText("Tổng số người dùng hiện tại: " + currentTotalUsers);
         updateSelectedUserButtons();
     }
 
     private void updateSelectedUserButtons() {
         AdminUserSummary sel = getSelectedUser();
         boolean hasSel = sel != null;
+        UserDto current = SessionStore.getInstance().getCurrentUser();
+        boolean self = hasSel && current != null && AdminViewModel.isSelfAction(current.id(), sel.id());
         detailUserBtn.setEnabled(hasSel);
-        lockUnlockBtn.setEnabled(hasSel);
-        roleBtn.setEnabled(hasSel);
+        lockUnlockBtn.setEnabled(hasSel && (!self || !sel.enabled()));
+        roleBtn.setEnabled(hasSel && (!self || !"ADMIN".equalsIgnoreCase(sel.role())));
         resetPwBtn.setEnabled(hasSel);
-        deleteUserBtn.setEnabled(hasSel);
+        deleteUserBtn.setEnabled(hasSel && !self);
         if (hasSel) {
             lockUnlockBtn.setText(sel.enabled() ? "Khóa tài khoản" : "Mở khóa tài khoản");
         }
     }
 
     private AdminUserSummary getSelectedUser() {
+        if (!currentWindow() || usersLoading || userMutationBusy) return null;
         int r = userTable.getSelectedRow();
-        return r >= 0 ? userTableModel.getRow(r) : null;
+        return r >= 0 ? userTableModel.getRow(userTable.convertRowIndexToModel(r)) : null;
     }
 
     private void openCreateUserDialog() {
+        if (!currentAdminSession() || userMutationBusy) return;
         JDialog dlg = new JDialog(this, "Tạo tài khoản mới — Admin", true);
         dlg.setIconImages(AppIcons.getWindowIcons());
         dlg.setSize(450, 340);
@@ -636,26 +698,49 @@ public class AdminFrame extends JFrame {
         cancel.addActionListener(e -> dlg.dispose());
         JButton create = Theme.primaryButton("Tạo tài khoản", null);
         create.addActionListener(e -> {
+            if (!uField.getText().trim().matches("[a-zA-Z0-9_]{3,64}") || fnField.getText().isBlank()
+                    || fnField.getText().trim().length() > 255 || emField.getText().trim().length() > 255
+                    || !ComposeValidation.isEmail(emField.getText().trim())) {
+                JOptionPane.showMessageDialog(dlg, "Tên đăng nhập phải có 3–64 ký tự hợp lệ, họ tên và email là bắt buộc.",
+                        "Dữ liệu chưa hợp lệ", JOptionPane.WARNING_MESSAGE);
+                return;
+            }
             AdminCreateUserRequest req = new AdminCreateUserRequest(
                     uField.getText().trim(), fnField.getText().trim(), emField.getText().trim(),
                     (String) rCombo.getSelectedItem(), null);
+            if (!beginUserMutation(null)) return;
             create.setEnabled(false);
+            cancel.setEnabled(false);
+            dlg.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
             new SwingWorker<AdminCreateUserResponse, Void>() {
                 @Override protected AdminCreateUserResponse doInBackground() throws Exception {
+                    requireCurrentAdminSession();
                     return apiClient.adminCreateUser(req);
                 }
                 @Override protected void done() {
-                    create.setEnabled(true);
+                    if (!currentAdminSession()) {
+                        dlg.dispose();
+                        finishUserMutation();
+                        return;
+                    }
                     try {
                         AdminCreateUserResponse created = get();
                         dlg.dispose();
                         loadUsers();
+                        loadStats();
                         if (created.temporaryPassword() != null) {
                             showOneTimePasswordDialog(created.username(), created.temporaryPassword(),
                                     "Tạo tài khoản thành công!");
                         }
                     } catch (Exception ex) {
                         handleAdminError(ex, "Không tạo được tài khoản");
+                    } finally {
+                        finishUserMutation();
+                        if (currentAdminSession() && dlg.isDisplayable()) {
+                            create.setEnabled(true);
+                            cancel.setEnabled(true);
+                            dlg.setDefaultCloseOperation(JDialog.DISPOSE_ON_CLOSE);
+                        }
                     }
                 }
             }.execute();
@@ -671,14 +756,19 @@ public class AdminFrame extends JFrame {
 
     private void showSelectedUserDetail() {
         AdminUserSummary sel = getSelectedUser();
-        if (sel == null) return;
+        if (sel == null || !currentAdminSession()) return;
+        long generation = usersRequestGeneration;
         new SwingWorker<AdminUserDetail, Void>() {
             @Override protected AdminUserDetail doInBackground() throws Exception {
+                requireCurrentAdminSession();
                 return apiClient.adminGetUserDetail(sel.id());
             }
             @Override protected void done() {
+                if (!currentAdminSession()) return;
                 try {
                     AdminUserDetail d = get();
+                    if (generation != usersRequestGeneration || !Objects.equals(sel, getSelectedUser())
+                            || d == null || !Objects.equals(d.id(), sel.id())) return;
                     StringBuilder sb = new StringBuilder();
                     sb.append("ID: ").append(d.id()).append("\n")
                       .append("Tên đăng nhập: ").append(d.username()).append("\n")
@@ -718,12 +808,15 @@ public class AdminFrame extends JFrame {
                 ? "Khóa tài khoản '" + sel.username() + "'? Phiên JWT hiện hành của người này sẽ bị vô hiệu ngay lập tức."
                 : "Mở khóa tài khoản '" + sel.username() + "'?";
         if (JOptionPane.showConfirmDialog(this, msg, "Xác nhận", JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION) return;
+        if (!beginUserMutation(sel)) return;
 
         new SwingWorker<AdminUserSummary, Void>() {
             @Override protected AdminUserSummary doInBackground() throws Exception {
+                requireCurrentAdminSession();
                 return willLock ? apiClient.adminLockUser(sel.id()) : apiClient.adminUnlockUser(sel.id());
             }
             @Override protected void done() {
+                if (!currentAdminSession()) { finishUserMutation(); return; }
                 try {
                     get();
                     loadUsers();
@@ -731,6 +824,8 @@ public class AdminFrame extends JFrame {
                     setStatus((willLock ? "Đã khóa " : "Đã mở khóa ") + sel.username());
                 } catch (Exception ex) {
                     handleAdminError(ex, "Thao tác khóa/mở khóa thất bại");
+                } finally {
+                    finishUserMutation();
                 }
             }
         }.execute();
@@ -749,12 +844,15 @@ public class AdminFrame extends JFrame {
         if (JOptionPane.showConfirmDialog(this,
                 "Đổi vai trò của '" + sel.username() + "' từ " + sel.role() + " sang " + newRole + "?",
                 "Đổi vai trò", JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION) return;
+        if (!beginUserMutation(sel)) return;
 
         new SwingWorker<AdminUserSummary, Void>() {
             @Override protected AdminUserSummary doInBackground() throws Exception {
+                requireCurrentAdminSession();
                 return apiClient.adminUpdateUserRole(sel.id(), newRole);
             }
             @Override protected void done() {
+                if (!currentAdminSession()) { finishUserMutation(); return; }
                 try {
                     get();
                     loadUsers();
@@ -762,6 +860,8 @@ public class AdminFrame extends JFrame {
                     setStatus("Đã đổi vai trò " + sel.username() + " -> " + newRole);
                 } catch (Exception ex) {
                     handleAdminError(ex, "Không đổi được vai trò");
+                } finally {
+                    finishUserMutation();
                 }
             }
         }.execute();
@@ -773,24 +873,30 @@ public class AdminFrame extends JFrame {
         if (JOptionPane.showConfirmDialog(this,
                 "Đặt lại mật khẩu cho '" + sel.username() + "'?\nHệ thống sẽ sinh mật khẩu tạm ngẫu nhiên (chỉ hiển thị một lần) và buộc đổi mật khẩu khi đăng nhập.",
                 "Đặt lại mật khẩu", JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION) return;
+        if (!beginUserMutation(sel)) return;
 
         new SwingWorker<AdminResetPasswordResponse, Void>() {
             @Override protected AdminResetPasswordResponse doInBackground() throws Exception {
+                requireCurrentAdminSession();
                 return apiClient.adminResetPassword(sel.id());
             }
             @Override protected void done() {
+                if (!currentAdminSession()) { finishUserMutation(); return; }
                 try {
                     AdminResetPasswordResponse res = get();
                     loadUsers();
                     showOneTimePasswordDialog(res.username(), res.temporaryPassword(), "Đặt lại mật khẩu thành công");
                 } catch (Exception ex) {
                     handleAdminError(ex, "Đặt lại mật khẩu thất bại");
+                } finally {
+                    finishUserMutation();
                 }
             }
         }.execute();
     }
 
     private void showOneTimePasswordDialog(String username, String tempPassword, String title) {
+        if (!currentAdminSession() || tempPassword == null || tempPassword.isBlank()) return;
         JDialog dlg = new JDialog(this, title, true);
         dlg.setIconImages(AppIcons.getWindowIcons());
         dlg.setSize(480, 230);
@@ -815,6 +921,7 @@ public class AdminFrame extends JFrame {
         btns.setOpaque(false);
         JButton copyBtn = Theme.primaryButton("Sao chép mật khẩu", null);
         copyBtn.addActionListener(e -> {
+            if (!currentAdminSession()) { dlg.dispose(); return; }
             Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(tempPassword), null);
             copyBtn.setText("Đã sao chép!");
         });
@@ -827,7 +934,12 @@ public class AdminFrame extends JFrame {
         root.add(pwField, BorderLayout.CENTER);
         root.add(btns, BorderLayout.SOUTH);
         dlg.setContentPane(root);
-        dlg.setVisible(true);
+        try {
+            dlg.setVisible(true);
+        } finally {
+            pwField.setText("");
+            dlg.dispose();
+        }
     }
 
     private void deleteSelectedUser() {
@@ -849,13 +961,16 @@ public class AdminFrame extends JFrame {
                     "Hủy xóa", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
+        if (!beginUserMutation(sel)) return;
 
         new SwingWorker<Void, Void>() {
             @Override protected Void doInBackground() throws Exception {
+                requireCurrentAdminSession();
                 apiClient.adminDeleteUser(sel.id());
                 return null;
             }
             @Override protected void done() {
+                if (!currentAdminSession()) { finishUserMutation(); return; }
                 try {
                     get();
                     loadUsers();
@@ -863,21 +978,33 @@ public class AdminFrame extends JFrame {
                     setStatus("Đã xóa tài khoản " + sel.username());
                 } catch (Exception ex) {
                     handleAdminError(ex, "Xóa người dùng thất bại");
+                } finally {
+                    finishUserMutation();
                 }
             }
         }.execute();
     }
 
     public void loadSettings() {
+        if (!currentWindow() || settingsBusy) return;
+        settingsBusy = true;
+        updateSettingsControls();
         new SwingWorker<List<AdminSettingItem>, Void>() {
             @Override protected List<AdminSettingItem> doInBackground() throws Exception {
+                requireCurrentWindow();
                 return apiClient.adminGetSettings();
             }
             @Override protected void done() {
+                settingsBusy = false;
+                if (!currentWindow()) return;
                 try {
                     applySettings(get());
+                    settingsLoaded = true;
                 } catch (Exception ex) {
+                    settingsLoaded = false;
                     handleAdminError(ex, "Không tải được cấu hình hệ thống");
+                } finally {
+                    updateSettingsControls();
                 }
             }
         }.execute();
@@ -895,7 +1022,14 @@ public class AdminFrame extends JFrame {
                     lastMaintenanceValue = Boolean.parseBoolean(it.value());
                     chkMaintenanceMode.setSelected(lastMaintenanceValue);
                 }
-                case "MAX_GMAIL_PER_USER" -> setSpinnerSafe(spnMaxGmail, it.value());
+                case "MAX_GMAIL_PER_USER" -> {
+                    int value = Integer.parseInt(it.value());
+                    legacyUnlimitedQuota = value == 0 && (it.minValue() == null || it.minValue() == 0);
+                    spnMaxGmail.setModel(new SpinnerNumberModel(value, legacyUnlimitedQuota ? 0 : 1, 50, 1));
+                    spnMaxGmail.setToolTipText(legacyUnlimitedQuota
+                            ? "0 cũ là không giới hạn. Sau khi lưu số dương, không thể quay lại 0."
+                            : "Giới hạn số hộp thư từ 1 đến 50.");
+                }
                 case "MAX_ATTACHMENT_SIZE_MB" -> setSpinnerSafe(spnMaxAttachMb, it.value());
                 case "MAIL_PAGE_SIZE" -> setSpinnerSafe(spnMailPageSize, it.value());
                 case "LOGIN_MAX_FAILED_ATTEMPTS" -> setSpinnerSafe(spnLoginMaxFailed, it.value());
@@ -908,7 +1042,26 @@ public class AdminFrame extends JFrame {
         settingsUpdatedMetaLabel.setText(lastMeta);
     }
 
+    private void updateSettingsControls() {
+        boolean editable = settingsLoaded && !settingsBusy && !disposed;
+        for (JComponent c : List.of(chkAllowRegistration, chkAllowOAuth2, chkAllowAppPassword,
+                chkAllowSendMail, chkMaintenanceMode, spnMaxGmail, spnMaxAttachMb,
+                spnMailPageSize, spnLoginMaxFailed, settingsSaveBtn)) {
+            c.setEnabled(editable);
+        }
+        settingsReloadBtn.setEnabled(!settingsBusy && !disposed);
+    }
+
     private void saveSettings() {
+        if (!currentAdminSession() || !settingsLoaded || settingsBusy) return;
+        try {
+            for (JSpinner spinner : List.of(spnMaxGmail, spnMaxAttachMb, spnMailPageSize, spnLoginMaxFailed)) {
+                spinner.commitEdit();
+            }
+        } catch (java.text.ParseException ex) {
+            JOptionPane.showMessageDialog(this, "Giá trị số không hợp lệ.", "Cấu hình không hợp lệ", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
         Map<String, String> map = new LinkedHashMap<>();
         map.put("ALLOW_REGISTRATION", String.valueOf(chkAllowRegistration.isSelected()));
         map.put("ALLOW_OAUTH2_LINK", String.valueOf(chkAllowOAuth2.isSelected()));
@@ -920,7 +1073,7 @@ public class AdminFrame extends JFrame {
         map.put("MAIL_PAGE_SIZE", String.valueOf(spnMailPageSize.getValue()));
         map.put("LOGIN_MAX_FAILED_ATTEMPTS", String.valueOf(spnLoginMaxFailed.getValue()));
 
-        String err = AdminViewModel.validateSettingsUpdate(map);
+        String err = AdminViewModel.validateSettingsUpdate(map, legacyUnlimitedQuota);
         if (err != null) {
             JOptionPane.showMessageDialog(this, err, "Cấu hình không hợp lệ", JOptionPane.WARNING_MESSAGE);
             return;
@@ -933,30 +1086,44 @@ public class AdminFrame extends JFrame {
             if (ok != JOptionPane.YES_OPTION) return;
         }
 
+        if (!currentAdminSession() || !settingsLoaded || settingsBusy) return;
+
+        settingsBusy = true;
+        updateSettingsControls();
         setStatus("Đang lưu cấu hình hệ thống...");
         new SwingWorker<List<AdminSettingItem>, Void>() {
             @Override protected List<AdminSettingItem> doInBackground() throws Exception {
+                requireCurrentAdminSession();
                 return apiClient.adminUpdateSettings(map);
             }
             @Override protected void done() {
+                settingsBusy = false;
+                if (!currentAdminSession()) return;
                 try {
                     applySettings(get());
+                    if (onSettingsChanged != null) onSettingsChanged.run();
                     setStatus("Đã lưu cấu hình hệ thống (có hiệu lực ngay).");
                     JOptionPane.showMessageDialog(AdminFrame.this, "Đã lưu cấu hình thành công!",
                             "Thành công", JOptionPane.INFORMATION_MESSAGE);
                 } catch (Exception ex) {
                     handleAdminError(ex, "Lưu cấu hình thất bại");
+                } finally {
+                    updateSettingsControls();
                 }
             }
         }.execute();
     }
 
     public void loadStats() {
+        if (!currentWindow()) return;
+        long generation = ++statsRequestGeneration;
         new SwingWorker<AdminStatsResponse, Void>() {
             @Override protected AdminStatsResponse doInBackground() throws Exception {
+                requireCurrentWindow();
                 return apiClient.adminGetStats();
             }
             @Override protected void done() {
+                if (!currentWindow() || generation != statsRequestGeneration) return;
                 try {
                     applyStats(get());
                 } catch (Exception ex) {
@@ -971,7 +1138,7 @@ public class AdminFrame extends JFrame {
         kpiActiveLockedVal.setText(st.activeUsers() + " / " + st.lockedUsers());
         kpiAdminsVal.setText(String.valueOf(st.totalAdmins()));
         kpiGmailVal.setText(st.totalGmailAccounts() + " (" + st.gmailByOAuth2() + " / " + st.gmailByAppPassword() + ")");
-        kpiRegVal.setText(st.registrationsLast7Days() + " / " + st.registrationsLast30Days());
+        kpiRegVal.setText(st.registrationsToday() + " / " + st.registrationsLast7Days() + " / " + st.registrationsLast30Days());
         kpiFailedLoginVal.setText(String.valueOf(st.failedLoginsLast24h()));
         sentMailChart.setData(st.mailsSentLast7DaysByDay());
         breakdownChart.setStats(st);
@@ -979,24 +1146,59 @@ public class AdminFrame extends JFrame {
     }
 
     public void loadLogs() {
+        if (!currentWindow()) return;
+        Long userId;
+        try {
+            userId = parseLogUserId();
+        } catch (IllegalArgumentException ex) {
+            JOptionPane.showMessageDialog(this, ex.getMessage(), "Bộ lọc nhật ký", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
         String uname = logUserField.getText().trim();
         Object actObj = logActionCombo.getSelectedItem();
         String action = actObj != null ? actObj.toString().trim() : "";
         String from = logFromField.getText().trim();
         String to = logToField.getText().trim();
+        LogSearchCriteria criteria = new LogSearchCriteria(userId, uname, action, from, to);
+        if (!criteria.equals(activeLogCriteria)) logPage = 0;
+        activeLogCriteria = criteria;
+        int requestedPage = logPage;
+        long generation = ++logRequestGeneration;
+        logPrevBtn.setEnabled(false);
+        logNextBtn.setEnabled(false);
 
         new SwingWorker<AdminPageResponse<AdminAuditLogItem>, Void>() {
             @Override protected AdminPageResponse<AdminAuditLogItem> doInBackground() throws Exception {
-                return apiClient.adminSearchLogs(null, uname, action, from, to, logPage, 25);
+                requireCurrentWindow();
+                return apiClient.adminSearchLogs(userId, uname, action, from, to, requestedPage, 25);
             }
             @Override protected void done() {
+                if (!currentWindow() || generation != logRequestGeneration) return;
                 try {
-                    applyLogsPage(get());
+                    AdminPageResponse<AdminAuditLogItem> page = get();
+                    if (page.page() > 0 && page.page() >= Math.max(1, page.totalPages())) {
+                        logPage = Math.max(0, page.totalPages() - 1);
+                        loadLogs();
+                        return;
+                    }
+                    applyLogsPage(page);
                 } catch (Exception ex) {
+                    logTableModel.setRows(List.of());
+                    logPageLabel.setText("Không tải được nhật ký");
                     handleAdminError(ex, "Không tải được nhật ký hệ thống");
                 }
             }
         }.execute();
+    }
+
+    private Long parseLogUserId() {
+        String text = logUserIdField.getText().trim();
+        if (text.isEmpty()) return null;
+        try {
+            long id = Long.parseLong(text);
+            if (id > 0) return id;
+        } catch (NumberFormatException ignored) {}
+        throw new IllegalArgumentException("ID người dùng phải là số nguyên dương.");
     }
 
     private void applyLogsPage(AdminPageResponse<AdminAuditLogItem> page) {
@@ -1009,23 +1211,48 @@ public class AdminFrame extends JFrame {
     }
 
     private void exportLogsCsv() {
-        JFileChooser fc = new JFileChooser(new File(ClientConfig.getInstance().getDownloadDir()));
-        fc.setSelectedFile(new File("audit-logs.csv"));
-        if (fc.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
-        File outFile = fc.getSelectedFile();
-
+        if (!currentAdminExportSession() || exportingLogs) return;
+        Long userId;
+        try {
+            userId = parseLogUserId();
+        } catch (IllegalArgumentException ex) {
+            JOptionPane.showMessageDialog(this, ex.getMessage(), "Bộ lọc nhật ký", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
         String uname = logUserField.getText().trim();
         Object actObj = logActionCombo.getSelectedItem();
         String action = actObj != null ? actObj.toString().trim() : "";
         String from = logFromField.getText().trim();
         String to = logToField.getText().trim();
+        File directory;
+        try {
+            directory = java.nio.file.Files.createDirectories(
+                    java.nio.file.Path.of(ClientConfig.getInstance().getDownloadDir()).toAbsolutePath().normalize()).toFile();
+        } catch (java.io.IOException | SecurityException | java.nio.file.InvalidPathException ex) {
+            handleAdminError(ex, "Không mở được thư mục xuất nhật ký");
+            return;
+        }
+        JFileChooser fc = new JFileChooser(directory);
+        fc.setSelectedFile(new File(directory, "audit-logs.csv"));
+        if (fc.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        if (!currentAdminExportSession() || exportingLogs) return;
+        File outFile = fc.getSelectedFile();
+        if (java.nio.file.Files.exists(outFile.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            JOptionPane.showMessageDialog(this, "Tệp CSV đã tồn tại. Hãy chọn tên khác.",
+                    "Xuất nhật ký", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        exportingLogs = true;
 
         setStatus("Đang xuất nhật ký CSV...");
         new SwingWorker<Long, Void>() {
             @Override protected Long doInBackground() throws Exception {
-                return apiClient.adminExportLogsCsvToFile(null, uname, action, from, to, outFile);
+                return apiClient.adminExportLogsCsvToFile(userId, uname, action, from, to, outFile,
+                        AdminFrame.this::currentAdminExportSession);
             }
             @Override protected void done() {
+                exportingLogs = false;
+                if (!currentAdminExportSession()) return;
                 try {
                     long bytes = get();
                     setStatus("Đã xuất CSV thành công (" + bytes + " bytes): " + outFile.getAbsolutePath());
@@ -1039,9 +1266,48 @@ public class AdminFrame extends JFrame {
         }.execute();
     }
 
+    private boolean currentWindow() {
+        return !disposed && SessionStore.getInstance().getGeneration() == windowGeneration;
+    }
+
+    private void requireCurrentWindow() throws InterruptedException {
+        if (!currentWindow()) throw new InterruptedException("Admin window no longer current");
+    }
+
+    private boolean currentAdminExportSession() {
+        return currentAdminSession();
+    }
+
+    private boolean currentAdminSession() {
+        SessionStore session = SessionStore.getInstance();
+        synchronized (session) {
+            UserDto user = session.getCurrentUser();
+            return !disposed && session.getGeneration() == windowGeneration
+                    && session.hasActiveSession() && user != null && "ADMIN".equalsIgnoreCase(user.role());
+        }
+    }
+
+    private void requireCurrentAdminSession() throws InterruptedException {
+        if (!currentAdminSession()) throw new InterruptedException("Admin session no longer current");
+    }
+
+    private boolean beginUserMutation(AdminUserSummary expected) {
+        if (!currentAdminSession() || userMutationBusy
+                || (expected != null && !Objects.equals(expected, getSelectedUser()))) return false;
+        userMutationBusy = true;
+        updateSelectedUserButtons();
+        return true;
+    }
+
+    private void finishUserMutation() {
+        userMutationBusy = false;
+        if (currentWindow()) updateSelectedUserButtons();
+    }
+
     // ==================== ERROR HANDLING (401 & 403) ====================
 
     private void handleAdminError(Exception ex, String prefix) {
+        if (!currentWindow()) return;
         Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
         if (cause instanceof ApiException apiEx) {
             if (apiEx.getStatusCode() == 401) {
@@ -1054,9 +1320,10 @@ public class AdminFrame extends JFrame {
                         "Tài khoản của bạn không còn quyền Quản trị viên (403 FORBIDDEN). Cửa sổ Quản trị sẽ đóng.",
                         "Mất quyền Quản trị", JOptionPane.ERROR_MESSAGE);
                 dispose();
+                if (onPermissionLost != null) onPermissionLost.run();
                 return;
             }
-            JOptionPane.showMessageDialog(this, apiEx.getMessage(), prefix, JOptionPane.WARNING_MESSAGE);
+            JOptionPane.showMessageDialog(this, "[" + apiEx.getCode() + "] " + apiEx.getMessage(), prefix, JOptionPane.WARNING_MESSAGE);
             setStatus(prefix + ": " + apiEx.getMessage());
             return;
         }
@@ -1073,6 +1340,8 @@ public class AdminFrame extends JFrame {
                                              AdminPageResponse<AdminAuditLogItem> logs) {
         applyUsersPage(users);
         applySettings(settings);
+        settingsLoaded = true;
+        updateSettingsControls();
         applyStats(stats);
         applyLogsPage(logs);
         setStatus("Dữ liệu mô phỏng (chỉ dùng cho --screenshots)");
@@ -1080,6 +1349,14 @@ public class AdminFrame extends JFrame {
 
     public void selectTab(int index) {
         tabbedPane.setSelectedIndex(index);
+    }
+
+    @Override public void dispose() {
+        disposed = true;
+        usersRequestGeneration++;
+        logRequestGeneration++;
+        statsRequestGeneration++;
+        super.dispose();
     }
 
     // ==================== HELPERS & TABLE MODELS ====================

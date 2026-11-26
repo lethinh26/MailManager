@@ -4,6 +4,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.autoconfigure.security.servlet.UserDetailsServiceAutoConfiguration;
+import org.springframework.core.env.SimpleCommandLinePropertySource;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -16,32 +19,38 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-@SpringBootApplication
+// All identities come from the application's DB and JWT filter. Do not create
+// Spring Boot's unused default user or print its generated password on startup.
+@SpringBootApplication(exclude = UserDetailsServiceAutoConfiguration.class)
+@EnableScheduling
 public class MailServerApplication {
 
     private static final Logger log = LoggerFactory.getLogger(MailServerApplication.class);
 
     public static void main(String[] args) {
         // 1. Tự động nạp biến môi trường từ file .env nếu có
-        loadDotEnvIfPresent();
+        if (!"false".equalsIgnoreCase(System.getenv("MAILAPP_LOAD_DOTENV"))) {
+            loadDotEnvIfPresent();
+        }
 
         // 2. Kích hoạt profile 'dev' mặc định nếu chưa cấu hình
-        if (System.getProperty("spring.profiles.active") == null && System.getenv("SPRING_PROFILES_ACTIVE") == null) {
+        SimpleCommandLinePropertySource commandLine = new SimpleCommandLinePropertySource(args);
+        if (configured(commandLine, "spring.profiles.active", "SPRING_PROFILES_ACTIVE") == null) {
             System.setProperty("spring.profiles.active", "dev");
             log.info("[ENV] Đã tự động kích hoạt profile 'dev' cho môi trường chạy trực tiếp.");
         }
 
         // 3. Đảm bảo cấu hình SSL keystore hợp lệ
-        ensureKeystoreConfigured();
+        ensureKeystoreConfigured(commandLine);
 
         // 4. Kiểm tra cổng máy chủ (8443) có bị chiếm bởi container Docker hoặc tiến trình khác không
         int port = 8443;
         try {
-            String portStr = System.getProperty("server.port", System.getenv().getOrDefault("SERVER_PORT", "8443"));
-            port = Integer.parseInt(portStr);
+            String portStr = configured(commandLine, "server.port", "SERVER_PORT");
+            if (portStr != null) port = Integer.parseInt(portStr);
         } catch (Exception ignored) {}
 
-        verifyPortNotOccupied(port);
+        if (port != 0) verifyPortNotOccupied(port);
 
         // 5. Khởi động Spring Boot Application
         SpringApplication.run(MailServerApplication.class, args);
@@ -99,10 +108,14 @@ public class MailServerApplication {
                 }
             }
         } catch (IOException e) {
-            log.warn("Không thể đọc file .env: {}", e.getMessage());
+            log.warn("Không thể đọc file .env: {}", e.getClass().getSimpleName());
             return;
         }
 
+        applyDotEnvProperties(envMap);
+    }
+
+    static void applyDotEnvProperties(Map<String, String> envMap) {
         for (Map.Entry<String, String> entry : envMap.entrySet()) {
             String k = entry.getKey();
             String v = entry.getValue();
@@ -111,35 +124,36 @@ public class MailServerApplication {
             }
         }
 
-        if (envMap.containsKey("KEYSTORE_PASSWORD") && System.getProperty("server.ssl.key-store-password") == null && System.getenv("KEYSTORE_PASSWORD") == null) {
-            System.setProperty("server.ssl.key-store-password", envMap.get("KEYSTORE_PASSWORD"));
-        }
+        // Secret aliases are resolved by the property placeholders in application.properties.
+        // Promoting a legacy .env key to a Spring property would override MAILAPP_* values.
         if (envMap.containsKey("SPRING_PROFILES_ACTIVE") && System.getProperty("spring.profiles.active") == null && System.getenv("SPRING_PROFILES_ACTIVE") == null) {
             System.setProperty("spring.profiles.active", envMap.get("SPRING_PROFILES_ACTIVE"));
         }
-        if (envMap.containsKey("JWT_SECRET") && System.getProperty("mailapp.jwt.secret") == null && System.getenv("JWT_SECRET") == null) {
-            System.setProperty("mailapp.jwt.secret", envMap.get("JWT_SECRET"));
-        }
-        if (envMap.containsKey("AES_KEY") && System.getProperty("mailapp.aes.key") == null && System.getenv("AES_KEY") == null) {
-            System.setProperty("mailapp.aes.key", envMap.get("AES_KEY"));
-        }
     }
 
-    private static void ensureKeystoreConfigured() {
-        String keyStorePassword = System.getProperty("server.ssl.key-store-password",
-                System.getenv().getOrDefault("KEYSTORE_PASSWORD", ""));
-
-        // 1. Tôn trọng đường dẫn keystore đã cấu hình tường minh (-Dserver.ssl.key-store=file:/app/certs/keystore.p12)
-        String explicitStore = System.getProperty("server.ssl.key-store",
-                System.getenv().getOrDefault("SERVER_SSL_KEY_STORE", ""));
-        if (explicitStore != null && !explicitStore.isBlank() && !keyStorePassword.isEmpty()) {
-            String normalizedPath = explicitStore.startsWith("file:")
-                    ? explicitStore.substring("file:".length())
-                    : explicitStore;
-            if (new File(normalizedPath).exists()) {
-                return;
-            }
+    private static String configured(SimpleCommandLinePropertySource args, String property, String... aliases) {
+        String value = args.getProperty(property);
+        if (value != null) return value;
+        value = System.getProperty(property);
+        if (value != null) return value;
+        for (String alias : aliases) {
+            value = System.getProperty(alias);
+            if (value == null) value = System.getenv(alias);
+            if (value != null && !value.isBlank()) return value;
         }
+        return null;
+    }
+
+    private static void ensureKeystoreConfigured(SimpleCommandLinePropertySource args) {
+        if ("false".equalsIgnoreCase(configured(args, "server.ssl.enabled", "SERVER_SSL_ENABLED"))) return;
+        String explicitStore = configured(args, "server.ssl.key-store", "SERVER_SSL_KEY_STORE", "MAILAPP_KEYSTORE_PATH");
+        // Let Spring validate an explicit file/classpath URI and password; never silently replace it.
+        if (explicitStore != null && !explicitStore.isBlank()) return;
+        String profiles = configured(args, "spring.profiles.active", "SPRING_PROFILES_ACTIVE");
+        if (profiles == null || !java.util.Arrays.asList(profiles.split(",")).contains("dev")) return;
+        String keyStorePassword = configured(args, "server.ssl.key-store-password",
+                "SERVER_SSL_KEY_STORE_PASSWORD", "MAILAPP_KEYSTORE_PASS", "KEYSTORE_PASSWORD");
+        if (keyStorePassword == null) keyStorePassword = "";
 
         // 2. Tìm keystore chuẩn trong certs/ hoặc src/main/resources/
         File[] candidates = new File[]{
@@ -151,9 +165,7 @@ public class MailServerApplication {
         };
         for (File candidate : candidates) {
             if (candidate.exists() && !keyStorePassword.isEmpty()) {
-                if (candidate.getPath().contains("certs")) {
-                    System.setProperty("server.ssl.key-store", "file:" + candidate.getAbsolutePath());
-                }
+                System.setProperty("server.ssl.key-store", candidate.toURI().toString());
                 return;
             }
         }
@@ -162,17 +174,17 @@ public class MailServerApplication {
             keyStorePassword = java.util.UUID.randomUUID().toString();
             System.setProperty("server.ssl.key-store-password", keyStorePassword);
             System.setProperty("KEYSTORE_PASSWORD", keyStorePassword);
-            File tempKeystore = new File(System.getProperty("java.io.tmpdir"), "mailapp-dev-keystore.p12");
-            if (tempKeystore.exists()) {
-                tempKeystore.delete();
-            }
         }
-
-        File tempKeystore = new File(System.getProperty("java.io.tmpdir"), "mailapp-dev-keystore.p12");
-        if (!tempKeystore.exists()) {
+        try {
+            File tempDir = java.nio.file.Files.createTempDirectory("mailapp-dev-keystore-").toFile();
+            tempDir.deleteOnExit();
+            File tempKeystore = new File(tempDir, "keystore.p12");
+            tempKeystore.deleteOnExit();
             generateSelfSignedKeystore(tempKeystore, keyStorePassword);
+            System.setProperty("server.ssl.key-store", tempKeystore.toURI().toString());
+        } catch (IOException e) {
+            throw new IllegalStateException("Cannot create isolated development keystore", e);
         }
-        System.setProperty("server.ssl.key-store", "file:" + tempKeystore.getAbsolutePath());
     }
 
     private static void generateSelfSignedKeystore(File targetFile, String storeCredential) {
@@ -198,10 +210,13 @@ public class MailServerApplication {
             ProcessBuilder pb = new ProcessBuilder(cmd);
             pb.environment().put("TEMP_KS_PASS", storeCredential);
             Process p = pb.start();
-            p.waitFor();
+            if (p.waitFor() != 0 || !targetFile.isFile()) {
+                throw new IllegalStateException("keytool failed to generate development keystore");
+            }
             log.info("[DEV SSL] Đã tự động sinh keystore SSL tự ký tại: {}", targetFile.getAbsolutePath());
         } catch (Exception e) {
-            log.warn("Không thể sinh keystore tạm thời: {}", e.getMessage());
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+            throw new IllegalStateException("Không thể sinh keystore tạm thời", e);
         }
     }
 }

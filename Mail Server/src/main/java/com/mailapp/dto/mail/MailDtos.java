@@ -1,5 +1,9 @@
 package com.mailapp.dto.mail;
 
+import com.fasterxml.jackson.annotation.JsonAlias;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+import java.time.Instant;
 import java.util.List;
 
 /**
@@ -35,7 +39,10 @@ public final class MailDtos {
             long size,
             boolean hasAttachment,
             int attachmentCount
-    ) {}
+    ) {
+        @JsonProperty("isRead")
+        public boolean isRead() { return flags != null && flags.seen(); }
+    }
 
     public record MailListResponse(
             List<MailSummaryDto> items,
@@ -44,7 +51,22 @@ public final class MailDtos {
             long total,
             boolean hasMore,
             long uidValidity
-    ) {}
+    ) {
+        @JsonProperty("content")
+        public List<MailSummaryDto> content() { return items; }
+
+        @JsonProperty("totalElements")
+        public long totalElements() { return total; }
+
+        @JsonProperty("totalPages")
+        public long totalPages() {
+            return size <= 0 || total <= 0 ? 0 : 1 + (total - 1) / size;
+        }
+    }
+
+    public enum AttachmentSizeAccuracy {
+        EXACT, ESTIMATED, UNKNOWN
+    }
 
     public record MailAttachmentDto(
             int index,
@@ -52,8 +74,21 @@ public final class MailDtos {
             String contentType,
             long size,
             boolean inline,
-            String contentId
-    ) {}
+            String contentId,
+            AttachmentSizeAccuracy sizeAccuracy
+    ) {
+        public MailAttachmentDto(int index, String filename, String contentType,
+                                 long size, boolean inline, String contentId) {
+            this(index, filename, contentType, size, inline, contentId,
+                    size < 0 ? AttachmentSizeAccuracy.UNKNOWN : AttachmentSizeAccuracy.ESTIMATED);
+        }
+
+        @JsonProperty("fileName")
+        public String fileName() { return filename; }
+
+        @JsonProperty("sizeBytes")
+        public long sizeBytes() { return size; }
+    }
 
     public record MailDetailResponse(
             long uid,
@@ -74,10 +109,16 @@ public final class MailDtos {
             boolean hasBlockedRemoteImages,
             List<MailAttachmentDto> attachments,
             MailFlagsDto flags
-    ) {}
+    ) {
+        @JsonProperty("bodyText")
+        public String bodyText() { return textBody; }
+
+        @JsonProperty("bodyHtml")
+        public String bodyHtml() { return htmlBody; }
+    }
 
     public record SendMailRequest(
-            Long gmailId,
+            @JsonAlias("gmailAccountId") Long gmailId,
             List<String> to,
             List<String> cc,
             List<String> bcc,
@@ -90,12 +131,30 @@ public final class MailDtos {
 
     public record SendMailResponse(
             String messageId,
-            String status
-    ) {}
+            String status,
+            String sentAt
+    ) {
+        public SendMailResponse(String messageId, String status) {
+            this(messageId, status, Instant.now().toString());
+        }
+
+        @JsonProperty("message")
+        public String message() { return "SENT".equals(status) ? "Sent" : status; }
+    }
 
     public record UpdateFlagsRequest(
             Boolean seen,
-            Boolean flagged
+            @JsonAlias("starred") Boolean flagged
     ) {}
+
+    /** Both current and original flag response fields, without altering nested flags DTOs. */
+    public record UpdateFlagsResponse(long uid, boolean seen, boolean flagged, boolean answered, boolean draft) {
+        public static UpdateFlagsResponse from(long uid, MailFlagsDto flags) {
+            return new UpdateFlagsResponse(uid, flags.seen(), flags.flagged(), flags.answered(), flags.draft());
+        }
+
+        @JsonProperty("starred")
+        public boolean starred() { return flagged; }
+    }
 }
 

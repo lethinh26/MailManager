@@ -80,6 +80,7 @@ class AttachmentCleanupServiceTest {
                 ex.close();
                 return;
             }
+            assertTrue(ex.getRequestURI().getQuery().contains("markSeen=false"), "Cleanup preview must not mark mail read");
             respondJson(ex, 200, """
                     {
                       "uid": 10, "uidValidity": 10, "subject": "Báo cáo tuần",
@@ -107,6 +108,97 @@ class AttachmentCleanupServiceTest {
     }
 
     @Test
+    void dryRunPreservesSizeAccuracyButActualCleanupUsesTransferredBytes(@TempDir Path baseDir) throws Exception {
+        AtomicInteger downloads = new AtomicInteger();
+        AtomicInteger deletes = new AtomicInteger();
+        byte[] bytes = "1234567890123456789012".getBytes(StandardCharsets.UTF_8);
+        server.createContext("/api/mails/1/INBOX/60/attachments/0/download", ex -> {
+            downloads.incrementAndGet();
+            ex.sendResponseHeaders(200, bytes.length);
+            try (OutputStream out = ex.getResponseBody()) { out.write(bytes); }
+        });
+        server.createContext("/api/mails/1/INBOX/60/attachments/1/download", ex -> {
+            downloads.incrementAndGet();
+            ex.sendResponseHeaders(200, bytes.length);
+            try (OutputStream out = ex.getResponseBody()) { out.write(bytes); }
+        });
+        server.createContext("/api/mails/1/INBOX/60", ex -> {
+            if ("DELETE".equals(ex.getRequestMethod())) {
+                deletes.incrementAndGet();
+                ex.sendResponseHeaders(204, -1);
+                ex.close();
+            } else {
+                respondJson(ex, 200, """
+                        {"uid":60,"uidValidity":10,"subject":"size accuracy",
+                         "attachments":[
+                           {"index":0,"filename":"estimated.txt","size":23,"sizeAccuracy":"ESTIMATED"},
+                           {"index":1,"fileName":"unknown.txt","sizeBytes":0,"sizeAccuracy":"UNKNOWN"}
+                         ]}
+                        """);
+            }
+        });
+        var targets = List.of(sampleSummary(60, "size accuracy"));
+        var preview = service.processMails(1L, "fixture@test.local", "INBOX", targets,
+                baseDir.toFile(), false, true, new AtomicBoolean(false), null).getFirst();
+        assertEquals(ItemStatus.DRY_RUN, preview.status());
+        assertEquals(23, preview.downloadedFiles().get(0).bytes());
+        assertEquals(AttachmentSizeAccuracy.ESTIMATED, preview.downloadedFiles().get(0).sizeAccuracy());
+        assertEquals(AttachmentSizeAccuracy.UNKNOWN, preview.downloadedFiles().get(1).sizeAccuracy());
+        assertEquals(0, downloads.get());
+        assertEquals(0, deletes.get());
+
+        var actual = service.processMails(1L, "fixture@test.local", "INBOX", targets,
+                baseDir.toFile(), false, false, new AtomicBoolean(false), null).getFirst();
+        assertEquals(ItemStatus.SUCCESS, actual.status());
+        assertTrue(actual.deleted());
+        assertEquals(2, downloads.get());
+        assertEquals(1, deletes.get());
+        for (var file : actual.downloadedFiles()) {
+            assertEquals(22, file.bytes());
+            assertEquals(AttachmentSizeAccuracy.EXACT, file.sizeAccuracy());
+            assertArrayEquals(bytes, Files.readAllBytes(file.savedPath()));
+            assertEquals(64, file.sha256().length());
+        }
+    }
+
+    @Test
+    void uncertainDeleteKeepsDownloadedFilesAndStopsBatch(@TempDir Path baseDir) throws Exception {
+        AtomicInteger deleteCalls = new AtomicInteger();
+        AtomicInteger nextMailCalls = new AtomicInteger();
+        byte[] bytes = "verified attachment".getBytes(StandardCharsets.UTF_8);
+        server.createContext("/api/mails/1/INBOX/40/attachments/0/download", ex -> {
+            ex.sendResponseHeaders(200, bytes.length);
+            try (OutputStream out = ex.getResponseBody()) { out.write(bytes); }
+        });
+        server.createContext("/api/mails/1/INBOX/40", ex -> {
+            if ("DELETE".equals(ex.getRequestMethod())) {
+                deleteCalls.incrementAndGet();
+                respondJson(ex, 502, "{\"code\":\"GMAIL_CONNECTION_ERROR\",\"message\":\"Mutation reply lost\"}");
+            } else {
+                respondJson(ex, 200, """
+                        {"uid":40,"uidValidity":10,"subject":"Fixture",
+                         "attachments":[{"index":0,"filename":"fixture.txt","contentType":"text/plain","size":19,"inline":false}]}
+                        """);
+            }
+        });
+        server.createContext("/api/mails/1/INBOX/41", ex -> {
+            nextMailCalls.incrementAndGet();
+            respondJson(ex, 500, "{}");
+        });
+        var results = service.processMails(1L, "fixture@test.local", "INBOX",
+                List.of(sampleSummary(40, "Fixture"), sampleSummary(41, "Next")),
+                baseDir.toFile(), false, false, new AtomicBoolean(false), null);
+        assertEquals(1, results.size());
+        var uncertain = results.getFirst();
+        assertEquals(ItemStatus.DELETE_UNCERTAIN, uncertain.status());
+        assertFalse(uncertain.deleted());
+        assertEquals(1, uncertain.downloadedFiles().size());
+        assertArrayEquals(bytes, Files.readAllBytes(uncertain.downloadedFiles().getFirst().savedPath()));
+        assertEquals(1, deleteCalls.get());
+        assertEquals(0, nextMailCalls.get());
+    }
+
+    @Test
     @DisplayName("Bất biến an toàn: Tải tệp thứ 2 thất bại -> TUYỆT ĐỐI KHÔNG gọi XÓA thư")
     void testDownloadFailure_MustNeverDeleteMail(@TempDir Path baseDir) {
         AtomicInteger deleteCalls = new AtomicInteger(0);
@@ -131,7 +223,7 @@ class AttachmentCleanupServiceTest {
                       "uid": 20, "uidValidity": 10, "subject": "Thư lỗi tải",
                       "attachments": [
                         {"index":0,"filename":"ok.pdf","contentType":"application/pdf","size":7,"inline":false},
-                        {"index":1,"filename":"broken.zip","contentType":"application/zip","size":100,"inline":false}
+                                {"index":1,"filename":"broken.zip","contentType":"application/zip","size":100,"inline":true}
                       ]
                     }
                     """);
@@ -250,6 +342,81 @@ class AttachmentCleanupServiceTest {
         assertEquals(ItemStatus.FAILED, res.get(0).status());
         assertFalse(res.get(0).deleted());
         assertTrue(service.getConsecutiveErrors() >= 1);
+    }
+
+    @Test
+    void mismatchedDetailIdentityOrDuplicateAttachmentIndexStopsBatch(@TempDir Path baseDir) {
+        AtomicInteger mutationsOrDownloads = new AtomicInteger();
+        AtomicInteger secondMailReads = new AtomicInteger();
+        AtomicBoolean mismatch = new AtomicBoolean(true);
+        server.createContext("/api/mails/1/INBOX/70/attachments", ex -> {
+            mutationsOrDownloads.incrementAndGet();
+            respondJson(ex, 500, "{}");
+        });
+        server.createContext("/api/mails/1/INBOX/70", ex -> {
+            if ("DELETE".equalsIgnoreCase(ex.getRequestMethod())) {
+                mutationsOrDownloads.incrementAndGet();
+                ex.sendResponseHeaders(204, -1);
+                ex.close();
+            } else {
+                respondJson(ex, 200, """
+                        {"uid":70,"uidValidity":%d,"attachments":[
+                        {"index":0,"filename":"a.txt","size":3},
+                        {"index":0,"filename":"b.txt","size":3}]}
+                        """.formatted(mismatch.get() ? 11 : 10));
+            }
+        });
+        server.createContext("/api/mails/1/INBOX/71", ex -> {
+            secondMailReads.incrementAndGet();
+            respondJson(ex, 500, "{}");
+        });
+        var targets = List.of(sampleSummary(70, "first"), sampleSummary(71, "second"));
+        for (boolean wrongIdentity : new boolean[]{true, false}) {
+            mismatch.set(wrongIdentity);
+            var result = service.processMails(1L, "fixture@test.local", "INBOX",
+                    targets, baseDir.toFile(), false, false, new AtomicBoolean(), null);
+            assertEquals(1, result.size());
+            assertEquals(ItemStatus.FAILED, result.getFirst().status());
+            assertFalse(result.getFirst().deleted());
+        }
+        assertEquals(0, mutationsOrDownloads.get());
+        assertEquals(0, secondMailReads.get());
+    }
+
+    @Test
+    void changedSelectionWhileDownloadingNeverDeletes(@TempDir Path baseDir) throws Exception {
+        AtomicBoolean current = new AtomicBoolean(true);
+        AtomicInteger deletes = new AtomicInteger();
+        AtomicInteger downloads = new AtomicInteger();
+        server.createContext("/api/mails/1/INBOX/80/attachments/0/download", ex -> {
+            downloads.incrementAndGet();
+            current.set(false);
+            byte[] bytes = "data".getBytes(StandardCharsets.UTF_8);
+            ex.sendResponseHeaders(200, bytes.length);
+            try (var out = ex.getResponseBody()) { out.write(bytes); }
+        });
+        server.createContext("/api/mails/1/INBOX/80", ex -> {
+            if ("DELETE".equalsIgnoreCase(ex.getRequestMethod())) {
+                deletes.incrementAndGet();
+                ex.sendResponseHeaders(204, -1);
+                ex.close();
+            } else {
+                respondJson(ex, 200, """
+                        {"uid":80,"uidValidity":10,"attachments":[
+                        {"index":0,"filename":"a.txt","size":4}]}
+                        """);
+            }
+        });
+        var result = service.processMails(1L, "fixture@test.local", "INBOX",
+                List.of(sampleSummary(80, "first")), baseDir.toFile(), false, false,
+                new AtomicBoolean(), null, current::get).getFirst();
+        assertEquals(ItemStatus.CANCELLED, result.status());
+        assertFalse(result.deleted());
+        assertEquals(1, downloads.get());
+        assertEquals(0, deletes.get());
+        try (var files = Files.walk(baseDir)) {
+            assertFalse(files.anyMatch(Files::isRegularFile));
+        }
     }
 
     @Test

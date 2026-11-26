@@ -39,6 +39,40 @@ import static org.mockito.Mockito.*;
 class SecretMaskingTest {
 
     @Test
+    void closeFailuresNeverLogRawProviderReplies() throws Exception {
+        Logger imapLogger = (Logger) LoggerFactory.getLogger(ImapConnection.class);
+        Logger smtpLogger = (Logger) LoggerFactory.getLogger(SmtpConnection.class);
+        var imapLevel = imapLogger.getLevel();
+        var smtpLevel = smtpLogger.getLevel();
+        ListAppender<ILoggingEvent> captured = new ListAppender<>();
+        captured.start();
+        imapLogger.setLevel(ch.qos.logback.classic.Level.DEBUG);
+        smtpLogger.setLevel(ch.qos.logback.classic.Level.DEBUG);
+        imapLogger.addAppender(captured);
+        smtpLogger.addAppender(captured);
+        String providerReply = "synthetic private provider reply";
+        try {
+            var store = mock(jakarta.mail.Store.class);
+            when(store.isConnected()).thenReturn(true);
+            doThrow(new jakarta.mail.MessagingException(providerReply)).when(store).close();
+            new ImapConnection(store, "***").close();
+            var transport = mock(jakarta.mail.Transport.class);
+            when(transport.isConnected()).thenReturn(true);
+            doThrow(new jakarta.mail.MessagingException(providerReply)).when(transport).close();
+            new SmtpConnection(transport, jakarta.mail.Session.getInstance(new java.util.Properties()), "***").close();
+            assertEquals(2, captured.list.size());
+            assertTrue(captured.list.stream().allMatch(e -> e.getFormattedMessage().contains("MessagingException")
+                    && !e.getFormattedMessage().contains(providerReply) && e.getThrowableProxy() == null));
+        } finally {
+            imapLogger.detachAppender(captured);
+            smtpLogger.detachAppender(captured);
+            imapLogger.setLevel(imapLevel);
+            smtpLogger.setLevel(smtpLevel);
+            captured.stop();
+        }
+    }
+
+    @Test
     @DisplayName("MailCredentials.toString() tuyệt đối không để lộ mật khẩu hoặc token")
     void testCredentialsToStringMasksSecret() {
         String sensitiveSecret = "my-super-secret-password-16chars";
@@ -144,6 +178,7 @@ class SecretMaskingTest {
             user.setEnabled(true);
 
             when(userRepository.findByUsername("cuongle")).thenReturn(Optional.of(user));
+            when(userRepository.lockUserById(1L)).thenReturn(Optional.of(user));
             when(passwordEncoder.matches(rawPassword, "hashed_value")).thenReturn(true);
             when(jwtProvider.generateToken(user)).thenReturn(rawJwtToken);
             when(jwtProvider.getExpirationSeconds()).thenReturn(86400L);

@@ -5,12 +5,14 @@ import com.mailapp.dto.GmailAccountResponse.LinkOutcome;
 import com.mailapp.dto.LinkAppPasswordRequest;
 import com.mailapp.dto.PreferredMethodRequest;
 import com.mailapp.exception.AppException;
+import com.mailapp.exception.GmailAccountChangedException;
 import com.mailapp.mail.MailConnectionFactory;
 import com.mailapp.mail.model.ConnectionTestResult;
 import com.mailapp.mail.model.MailCredentials;
 import com.mailapp.model.AccountStatus;
 import com.mailapp.model.AuthType;
 import com.mailapp.model.GmailAccount;
+import com.mailapp.model.LinkIntent;
 import com.mailapp.model.User;
 import com.mailapp.oauth2.OAuth2Service;
 import com.mailapp.repository.GmailAccountRepository;
@@ -108,11 +110,11 @@ public class GmailAccountController {
     /**
      * [EP-G2] Liên kết hoặc thêm/cập nhật phương thức App Password 16 ký tự cho một hộp thư Gmail.
      * Tìm theo (user_id, email_key). Nếu hộp thư đã liên kết Google OAuth2 thì thêm App Password vào cùng dòng
-     * (giữ nguyên id, displayName và OAuth2 token) và trả outcome = METHOD_ADDED, không bao giờ trả lỗi trùng.
+     * (giữ nguyên id, displayName và OAuth2 token) khi người dùng gửi intent=UPSERT.
      */
     @PostMapping("/app-password")
     @Operation(summary = "[EP-G2] Liên kết hoặc bổ sung App Password cho hộp thư Gmail",
-            description = "Kiểm tra IMAP thật qua IMAPS 993 rồi upsert theo (user_id, email_key). Trả outcome = CREATED | METHOD_ADDED | METHOD_UPDATED.")
+            description = "CREATE mặc định trả 409 GMAIL_DUPLICATE nếu hộp thư đã có; intent=UPSERT cho phép thêm/cập nhật phương thức sau khi kiểm tra IMAPS.")
     public ResponseEntity<GmailAccountResponse> linkGmailWithAppPassword(
             @Valid @RequestBody LinkAppPasswordRequest body,
             @AuthenticationPrincipal User currentUser,
@@ -136,6 +138,9 @@ public class GmailAccountController {
 
         // Chỉ kiểm tra giới hạn MAX_GMAIL_PER_USER nếu đây là hộp thư mới (chưa tồn tại email_key)
         boolean exists = gmailAccountRepository.findByUserIdAndEmailKey(currentUser.getId(), emailKey).isPresent();
+        if (exists && body.intent() == LinkIntent.CREATE) {
+            throw new AppException(HttpStatus.CONFLICT, "GMAIL_DUPLICATE", "Gmail này đã liên kết.");
+        }
         if (!exists) {
             int maxGmail = systemSettingService.getMaxGmailPerUser();
             if (maxGmail > 0 && gmailAccountRepository.countByUserId(currentUser.getId()) >= maxGmail) {
@@ -163,7 +168,7 @@ public class GmailAccountController {
         String clientIp = request.getRemoteAddr();
 
         GmailAccountLinkService.UpsertResult upsert = linkService.upsertAppPassword(
-                currentUser, displayEmail, encryptedPassword, body.displayName(), clientIp);
+                currentUser, displayEmail, encryptedPassword, body.displayName(), clientIp, body.intent());
 
         HttpStatus responseStatus = upsert.outcome() == LinkOutcome.CREATED ? HttpStatus.CREATED : HttpStatus.OK;
         return ResponseEntity.status(responseStatus)
@@ -186,14 +191,7 @@ public class GmailAccountController {
             throw new AppException(HttpStatus.UNAUTHORIZED, "UNAUTHORIZED", "Chưa xác thực người dùng.");
         }
 
-        GmailAccount account = gmailAccountRepository.findById(id)
-                .orElseThrow(() -> new AppException(HttpStatus.NOT_FOUND, "ACCOUNT_NOT_FOUND",
-                        "Không tìm thấy tài khoản Gmail với ID: " + id));
-
-        if (!account.getUser().getId().equals(currentUser.getId())) {
-            throw new AppException(HttpStatus.FORBIDDEN, "FORBIDDEN",
-                    "Bạn không có quyền thao tác trên tài khoản Gmail này.");
-        }
+        GmailAccount account = requireOwnedAccount(id, currentUser);
 
         AuthType desired = body.preferredMethod();
         if (desired == AuthType.OAUTH2 && !account.hasOAuth()) {
@@ -249,14 +247,7 @@ public class GmailAccountController {
                     "Phương thức không hợp lệ. Chỉ chấp nhận OAUTH2 hoặc APP_PASSWORD.");
         }
 
-        GmailAccount account = gmailAccountRepository.findById(id)
-                .orElseThrow(() -> new AppException(HttpStatus.NOT_FOUND, "ACCOUNT_NOT_FOUND",
-                        "Không tìm thấy tài khoản Gmail với ID: " + id));
-
-        if (!account.getUser().getId().equals(currentUser.getId())) {
-            throw new AppException(HttpStatus.FORBIDDEN, "FORBIDDEN",
-                    "Bạn không có quyền thao tác trên tài khoản Gmail này.");
-        }
+        GmailAccount account = requireOwnedAccount(id, currentUser);
 
         if (targetMethod == AuthType.OAUTH2 && !account.hasOAuth()) {
             throw new AppException(HttpStatus.BAD_REQUEST, "METHOD_NOT_LINKED",
@@ -328,9 +319,9 @@ public class GmailAccountController {
         try {
             oauth2Service.revokeToken(account);
         } catch (Exception e) {
-            log.warn("Lỗi khi revoke token Google (best-effort) cho {}: {}", maskedEmail, e.getMessage());
+            log.warn("Lỗi khi revoke token Google (best-effort) cho {}: {}", maskedEmail, e.getClass().getSimpleName());
             auditLogService.log(userId, "REVOKE_TOKEN_FAILED",
-                    "Revoke thất bại cho Gmail " + maskedEmail + ": " + e.getMessage(), clientIp);
+                    "Revoke thất bại cho Gmail " + maskedEmail, clientIp);
         }
     }
 
@@ -349,19 +340,12 @@ public class GmailAccountController {
         }
 
         String newName = body != null ? body.get("displayName") : null;
-        if (newName == null || newName.isBlank() || newName.trim().length() > 100) {
+        if (newName == null || newName.isBlank() || newName.trim().length() > 255) {
             throw new AppException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR",
-                    "Tên hiển thị không được để trống và tối đa 100 ký tự.");
+                    "Tên hiển thị không được để trống và tối đa 255 ký tự.");
         }
 
-        GmailAccount account = gmailAccountRepository.findById(id)
-                .orElseThrow(() -> new AppException(HttpStatus.NOT_FOUND, "ACCOUNT_NOT_FOUND",
-                        "Không tìm thấy tài khoản Gmail với ID: " + id));
-
-        if (!account.getUser().getId().equals(currentUser.getId())) {
-            throw new AppException(HttpStatus.FORBIDDEN, "FORBIDDEN",
-                    "Bạn không có quyền thao tác trên tài khoản Gmail này.");
-        }
+        GmailAccount account = requireOwnedAccount(id, currentUser);
 
         account.setDisplayName(newName.trim());
         GmailAccount saved = gmailAccountRepository.save(account);
@@ -382,14 +366,7 @@ public class GmailAccountController {
             throw new AppException(HttpStatus.UNAUTHORIZED, "UNAUTHORIZED", "Chưa xác thực người dùng.");
         }
 
-        GmailAccount account = gmailAccountRepository.findById(id)
-                .orElseThrow(() -> new AppException(HttpStatus.NOT_FOUND, "ACCOUNT_NOT_FOUND",
-                        "Không tìm thấy tài khoản Gmail với ID: " + id));
-
-        if (!account.getUser().getId().equals(currentUser.getId())) {
-            throw new AppException(HttpStatus.FORBIDDEN, "FORBIDDEN",
-                    "Bạn không có quyền truy cập tài khoản Gmail này.");
-        }
+        GmailAccount account = requireOwnedAccount(id, currentUser);
 
         return oauth2Service.fetchAccountAvatar(account)
                 .map(payload -> ResponseEntity.ok()
@@ -412,14 +389,11 @@ public class GmailAccountController {
             throw new AppException(HttpStatus.UNAUTHORIZED, "UNAUTHORIZED", "Chưa xác thực người dùng.");
         }
 
-        GmailAccount account = gmailAccountRepository.findById(id)
-                .orElseThrow(() -> new AppException(HttpStatus.NOT_FOUND, "ACCOUNT_NOT_FOUND",
-                        "Không tìm thấy tài khoản Gmail với ID: " + id));
-
-        if (!account.getUser().getId().equals(currentUser.getId()) && currentUser.getRole() != com.mailapp.model.Role.ADMIN) {
-            throw new AppException(HttpStatus.FORBIDDEN, "FORBIDDEN",
-                    "Bạn không có quyền kiểm tra tài khoản Gmail này.");
-        }
+        GmailAccount account = currentUser.getRole() == com.mailapp.model.Role.ADMIN
+                ? gmailAccountRepository.findById(id)
+                    .orElseThrow(() -> new AppException(HttpStatus.NOT_FOUND, "ACCOUNT_NOT_FOUND",
+                            "Không tìm thấy tài khoản Gmail."))
+                : requireOwnedAccount(id, currentUser);
 
         long startTime = System.currentTimeMillis();
         boolean imapOk = false;
@@ -427,25 +401,38 @@ public class GmailAccountController {
         boolean smtpOk = false;
 
         try (var imap = mailConnectionFactory.openImap(account)) {
-            imapOk = imap.isConnected();
             try {
                 jakarta.mail.Folder inbox = imap.folder("INBOX");
-                if (inbox != null && inbox.exists()) {
+                if (imap.isConnected() && inbox != null && inbox.exists()) {
                     inbox.open(jakarta.mail.Folder.READ_ONLY);
-                    inboxCount = inbox.getMessageCount();
-                    inbox.close(false);
+                    try {
+                        inboxCount = inbox.getMessageCount();
+                    } finally {
+                        inbox.close(false);
+                    }
+                    imapOk = inboxCount >= 0;
+                    if (!imapOk) imap.markBroken();
                 }
             } catch (Exception e) {
-                log.warn("Kiểm tra IMAP mở inbox thất bại: {}", e.getMessage());
+                imap.markBroken();
+                imapOk = false;
+                inboxCount = -1;
+                log.warn("Kiểm tra IMAP mở inbox thất bại: {}", e.getClass().getSimpleName());
             }
+        } catch (GmailAccountChangedException e) {
+            // Never probe SMTP using the same stale account after a failed
+            // optimistic check during IMAP refresh/fallback.
+            throw e;
         } catch (Exception e) {
-            log.warn("Kiểm tra IMAP thất bại: {}", e.getMessage());
+            log.warn("Kiểm tra IMAP thất bại: {}", e.getClass().getSimpleName());
         }
 
         try (var smtp = mailConnectionFactory.openSmtp(account)) {
             smtpOk = smtp.isConnected();
+        } catch (GmailAccountChangedException e) {
+            throw e;
         } catch (Exception e) {
-            log.warn("Kiểm tra SMTP thất bại: {}", e.getMessage());
+            log.warn("Kiểm tra SMTP thất bại: {}", e.getClass().getSimpleName());
         }
 
         if (imapOk) {
@@ -472,7 +459,7 @@ public class GmailAccountController {
      */
     @DeleteMapping("/{id}")
     @Operation(summary = "[EP-G3] Hủy toàn bộ liên kết hộp thư Gmail")
-    public ResponseEntity<Map<String, Object>> deleteGmailAccount(
+    public ResponseEntity<Void> deleteGmailAccount(
             @PathVariable Long id,
             @AuthenticationPrincipal User currentUser,
             HttpServletRequest request) {
@@ -481,14 +468,9 @@ public class GmailAccountController {
             throw new AppException(HttpStatus.UNAUTHORIZED, "UNAUTHORIZED", "Chưa xác thực người dùng.");
         }
 
-        GmailAccount account = gmailAccountRepository.findById(id)
-                .orElseThrow(() -> new AppException(HttpStatus.NOT_FOUND, "ACCOUNT_NOT_FOUND",
-                        "Không tìm thấy tài khoản Gmail với ID: " + id));
-
-        if (!account.getUser().getId().equals(currentUser.getId())) {
-            throw new AppException(HttpStatus.FORBIDDEN, "FORBIDDEN",
-                    "Bạn không có quyền thao tác trên tài khoản Gmail này.");
-        }
+        GmailAccount account = gmailAccountRepository.findByIdAndUserId(id, currentUser.getId())
+                .orElseThrow(() -> new AppException(HttpStatus.NOT_FOUND, "NOT_FOUND",
+                        "Không tìm thấy tài khoản Gmail."));
 
         String email = account.getEmail();
         String maskedEmail = MailCredentials.maskEmail(email);
@@ -499,12 +481,17 @@ public class GmailAccountController {
         }
 
         gmailAccountRepository.delete(account);
-        auditLogService.log(currentUser.getId(), "UNLINK_GMAIL", "Đã hủy liên kết Gmail: " + email, clientIp);
+        auditLogService.log(currentUser.getId(), "UNLINK_GMAIL",
+                "Đã hủy liên kết Gmail: " + email + " (authType=" + account.getAuthType()
+                        + ", hasOAuth=" + account.hasOAuth() + ", hasAppPassword=" + account.hasAppPassword() + ")", clientIp);
         log.info("Người dùng id={} đã hủy liên kết Gmail id={}, email={}", currentUser.getId(), id, maskedEmail);
 
-        return ResponseEntity.ok(Map.of(
-                "status", "success",
-                "message", "Đã hủy liên kết tài khoản Gmail " + email + " thành công."
-        ));
+        return ResponseEntity.noContent().build();
+    }
+
+    private GmailAccount requireOwnedAccount(Long id, User currentUser) {
+        return gmailAccountRepository.findByIdAndUserId(id, currentUser.getId())
+                .orElseThrow(() -> new AppException(HttpStatus.NOT_FOUND, "ACCOUNT_NOT_FOUND",
+                        "Không tìm thấy tài khoản Gmail."));
     }
 }

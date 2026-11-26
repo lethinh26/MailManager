@@ -41,13 +41,13 @@ public class AesCipher {
     private final SecretKey secretKey;
     private final SecureRandom secureRandom = new SecureRandom();
 
-    public AesCipher(@Value("${mailapp.aes.key:${AES_KEY:}}") String rawKey) {
+    public AesCipher(@Value("${mailapp.aes.key:${MAILAPP_AES_KEY:${AES_KEY:}}}") String rawKey) {
         this(rawKey, null);
     }
 
     @Autowired
     public AesCipher(
-            @Value("${mailapp.aes.key:${AES_KEY:}}") String rawKey,
+            @Value("${mailapp.aes.key:${MAILAPP_AES_KEY:${AES_KEY:}}}") String rawKey,
             @Nullable Environment env) {
         this.secretKey = deriveKey(rawKey, env);
     }
@@ -112,7 +112,7 @@ public class AesCipher {
         }
         try {
             byte[] combined = Base64.getDecoder().decode(encryptedBase64);
-            if (combined.length < IV_LENGTH_BYTES) {
+            if (combined.length < IV_LENGTH_BYTES + GCM_TAG_LENGTH_BITS / Byte.SIZE) {
                 throw new IllegalArgumentException("Dữ liệu mã hóa không hợp lệ");
             }
 

@@ -15,16 +15,16 @@ public class User {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @Column(nullable = false, unique = true, length = 50)
+    @Column(nullable = false, unique = true, length = 64)
     private String username;
 
     @Column(name = "password_hash", nullable = false)
     private String passwordHash;
 
-    @Column(name = "full_name", length = 100)
+    @Column(name = "full_name", length = 255)
     private String fullName;
 
-    @Column(length = 100)
+    @Column(length = 255, unique = true)
     private String email;
 
     @Enumerated(EnumType.STRING)
@@ -55,13 +55,19 @@ public class User {
 
     @PrePersist
     protected void onCreate() {
+        normalizeEmail();
         this.createdAt = LocalDateTime.now();
         this.updatedAt = LocalDateTime.now();
     }
 
     @PreUpdate
     protected void onUpdate() {
+        normalizeEmail();
         this.updatedAt = LocalDateTime.now();
+    }
+
+    private void normalizeEmail() {
+        if (email != null) email = email.trim().toLowerCase(java.util.Locale.ROOT);
     }
 
     public Long getId() { return id; }

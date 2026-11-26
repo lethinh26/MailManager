@@ -25,7 +25,9 @@ public class ClientConfig {
 
     private ClientConfig() {
         String userHome = System.getProperty("user.home", ".");
-        File configDir = new File(userHome, ".mailclient");
+        String override = System.getProperty("mailclient.config.dir");
+        File configDir = override == null || override.isBlank()
+                ? new File(userHome, ".mailclient") : new File(override);
         if (!configDir.exists()) {
             configDir.mkdirs();
         }

@@ -74,9 +74,8 @@ class UiAccessibilityAndThemeTest {
     @Test
     @DisplayName("Thứ tự điều hướng Tab trên LoginFrame và RegisterFrame đi tuần tự từ trên xuống dưới")
     void testTabFocusTraversalOrderOnAuthForms() throws Exception {
-        if (GraphicsEnvironment.isHeadless()) {
-            return; // Không thể tạo JFrame trong môi trường headless thuần
-        }
+        org.junit.jupiter.api.Assumptions.assumeFalse(GraphicsEnvironment.isHeadless(),
+                "Cần môi trường đồ họa để kiểm thử JFrame");
 
         ApiClient client = new ApiClient("http://localhost:19999");
         AtomicReference<Throwable> err = new AtomicReference<>();
@@ -89,13 +88,18 @@ class UiAccessibilityAndThemeTest {
                 FocusTraversalPolicy lp = login.getFocusTraversalPolicy();
                 assertNotNull(lp, "LoginFrame phải có FocusTraversalPolicy tường minh");
                 List<Component> expectedLogin = login.getExpectedTabOrder();
-                assertEquals(6, expectedLogin.size());
+                assertEquals(7, expectedLogin.size());
                 assertSame(expectedLogin.get(0), lp.getFirstComponent(login));
                 for (int i = 0; i < expectedLogin.size(); i++) {
                     Component next = lp.getComponentAfter(login, expectedLogin.get(i));
                     Component expectedNext = expectedLogin.get((i + 1) % expectedLogin.size());
                     assertSame(expectedNext, next, "Thứ tự Tab LoginFrame sai tại bước " + i);
                 }
+                login.applyPublicConfig(new com.mailapp.client.model.PublicConfigDto(false, false, false, true, false, 5, 25));
+                assertTrue(login.getMaintenanceBanner().isVisible());
+                assertFalse(expectedLogin.get(4).isVisible());
+                assertFalse(expectedLogin.get(5).isVisible());
+                assertSame(expectedLogin.get(6), lp.getComponentAfter(login, expectedLogin.get(3)));
 
                 reg = new RegisterFrame(client, null);
                 FocusTraversalPolicy rp = reg.getFocusTraversalPolicy();

@@ -3,6 +3,10 @@ package com.mailapp.mail;
 import com.mailapp.mail.model.ConnectionTestResult;
 import com.mailapp.mail.model.MailCredentials;
 import com.mailapp.model.GmailAccount;
+import jakarta.mail.MessagingException;
+import jakarta.mail.Session;
+import jakarta.mail.Store;
+import jakarta.mail.Transport;
 
 /**
  * Factory điều phối kết nối Gmail dùng chung cho toàn bộ dự án.
@@ -12,6 +16,24 @@ import com.mailapp.model.GmailAccount;
  * @author Lê Thanh Cường (Module M07)
  */
 public interface MailConnectionFactory {
+
+    enum Protocol { IMAP, SMTP }
+
+    /**
+     * Legacy low-level adapter: returns an unconnected, unpooled store.
+     * The caller must connect and close it in try-with-resources. Business
+     * operations should use openImap for mapped errors and multi-auth fallback.
+     */
+    Store createImapStore(GmailAccount account) throws MessagingException;
+
+    /** Legacy unconnected transport; the caller owns connect and close. */
+    Transport createSmtpTransport(GmailAccount account) throws MessagingException;
+
+    /**
+     * Legacy isolated session, bound to the preferred authentication method
+     * and configured server. Do not expose or reuse it across accounts.
+     */
+    Session createSession(GmailAccount account, Protocol protocol);
 
     /**
      * Mở kết nối IMAP qua MailCredentials.

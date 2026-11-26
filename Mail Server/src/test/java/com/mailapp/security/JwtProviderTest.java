@@ -76,7 +76,9 @@ class JwtProviderTest {
         assertTrue(provider.validateToken(token));
 
         Claims claims = provider.parseClaims(token);
-        assertEquals("99", claims.getSubject());
+        assertEquals("cuongle", claims.getSubject());
+        assertEquals(99L, provider.getUserId(token));
+        assertEquals(99L, ((Number) claims.get("uid")).longValue());
         assertEquals("cuongle", claims.get("username", String.class));
         assertEquals("ADMIN", claims.get("role", String.class));
         assertNotNull(claims.getId()); // jti
@@ -116,5 +118,30 @@ class JwtProviderTest {
         assertTrue(headerJson.contains("\"alg\":\"HS256\""),
                 "Thuật toán ký trong JWT header phải là HS256, thực tế: " + headerJson);
         assertTrue(provider.validateToken(token));
+    }
+
+    @Test
+    void legacyNumericSubjectsAndNewNumericUsernamesCannotBeConfused() {
+        String secret = "my-valid-secret-key-minimum-32bs";
+        var provider = new JwtProvider(secret, EXPIRATION_MS);
+        var key = io.jsonwebtoken.security.Keys.hmacShaKeyFor(secret.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        var expiry = java.util.Date.from(java.time.Instant.now().plusSeconds(600));
+        String legacy = io.jsonwebtoken.Jwts.builder().subject("12").claim("uid", 12)
+                .expiration(expiry).signWith(key, io.jsonwebtoken.Jwts.SIG.HS256).compact();
+        assertEquals(12L, provider.getUserId(legacy));
+        String conflict = io.jsonwebtoken.Jwts.builder().subject("12").claim("uid", 34)
+                .expiration(expiry).signWith(key, io.jsonwebtoken.Jwts.SIG.HS256).compact();
+        assertFalse(provider.validateToken(conflict));
+        String numericUsername = provider.generateToken(new User(34L, "123", "numeric@example.com", Role.USER));
+        assertEquals("123", provider.parseClaims(numericUsername).getSubject());
+        assertEquals(34L, provider.getUserId(numericUsername));
+        String futureVersion = io.jsonwebtoken.Jwts.builder().subject("123").claim("uid", 34)
+                .claim("username", "123").claim("identityVersion", 3)
+                .expiration(expiry).signWith(key, io.jsonwebtoken.Jwts.SIG.HS256).compact();
+        assertFalse(provider.validateToken(futureVersion));
+        String mismatch = io.jsonwebtoken.Jwts.builder().subject("123").claim("uid", 34)
+                .claim("username", "456").claim("identityVersion", 2)
+                .expiration(expiry).signWith(key, io.jsonwebtoken.Jwts.SIG.HS256).compact();
+        assertFalse(provider.validateToken(mismatch));
     }
 }

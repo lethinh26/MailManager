@@ -26,6 +26,29 @@ class AdminModuleClientTest {
     private HttpServer server;
     private ApiClient apiClient;
 
+    @Test
+    void exportNeverOverwritesExistingFileOrPublishesAfterGuardExpires(@TempDir Path dir) throws Exception {
+        java.util.concurrent.atomic.AtomicBoolean current = new java.util.concurrent.atomic.AtomicBoolean(true);
+        java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        server.createContext("/api/admin/logs/export", ex -> {
+            calls.incrementAndGet();
+            current.set(false); // response arrives after the export window became stale
+            byte[] csv = "ID,Action\r\n".getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().set("Content-Type", "text/csv; charset=UTF-8");
+            ex.sendResponseHeaders(200, csv.length);
+            try (OutputStream out = ex.getResponseBody()) { out.write(csv); }
+        });
+        Path existing = Files.writeString(dir.resolve("existing.csv"), "keep");
+        assertThrows(IOException.class, () -> apiClient.adminExportLogsCsvToFile(null, null, null, null, null, existing.toFile()));
+        assertEquals("keep", Files.readString(existing));
+        assertEquals(0, calls.get());
+        Path target = dir.resolve("new.csv");
+        assertThrows(InterruptedException.class, () -> apiClient.adminExportLogsCsvToFile(null, null, null, null, null, target.toFile(), current::get));
+        assertEquals(1, calls.get());
+        assertFalse(Files.exists(target));
+        try (var files = Files.list(dir)) { assertEquals(1, files.count()); }
+    }
+
     @BeforeEach
     void setUp() throws IOException {
         server = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
@@ -61,6 +84,8 @@ class AdminModuleClientTest {
         assertNotNull(AdminViewModel.validateSettingsUpdate(Map.of("MAX_ATTACHMENT_SIZE_MB", "100")));
         assertNotNull(AdminViewModel.validateSettingsUpdate(Map.of("MAIL_PAGE_SIZE", "5")));
         assertNotNull(AdminViewModel.validateSettingsUpdate(Map.of("LOGIN_MAX_FAILED_ATTEMPTS", "2")));
+        assertNotNull(AdminViewModel.validateSettingsUpdate(Map.of("MAX_GMAIL_PER_USER", "0")));
+        assertNull(AdminViewModel.validateSettingsUpdate(Map.of("MAX_GMAIL_PER_USER", "0"), true));
 
         assertNull(AdminViewModel.validateSettingsUpdate(Map.of(
                 "ALLOW_OAUTH2_LINK", "true",

@@ -8,6 +8,7 @@ import com.mailapp.model.AccountStatus;
 import com.mailapp.model.AuthType;
 import com.mailapp.model.GmailAccount;
 import com.mailapp.repository.GmailAccountRepository;
+import com.mailapp.repository.GmailAccountSnapshot;
 import com.mailapp.security.AesCipher;
 import com.mailapp.service.AuditLogService;
 import io.github.resilience4j.retry.Retry;
@@ -15,6 +16,7 @@ import io.github.resilience4j.retry.RetryConfig;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import jakarta.annotation.PreDestroy;
+import jakarta.annotation.PostConstruct;
 import jakarta.mail.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,8 +37,15 @@ import java.util.Base64;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -71,8 +80,11 @@ public class DefaultMailConnectionFactory implements MailConnectionFactory {
      * Pool kết nối IMAPS theo từng tài khoản Gmail (giữ ấm TCP + TLS 1.3 + XOAUTH2),
      * giảm độ trễ mở thư từ 3-15 giây xuống dưới 500ms và tránh nghẽn handshake tới imap.gmail.com.
      */
-    private record PooledStore(Store store, long lastUsedAtMs) {}
-    private final ConcurrentHashMap<String, ConcurrentLinkedDeque<PooledStore>> imapPool = new ConcurrentHashMap<>();
+    private record PooledStore(Store store, long lastUsedNanos) {}
+    private final Object poolLock = new Object();
+    private final Map<String, Deque<PooledStore>> imapPool = new HashMap<>();
+    private boolean poolClosed;
+    private ScheduledExecutorService poolMaintenance;
 
     public DefaultMailConnectionFactory(MailConnectionProperties properties,
                                         AesCipher aesCipher,
@@ -105,13 +117,65 @@ public class DefaultMailConnectionFactory implements MailConnectionFactory {
     }
 
     @Override
+    public Store createImapStore(GmailAccount account) throws MessagingException {
+        return createSession(account, Protocol.IMAP).getStore("imaps");
+    }
+
+    @Override
+    public Transport createSmtpTransport(GmailAccount account) throws MessagingException {
+        return createSession(account, Protocol.SMTP).getTransport("smtp");
+    }
+
+    @Override
+    public Session createSession(GmailAccount account, Protocol protocol) {
+        Objects.requireNonNull(account, "GmailAccount không được null");
+        Objects.requireNonNull(protocol, "Protocol không được null");
+        GmailAccountSnapshot.requireCurrent(gmailAccountRepository, account);
+        // This adapter does not claim a successful login or change fallback
+        // state before the caller performs authentication. Use open* for
+        // actual connection orchestration, including fallback and retry.
+        MailCredentials credentials = MailCredentials.forMethod(account, account.getPreferredMethod(),
+                aesCipher, accessTokenProvider);
+        boolean imap = protocol == Protocol.IMAP;
+        String name = imap ? "imaps" : "smtp";
+        String host = imap ? properties.getImapHost() : properties.getSmtpHost();
+        int port = imap ? properties.getImapPort() : properties.getSmtpPort();
+        Properties props = imap ? imapProperties(credentials, false) : smtpProperties(credentials);
+        props.setProperty("mail." + name + ".user", credentials.email());
+        return scopedSession(props, credentials, name, host, port);
+    }
+
+    private Session scopedSession(Properties props, MailCredentials credentials, String name, String host, int port) {
+        Session session = Session.getInstance(props, new Authenticator() {
+            @Override
+            protected PasswordAuthentication getPasswordAuthentication() {
+                // Do not supply credentials for another host, protocol, port
+                // or user if a caller accidentally overrides the defaults.
+                if (!name.equalsIgnoreCase(getRequestingProtocol())
+                        || getRequestingSite() == null
+                        || (!host.equalsIgnoreCase(getRequestingSite().getHostName())
+                            && !host.equals(getRequestingSite().getHostAddress()))
+                        || (getRequestingPort() != -1 && getRequestingPort() != port)
+                        || !credentials.email().equals(getDefaultUserName())) return null;
+                return new PasswordAuthentication(credentials.email(), credentials.secret());
+            }
+        });
+        session.setDebug(false);
+        return session;
+    }
+
+    @Override
     public ImapConnection openImap(MailCredentials credentials) {
+        return openImap(credentials, null);
+    }
+
+    private ImapConnection openImap(MailCredentials credentials, Long mailboxId) {
         Objects.requireNonNull(credentials, "MailCredentials không được null");
         return executeWithMonitoring("imap", credentials.authType(), credentials.email(), () -> {
             if (properties.isRetryEnabled()) {
-                return Retry.decorateCheckedSupplier(networkRetry, () -> doOpenImap(credentials)).get();
+                return Retry.decorateCheckedSupplier(networkRetry, () -> doOpenImap(credentials, false, mailboxId)).get();
             } else {
-                return doOpenImap(credentials);
+                return doOpenImap(credentials, false, mailboxId);
             }
         });
     }
@@ -119,7 +183,7 @@ public class DefaultMailConnectionFactory implements MailConnectionFactory {
     @Override
     public ImapConnection openImap(GmailAccount account) {
         Objects.requireNonNull(account, "GmailAccount không được null");
-        return executeWithFallback(account, this::openImap);
+        return executeWithFallback(account, credentials -> openImap(credentials, account.getId()));
     }
 
     @Override
@@ -146,13 +210,17 @@ public class DefaultMailConnectionFactory implements MailConnectionFactory {
         long start = System.currentTimeMillis();
         String masked = MailCredentials.maskEmail(credentials.email());
 
-        try (ImapConnection connection = openImap(credentials)) {
+        // Probe submitted credentials with a fresh, unpooled connection, without
+        // retrying network or authentication failures.
+        try (ImapConnection connection = openImapProbe(credentials)) {
             if (connection.isConnected()) {
                 long duration = System.currentTimeMillis() - start;
                 log.info("[MDC: {}] Thử nghiệm kết nối IMAP thành công cho: {} trong {}ms", getOrSetCorrelationId(), masked, duration);
                 return ConnectionTestResult.ok(duration);
             }
             return ConnectionTestResult.networkError("Không thể hoàn tất kết nối tới máy chủ IMAP.");
+        } catch (ReauthRequiredException e) {
+            return ConnectionTestResult.authFailed(e.getMessage());
         } catch (ImapDisabledException e) {
             log.warn("[MDC: {}] Kiểm tra IMAP thất bại: IMAP đang bị tắt cho {}", getOrSetCorrelationId(), masked);
             return ConnectionTestResult.imapDisabled(e.getMessage());
@@ -171,8 +239,9 @@ public class DefaultMailConnectionFactory implements MailConnectionFactory {
             log.warn("[MDC: {}] Kiểm tra IMAP thất bại: Lỗi mạng hoặc timeout cho {}", getOrSetCorrelationId(), masked);
             return ConnectionTestResult.networkError(e.getMessage());
         } catch (Exception e) {
-            log.error("[MDC: {}] Kiểm tra IMAP thất bại với lỗi không xác định cho {}", getOrSetCorrelationId(), masked, e);
-            return ConnectionTestResult.networkError("Lỗi kết nối: " + e.getMessage());
+            log.error("[MDC: {}] Kiểm tra IMAP thất bại với lỗi không xác định cho {}: {}",
+                    getOrSetCorrelationId(), masked, e.getClass().getSimpleName());
+            return ConnectionTestResult.networkError("Không thể hoàn tất kết nối tới máy chủ IMAP.");
         }
     }
 
@@ -186,7 +255,7 @@ public class DefaultMailConnectionFactory implements MailConnectionFactory {
     public ConnectionTestResult testImap(GmailAccount account) {
         Objects.requireNonNull(account, "GmailAccount không được null");
         long start = System.currentTimeMillis();
-        try (ImapConnection conn = openImap(account)) {
+        try (ImapConnection conn = executeWithFallback(account, this::openImapProbe)) {
             if (conn.isConnected()) {
                 return ConnectionTestResult.ok(System.currentTimeMillis() - start);
             }
@@ -200,7 +269,7 @@ public class DefaultMailConnectionFactory implements MailConnectionFactory {
         } catch (MailNetworkException e) {
             return ConnectionTestResult.networkError(e.getMessage());
         } catch (Exception e) {
-            return ConnectionTestResult.networkError("Lỗi kết nối: " + e.getMessage());
+            return ConnectionTestResult.networkError("Không thể hoàn tất kết nối tới máy chủ IMAP.");
         }
     }
 
@@ -212,80 +281,121 @@ public class DefaultMailConnectionFactory implements MailConnectionFactory {
      * - Đánh dấu fallbackActive=true, ghi audit FALLBACK_TO_APP_PASSWORD (không ghi bí mật),
      *   nhưng KHÔNG xóa trạng thái NEEDS_REAUTH của OAuth2.
      */
-    private <T> T executeWithFallback(GmailAccount account, java.util.function.Function<MailCredentials, T> opener) {
+    private <T extends AutoCloseable> T executeWithFallback(GmailAccount account, java.util.function.Function<MailCredentials, T> opener) {
         AuthType preferred = account.getPreferredMethod();
         Objects.requireNonNull(preferred, "AuthType trong GmailAccount không được null");
+        GmailAccountSnapshot.requireCurrent(gmailAccountRepository, account);
 
         if (preferred == AuthType.OAUTH2) {
             // Nếu OAuth2 đã ở trạng thái NEEDS_REAUTH trước đó và có App Password dự phòng:
             // đi thẳng sang App Password để không gọi refresh lặp lại tới Google
-            if (account.getStatus() == AccountStatus.NEEDS_REAUTH && account.hasAppPassword()) {
-                activateFallbackState(account, false);
-                MailCredentials fallbackCreds = MailCredentials.forMethod(
-                        account, AuthType.APP_PASSWORD, aesCipher, accessTokenProvider);
-                return opener.apply(fallbackCreds);
+            if (account.getStatus() == AccountStatus.NEEDS_REAUTH) {
+                if (!account.hasAppPassword()) throw new ReauthRequiredException();
+                return openFallback(account, opener);
             }
 
             try {
                 MailCredentials oauthCreds = MailCredentials.forMethod(
                         account, AuthType.OAUTH2, aesCipher, accessTokenProvider);
                 T connection = opener.apply(oauthCreds);
-                if (account.isFallbackActive()) {
-                    account.setFallbackActive(false);
-                    if (gmailAccountRepository != null && account.getId() != null) {
-                        gmailAccountRepository.save(account);
+                try {
+                    GmailAccountSnapshot.requireCurrent(gmailAccountRepository, account);
+                    if (account.isFallbackActive()) {
+                        account.setFallbackActive(false);
+                        if (gmailAccountRepository != null && account.getId() != null) {
+                            persistAccountState(account);
+                        }
                     }
+                    return connection;
+                } catch (RuntimeException | Error e) {
+                    // A successful open followed by a persistence failure must
+                    // never abandon a live lease.
+                    if (connection instanceof ImapConnection imap) imap.markBroken();
+                    try { connection.close(); } catch (Exception ignored) {}
+                    throw e;
                 }
-                return connection;
             } catch (ReauthRequiredException reauthEx) {
-                if (!account.hasAppPassword()) {
-                    throw reauthEx;
+                if (account.getStatus() != AccountStatus.NEEDS_REAUTH || account.isFallbackActive()) {
+                    account.setStatus(AccountStatus.NEEDS_REAUTH);
+                    account.setFallbackActive(false);
+                    persistAccountState(account);
                 }
-                // Giữ nguyên NEEDS_REAUTH của OAuth2, bật fallbackActive và ghi audit
-                activateFallbackState(account, true);
-                MailCredentials fallbackCreds = MailCredentials.forMethod(
-                        account, AuthType.APP_PASSWORD, aesCipher, accessTokenProvider);
-                return opener.apply(fallbackCreds);
+                if (!account.hasAppPassword()) throw reauthEx;
+                return openFallback(account, opener);
             }
         }
 
         MailCredentials credentials = MailCredentials.forMethod(account, preferred, aesCipher, accessTokenProvider);
-        return opener.apply(credentials);
+        T connection = opener.apply(credentials);
+        try {
+            GmailAccountSnapshot.requireCurrent(gmailAccountRepository, account);
+            return connection;
+        } catch (RuntimeException | Error e) {
+            if (connection instanceof ImapConnection imap) imap.markBroken();
+            try { connection.close(); } catch (Exception ignored) {}
+            throw e;
+        }
     }
 
-    private void activateFallbackState(GmailAccount account, boolean forceAudit) {
+    private <T extends AutoCloseable> T openFallback(GmailAccount account, java.util.function.Function<MailCredentials, T> opener) {
         String masked = MailCredentials.maskEmail(account.getEmail());
-        boolean newlyActivated = !account.isFallbackActive();
-
-        // Đảm bảo KHÔNG xóa trạng thái NEEDS_REAUTH của OAuth2
-        account.setStatus(AccountStatus.NEEDS_REAUTH);
-        account.setFallbackActive(true);
-
-        if (gmailAccountRepository != null && (newlyActivated || forceAudit)) {
-            try {
-                gmailAccountRepository.save(account);
-            } catch (Exception e) {
-                log.warn("Không thể lưu trạng thái fallbackActive cho {}: {}", masked, e.getMessage());
+        T connection;
+        try {
+            GmailAccountSnapshot.requireCurrent(gmailAccountRepository, account);
+            MailCredentials fallbackCreds = MailCredentials.forMethod(
+                    account, AuthType.APP_PASSWORD, aesCipher, accessTokenProvider);
+            connection = opener.apply(fallbackCreds);
+        } catch (RuntimeException e) {
+            // A failed backup is not an active fallback.
+            if (account.isFallbackActive()) {
+                account.setFallbackActive(false);
+                persistAccountState(account);
             }
+            throw e;
         }
 
-        if (auditLogService != null && (forceAudit || newlyActivated)) {
-            Long userId = account.getUser() != null ? account.getUser().getId() : null;
-            auditLogService.log(userId, "FALLBACK_TO_APP_PASSWORD",
-                    "OAuth2 cần cấp lại quyền cho " + masked + "; tự động sử dụng App Password dự phòng.", null);
+        try {
+            GmailAccountSnapshot.requireCurrent(gmailAccountRepository, account);
+            if (!account.isFallbackActive()) {
+                account.setFallbackActive(true);
+                persistAccountState(account);
+                if (auditLogService != null) {
+                    Long userId = account.getUser() != null ? account.getUser().getId() : null;
+                    auditLogService.log(userId, "FALLBACK_TO_APP_PASSWORD",
+                            "OAuth2 cần cấp lại quyền cho " + masked + "; đã kết nối bằng App Password dự phòng.", (String) null);
+                }
+            }
+            log.debug("Đã mở App Password dự phòng cho {} (giữ NEEDS_REAUTH).", masked);
+            return connection;
+        } catch (RuntimeException | Error e) {
+            // Do not release an authenticated connection to the caller if its
+            // associated account state could not be committed.
+            if (connection instanceof ImapConnection imap) imap.markBroken();
+            try { connection.close(); } catch (Exception ignored) {}
+            throw e;
         }
-        log.warn("[MDC: {}] Kích hoạt App Password dự phòng cho {} (giữ nguyên NEEDS_REAUTH của OAuth2).",
-                getOrSetCorrelationId(), masked);
+    }
+
+    private void persistAccountState(GmailAccount account) {
+        if (gmailAccountRepository == null || account.getId() == null) return;
+        GmailAccountSnapshot.saveState(gmailAccountRepository, account);
     }
 
     // =========================================================================
     // Core Open Logic (Low-level Jakarta Mail)
     // =========================================================================
 
-    private ImapConnection doOpenImap(MailCredentials credentials) throws Exception {
+    private ImapConnection openImapProbe(MailCredentials credentials) {
+        return executeWithMonitoring("imap", credentials.authType(), credentials.email(),
+                () -> doOpenImap(credentials, true, null));
+    }
+
+    private ImapConnection doOpenImap(MailCredentials credentials, boolean probe, Long mailboxId) throws Exception {
         String masked = MailCredentials.maskEmail(credentials.email());
-        boolean usePool = properties.isPoolEnabled() && !isLocalhost(properties.getImapHost());
-        String poolKey = usePool ? buildPoolKey(credentials) : null;
+        // Loopback has no special pooling behavior; ordinary fixtures set
+        // pool.enabled=false, and the lease fixture explicitly enables it.
+        boolean usePool = !probe && properties.isPoolEnabled();
+        String poolKey = usePool ? buildPoolKey(credentials, mailboxId) : null;
 
         // 1. Ưu tiên mượn kết nối IMAPS ấm từ pool nếu còn khỏe mạnh và chưa quá idleSeconds
         if (usePool) {
@@ -295,6 +405,23 @@ public class DefaultMailConnectionFactory implements MailConnectionFactory {
             }
         }
 
+        Session session = Session.getInstance(imapProperties(credentials, probe));
+        session.setDebug(false);
+
+        Store store = session.getStore("imaps");
+        try {
+            store.connect(properties.getImapHost(), properties.getImapPort(), credentials.email(), credentials.secret());
+            if (usePool) {
+                return new ImapConnection(store, masked, conn -> returnToPool(poolKey, conn));
+            }
+            return new ImapConnection(store, masked);
+        } catch (Exception e) {
+            closeStore(store);
+            throw mapException(e, credentials.authType());
+        }
+    }
+
+    private Properties imapProperties(MailCredentials credentials, boolean probe) {
         Properties props = new Properties();
         props.put("mail.store.protocol", "imaps");
         props.put("mail.imaps.host", properties.getImapHost());
@@ -302,8 +429,9 @@ public class DefaultMailConnectionFactory implements MailConnectionFactory {
 
         // TLS cấu hình chuẩn
         props.put("mail.imaps.ssl.enable", "true");
-        if (isLocalhost(properties.getImapHost())) {
-            props.put("mail.imaps.ssl.trust", "*");
+        if (allowLocalTestTransport(properties.getImapHost())) {
+            // GreenMail's disposable self-signed certificate; never trust "*".
+            props.put("mail.imaps.ssl.trust", properties.getImapHost());
             props.put("mail.imaps.ssl.checkserveridentity", "false");
         } else {
             props.put("mail.imaps.ssl.checkserveridentity", "true");
@@ -311,9 +439,9 @@ public class DefaultMailConnectionFactory implements MailConnectionFactory {
         }
 
         // Timeouts
-        props.put("mail.imaps.connectiontimeout", String.valueOf(properties.getConnectionTimeoutMs()));
-        props.put("mail.imaps.timeout", String.valueOf(properties.getTimeoutMs()));
-        props.put("mail.imaps.writetimeout", String.valueOf(properties.getWriteTimeoutMs()));
+        props.put("mail.imaps.connectiontimeout", String.valueOf(probe ? probeTimeout(properties.getConnectionTimeoutMs()) : properties.getConnectionTimeoutMs()));
+        props.put("mail.imaps.timeout", String.valueOf(probe ? probeTimeout(properties.getTimeoutMs()) : properties.getTimeoutMs()));
+        props.put("mail.imaps.writetimeout", String.valueOf(probe ? probeTimeout(properties.getWriteTimeoutMs()) : properties.getWriteTimeoutMs()));
         // Tối ưu kích thước khối đọc IMAP (partialfetch=true, fetchsize=256KB mặc định) để stream đính kèm lớn không đệm toàn bộ vào heap
         props.put("mail.imaps.partialfetch", String.valueOf(properties.isImapPartialFetch()));
         props.put("mail.imaps.fetchsize", String.valueOf(properties.getImapFetchSize()));
@@ -329,99 +457,148 @@ public class DefaultMailConnectionFactory implements MailConnectionFactory {
             props.put("mail.imaps.auth.plain.disable", "true");
         }
 
-        // Tạo Session mới mỗi lần mở, debug=false
-        Session session = Session.getInstance(props);
-        session.setDebug(false);
-
-        Store store = session.getStore("imaps");
-        try {
-            store.connect(properties.getImapHost(), properties.getImapPort(), credentials.email(), credentials.secret());
-            if (usePool) {
-                return new ImapConnection(store, masked, conn -> returnToPool(poolKey, conn));
-            }
-            return new ImapConnection(store, masked);
-        } catch (Exception e) {
-            if (store != null && store.isConnected()) {
-                try { store.close(); } catch (Exception ignored) {}
-            }
-            throw mapException(e, credentials.email());
-        }
+        return props;
     }
 
     private ImapConnection borrowFromPool(String poolKey, String masked) {
-        ConcurrentLinkedDeque<PooledStore> deque = imapPool.get(poolKey);
-        if (deque == null) return null;
-        long maxIdleMs = Math.max(10, properties.getPoolIdleSeconds()) * 1000L;
-        long now = System.currentTimeMillis();
-
-        PooledStore entry;
-        while ((entry = deque.pollFirst()) != null) {
-            boolean expired = (now - entry.lastUsedAtMs()) > maxIdleMs;
-            if (!expired && entry.store().isConnected()) {
-                log.debug("Tái sử dụng kết nối IMAPS từ pool cho: {}", masked);
-                return new ImapConnection(entry.store(), masked, conn -> returnToPool(poolKey, conn));
+        while (true) {
+            PooledStore entry;
+            synchronized (poolLock) {
+                if (poolClosed) return null;
+                Deque<PooledStore> deque = imapPool.get(poolKey);
+                if (deque == null) return null;
+                entry = deque.pollFirst();
+                if (deque.isEmpty()) imapPool.remove(poolKey);
             }
+            if (entry == null) return null;
             try {
-                if (entry.store().isConnected()) entry.store().close();
+                if (!expired(entry, System.nanoTime()) && entry.store().isConnected()) {
+                    log.debug("Tái sử dụng kết nối IMAPS từ pool cho: {}", masked);
+                    return new ImapConnection(entry.store(), masked, conn -> returnToPool(poolKey, conn));
+                }
             } catch (Exception ignored) {}
+            closeStore(entry.store());
         }
-        return null;
     }
 
     private void returnToPool(String poolKey, ImapConnection conn) {
-        if (conn == null || conn.isBroken() || !conn.isConnected()) {
+        if (conn == null || !conn.isReusable()) {
             if (conn != null) conn.forceCloseStore();
             return;
         }
         int maxPerAccount = Math.max(1, properties.getPoolMaxPerAccount());
-        ConcurrentLinkedDeque<PooledStore> deque = imapPool.computeIfAbsent(poolKey, k -> new ConcurrentLinkedDeque<>());
-        if (deque.size() >= maxPerAccount) {
-            conn.forceCloseStore();
-            return;
+        synchronized (poolLock) {
+            if (!poolClosed && properties.isPoolEnabled()) {
+                Deque<PooledStore> deque = imapPool.computeIfAbsent(poolKey, k -> new ArrayDeque<>());
+                if (deque.size() < maxPerAccount) {
+                    deque.offerFirst(new PooledStore(conn.storeForRelease(), System.nanoTime()));
+                    return;
+                }
+            }
         }
-        deque.offerFirst(new PooledStore(conn.getStore(), System.currentTimeMillis()));
+        conn.forceCloseStore();
     }
 
-    private String buildPoolKey(MailCredentials credentials) {
+    private String buildPoolKey(MailCredentials credentials, Long mailboxId) {
         String secretSig;
         try {
             byte[] hash = MessageDigest.getInstance("SHA-256")
                     .digest(String.valueOf(credentials.secret()).getBytes(StandardCharsets.UTF_8));
-            secretSig = Base64.getEncoder().encodeToString(hash).substring(0, 16);
+            secretSig = Base64.getEncoder().encodeToString(hash);
         } catch (Exception e) {
-            secretSig = String.valueOf(Objects.hashCode(credentials.secret()));
+            throw new IllegalStateException("SHA-256 unavailable", e);
         }
         return properties.getImapHost() + ":" + properties.getImapPort()
-                + "|" + credentials.email().toLowerCase()
+                + "|" + (mailboxId == null ? "direct" : mailboxId)
+                + "|" + credentials.email().toLowerCase(Locale.ROOT)
                 + "|" + credentials.authType()
                 + "|" + secretSig;
     }
 
-    @PreDestroy
-    public void shutdownPool() {
-        for (ConcurrentLinkedDeque<PooledStore> deque : imapPool.values()) {
-            PooledStore entry;
-            while ((entry = deque.pollFirst()) != null) {
-                try {
-                    if (entry.store().isConnected()) entry.store().close();
-                } catch (Exception ignored) {}
+    private boolean expired(PooledStore entry, long nowNanos) {
+        return nowNanos - entry.lastUsedNanos() >= TimeUnit.SECONDS.toNanos(Math.max(10, properties.getPoolIdleSeconds()));
+    }
+
+    @PostConstruct
+    void startPoolMaintenance() {
+        synchronized (poolLock) {
+            if (poolClosed || !properties.isPoolEnabled() || poolMaintenance != null) return;
+            poolMaintenance = Executors.newSingleThreadScheduledExecutor(runnable -> {
+                Thread t = new Thread(runnable, "mail-imap-idle-reaper");
+                t.setDaemon(true);
+                return t;
+            });
+            poolMaintenance.scheduleWithFixedDelay(() -> evictExpiredIdleStores(System.nanoTime()), 1, 1, TimeUnit.SECONDS);
+        }
+    }
+
+    void evictExpiredIdleStores(long nowNanos) {
+        List<Store> expired = new ArrayList<>();
+        synchronized (poolLock) {
+            for (var iterator = imapPool.entrySet().iterator(); iterator.hasNext();) {
+                Deque<PooledStore> deque = iterator.next().getValue();
+                deque.removeIf(entry -> {
+                    if (!expired(entry, nowNanos)) return false;
+                    expired.add(entry.store());
+                    return true;
+                });
+                if (deque.isEmpty()) iterator.remove();
             }
         }
-        imapPool.clear();
+        expired.forEach(DefaultMailConnectionFactory::closeStore);
+    }
+
+    private static void closeStore(Store store) {
+        if (store != null) {
+            try { store.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    @PreDestroy
+    public void shutdownPool() {
+        List<Store> remaining = new ArrayList<>();
+        synchronized (poolLock) {
+            poolClosed = true;
+            if (poolMaintenance != null) poolMaintenance.shutdownNow();
+            imapPool.values().forEach(deque -> deque.forEach(entry -> remaining.add(entry.store())));
+            imapPool.clear();
+        }
+        remaining.forEach(DefaultMailConnectionFactory::closeStore);
     }
 
     private SmtpConnection doOpenSmtp(MailCredentials credentials) throws Exception {
+        Properties props = smtpProperties(credentials);
+        // Tạo Session mới mỗi lần mở, debug=false
+        Session session;
+        if (credentials.authType() == AuthType.APP_PASSWORD) {
+            session = scopedSession(props, credentials, "smtp", properties.getSmtpHost(), properties.getSmtpPort());
+        } else {
+            session = Session.getInstance(props);
+        }
+        session.setDebug(false);
+
+        Transport transport = session.getTransport("smtp");
+        try {
+            transport.connect(properties.getSmtpHost(), properties.getSmtpPort(), credentials.email(), credentials.secret());
+            return new SmtpConnection(transport, session, MailCredentials.maskEmail(credentials.email()));
+        } catch (Exception e) {
+            if (transport != null) {
+                try { transport.close(); } catch (Exception ignored) {}
+            }
+            throw mapException(e, credentials.authType());
+        }
+    }
+
+    private Properties smtpProperties(MailCredentials credentials) {
         Properties props = new Properties();
         props.put("mail.transport.protocol", "smtp");
         props.put("mail.smtp.host", properties.getSmtpHost());
         props.put("mail.smtp.port", String.valueOf(properties.getSmtpPort()));
 
         props.put("mail.smtp.auth", "true");
-        if (isLocalhost(properties.getSmtpHost())) {
+        if (allowLocalTestTransport(properties.getSmtpHost())) {
             props.put("mail.smtp.starttls.enable", "false");
             props.put("mail.smtp.starttls.required", "false");
-            props.put("mail.smtp.ssl.trust", "*");
-            props.put("mail.smtp.ssl.checkserveridentity", "false");
         } else {
             props.put("mail.smtp.starttls.enable", "true");
             props.put("mail.smtp.starttls.required", "true");
@@ -442,40 +619,23 @@ public class DefaultMailConnectionFactory implements MailConnectionFactory {
             props.put("mail.smtp.auth.plain.disable", "true");
         }
 
-        // Tạo Session mới mỗi lần mở, debug=false
-        Session session;
-        if (credentials.authType() == AuthType.APP_PASSWORD) {
-            session = Session.getInstance(props, new Authenticator() {
-                @Override
-                protected PasswordAuthentication getPasswordAuthentication() {
-                    return new PasswordAuthentication(credentials.email(), credentials.secret());
-                }
-            });
-        } else {
-            session = Session.getInstance(props);
-        }
-        session.setDebug(false);
-
-        Transport transport = session.getTransport("smtp");
-        try {
-            transport.connect(properties.getSmtpHost(), properties.getSmtpPort(), credentials.email(), credentials.secret());
-            return new SmtpConnection(transport, session, MailCredentials.maskEmail(credentials.email()));
-        } catch (Exception e) {
-            if (transport != null && transport.isConnected()) {
-                try { transport.close(); } catch (Exception ignored) {}
-            }
-            throw mapException(e, credentials.email());
-        }
+        return props;
     }
 
     // =========================================================================
     // Resilience4j, Metrics & Logging Helpers
     // =========================================================================
 
-    private boolean isLocalhost(String host) {
-        return "127.0.0.1".equals(host)
-                || "localhost".equalsIgnoreCase(host)
-                || "host.docker.internal".equalsIgnoreCase(host);
+    static int probeTimeout(int configuredMs) {
+        return configuredMs > 0 ? Math.min(10_000, configuredMs) : 10_000;
+    }
+
+    private static boolean isLoopback(String host) {
+        return "127.0.0.1".equals(host) || "::1".equals(host) || "localhost".equalsIgnoreCase(host);
+    }
+
+    boolean allowLocalTestTransport(String host) {
+        return properties.isLocalTestTransport() && isLoopback(host);
     }
 
     private Retry buildNetworkRetry(MailConnectionProperties props) {
@@ -529,7 +689,7 @@ public class DefaultMailConnectionFactory implements MailConnectionFactory {
         } catch (Throwable e) {
             long duration = System.currentTimeMillis() - start;
             log.warn("[MDC: {}] Mở kết nối {} thất bại cho: {} sau {}ms. Nguyên nhân: {}",
-                    correlationId, protocol, masked, duration, e.getMessage());
+                    correlationId, protocol, masked, duration, e.getClass().getSimpleName());
             recordMetric(protocol, authType, false, duration);
 
             if (e instanceof RuntimeException re) {
@@ -562,7 +722,7 @@ public class DefaultMailConnectionFactory implements MailConnectionFactory {
         return cid;
     }
 
-    private MailConnectionException mapException(Exception e, String email) {
+    private MailConnectionException mapException(Exception e, AuthType authType) {
         if (e instanceof MailConnectionException mce) {
             return mce;
         }
@@ -574,6 +734,9 @@ public class DefaultMailConnectionFactory implements MailConnectionFactory {
                 if (msg.contains("imap is disabled") || msg.contains("web browser") || msg.contains("please log in via your web browser")) {
                     return new ImapDisabledException(
                             "Tài khoản Gmail chưa bật tính năng IMAP. Vào Gmail Web -> Cài đặt -> Chuyển tiếp và POP/IMAP -> Bật IMAP.", afe);
+                }
+                if (authType == AuthType.OAUTH2) {
+                    return new ReauthRequiredException("Gmail không chấp nhận quyền OAuth2. Vui lòng cấp lại quyền truy cập.", afe);
                 }
                 return new MailAuthException("Xác thực Gmail thất bại. Vui lòng kiểm tra lại App Password hoặc quyền truy cập.", afe);
             }

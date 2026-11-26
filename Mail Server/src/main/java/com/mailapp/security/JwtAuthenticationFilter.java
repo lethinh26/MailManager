@@ -1,7 +1,13 @@
 package com.mailapp.security;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mailapp.exception.ErrorResponse;
+import com.mailapp.model.Role;
 import com.mailapp.model.User;
 import com.mailapp.repository.UserRepository;
+import com.mailapp.service.SystemSettingService;
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.JwtException;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -10,6 +16,8 @@ import org.springframework.security.authentication.UsernamePasswordAuthenticatio
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.web.authentication.WebAuthenticationDetailsSource;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 
@@ -29,13 +37,19 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
     private final JwtProvider jwtProvider;
     private final UserRepository userRepository;
     private final JtiDenylistService denylistService;
+    private final SystemSettingService settings;
+    private final ObjectMapper objectMapper;
 
     public JwtAuthenticationFilter(JwtProvider jwtProvider,
                                    UserRepository userRepository,
-                                   JtiDenylistService denylistService) {
+                                   JtiDenylistService denylistService,
+                                   SystemSettingService settings,
+                                   ObjectMapper objectMapper) {
         this.jwtProvider = jwtProvider;
         this.userRepository = userRepository;
         this.denylistService = denylistService;
+        this.settings = settings;
+        this.objectMapper = objectMapper;
     }
 
     @Override
@@ -47,19 +61,41 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         if (authHeader != null && authHeader.startsWith("Bearer ")) {
             String token = authHeader.substring(7).trim();
 
-            if (jwtProvider.validateToken(token)) {
-                String jti = jwtProvider.getJti(token);
+            Claims claims = null;
+            Long userId = null;
+            try {
+                claims = jwtProvider.parseClaims(token);
+                userId = jwtProvider.resolveUserId(claims);
+            } catch (JwtException | IllegalArgumentException ignored) {
+                // Invalid signed claims are treated like an invalid token.
+            }
+            if (userId != null) {
+                String jti = claims.getId();
                 if (jti != null && denylistService.isRevoked(jti)) {
                     filterChain.doFilter(request, response);
                     return;
                 }
 
-                Long userId = jwtProvider.getUserId(token);
                 Optional<User> userOpt = userRepository.findById(userId);
 
                 if (userOpt.isPresent()) {
                     User user = userOpt.get();
-                    if (user.isEnabled()) {
+                    // A renamed account requires a new username-based JWT.
+                    // Legacy numeric subjects still resolve solely by stable ID.
+                    boolean subjectMatches = claims.get("identityVersion") == null
+                            || user.getUsername().equals(claims.getSubject());
+                    if (user.isEnabled() && subjectMatches) {
+                        if (user.getRole() != Role.ADMIN && isProtectedPath(request)
+                                && settings.isMaintenanceMode()) {
+                            response.setStatus(HttpStatus.SERVICE_UNAVAILABLE.value());
+                            response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+                            response.setCharacterEncoding("UTF-8");
+                            objectMapper.writeValue(response.getWriter(), ErrorResponse.of(
+                                    503, HttpStatus.SERVICE_UNAVAILABLE.getReasonPhrase(),
+                                    "Hệ thống đang bảo trì. Vui lòng thử lại sau.", "MAINTENANCE_MODE",
+                                    request.getRequestURI()));
+                            return;
+                        }
                         String role = "ROLE_" + user.getRole().name();
                         UsernamePasswordAuthenticationToken authentication =
                                 new UsernamePasswordAuthenticationToken(user, null, List.of(new SimpleGrantedAuthority(role)));
@@ -71,6 +107,18 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         }
 
         filterChain.doFilter(request, response);
+    }
+
+    private boolean isProtectedPath(HttpServletRequest request) {
+        String path = request.getServletPath();
+        if (path == null || path.isBlank()) {
+            path = request.getRequestURI().substring(request.getContextPath().length());
+        }
+        return !(path.equals("/api/auth/login") || path.equals("/api/auth/register")
+                || path.startsWith("/api/auth/oauth2/google/")
+                || path.startsWith("/api/public/") || path.equals("/api/oauth2/callback")
+                || path.equals("/actuator/health") || path.equals("/actuator/info")
+                || path.startsWith("/v3/api-docs") || path.startsWith("/swagger-ui"));
     }
 }
 

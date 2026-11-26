@@ -1,6 +1,7 @@
 package com.mailapp.controller;
 
 import com.mailapp.dto.AuthorizeUrlResponse;
+import com.mailapp.exception.GlobalExceptionHandler;
 import com.mailapp.model.Role;
 import com.mailapp.model.User;
 import com.mailapp.oauth2.OAuth2Service;
@@ -11,10 +12,14 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 @ExtendWith(MockitoExtension.class)
 class OAuth2ControllerTest {
@@ -69,5 +74,29 @@ class OAuth2ControllerTest {
         assertEquals(HttpStatus.OK, response.getStatusCode());
         assertNotNull(response.getBody());
         assertTrue(response.getBody().contains("access_denied"));
+    }
+
+    @Test
+    void callbackWithIncompatibleAcceptReturns406WithoutConsumingState() throws Exception {
+        var mvc = MockMvcBuilders.standaloneSetup(controller)
+                .setControllerAdvice(new GlobalExceptionHandler()).build();
+        for (MediaType accept : new MediaType[]{MediaType.APPLICATION_JSON, MediaType.APPLICATION_XML}) {
+            mvc.perform(get("/api/oauth2/callback")
+                            .param("code", "synthetic-code")
+                            .param("state", "synthetic-state")
+                            .accept(accept))
+                    .andExpect(status().isNotAcceptable())
+                    .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
+                    .andExpect(jsonPath("$.code").value("NOT_ACCEPTABLE"))
+                    .andExpect(jsonPath("$.path").value("/api/oauth2/callback"));
+        }
+        verifyNoInteractions(oauth2Service);
+        when(oauth2Service.handleCallback("synthetic-code", "synthetic-state", null, null))
+                .thenReturn("<html>ok</html>");
+        mvc.perform(get("/api/oauth2/callback").param("code", "synthetic-code")
+                        .param("state", "synthetic-state").accept(MediaType.TEXT_HTML))
+                .andExpect(status().isOk())
+                .andExpect(content().string("<html>ok</html>"));
+        verify(oauth2Service).handleCallback("synthetic-code", "synthetic-state", null, null);
     }
 }

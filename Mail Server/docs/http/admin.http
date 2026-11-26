@@ -1,70 +1,124 @@
-### 1. Danh sách người dùng (EP-AD2)
-GET {{baseUrl}}/api/admin/users?page=0&size=20&sortBy=createdAt&sortDir=desc
-Authorization: Bearer {{adminToken}}
+### Disposable HTTPS fixture only; see README.acceptance.md.
+### All values are placeholders; never use a real admin, existing database or profile.
+### Choose {{fixtureTargetUserId}} from a user created in THIS fixture; never mutate
+### the bootstrap admin or guess a numeric ID. Observe each request individually.
 
-### 2. Tạo người dùng thủ công (EP-AD1 — sinh mật khẩu tạm ngẫu nhiên)
-POST {{baseUrl}}/api/admin/users
-Authorization: Bearer {{adminToken}}
+### List/filter users — 200 ADMIN, 403 USER
+GET {{fixtureBaseUrl}}/api/admin/users?page=0&size=20&sortBy=createdAt&sortDir=desc
+Authorization: Bearer {{fixtureAdminToken}}
+Accept: application/json
+
+### Create target — 201, generated one-time password, forced change, no-store
+POST {{fixtureBaseUrl}}/api/admin/users
+Authorization: Bearer {{fixtureAdminToken}}
 Content-Type: application/json
+Accept: application/json
 
 {
-  "username": "sv_ptit_01",
-  "fullName": "Sinh Viên PTIT 01",
-  "email": "sv01@ptit.edu.vn",
+  "username": "{{fixtureNewUsername}}",
+  "fullName": "Disposable admin-created user",
+  "email": "{{fixtureNewEmail}}",
   "role": "USER"
 }
 
-### 3. Chi tiết người dùng kèm danh sách Gmail metadata (EP-AD3)
-GET {{baseUrl}}/api/admin/users/2
-Authorization: Bearer {{adminToken}}
+### Detail — 200, no credentials
+GET {{fixtureBaseUrl}}/api/admin/users/{{fixtureTargetUserId}}
+Authorization: Bearer {{fixtureAdminToken}}
+Accept: application/json
 
-### 4. Khóa & Mở khóa tài khoản (EP-AD4, EP-AD5)
-PUT {{baseUrl}}/api/admin/users/2/lock
-Authorization: Bearer {{adminToken}}
+### Lock target — 200, previous target bearer now 401 on /me
+PUT {{fixtureBaseUrl}}/api/admin/users/{{fixtureTargetUserId}}/lock
+Authorization: Bearer {{fixtureAdminToken}}
+Accept: application/json
 
-###
-PUT {{baseUrl}}/api/admin/users/2/unlock
-Authorization: Bearer {{adminToken}}
+### Unlock target — 200
+PUT {{fixtureBaseUrl}}/api/admin/users/{{fixtureTargetUserId}}/unlock
+Authorization: Bearer {{fixtureAdminToken}}
+Accept: application/json
 
-### 5. Đổi vai trò (EP-AD6)
-PUT {{baseUrl}}/api/admin/users/2/role
-Authorization: Bearer {{adminToken}}
+### Change target role — 200; immediately restore USER after observing
+PUT {{fixtureBaseUrl}}/api/admin/users/{{fixtureTargetUserId}}/role
+Authorization: Bearer {{fixtureAdminToken}}
 Content-Type: application/json
+Accept: application/json
 
 {
   "role": "ADMIN"
 }
 
-### 6. Đặt lại mật khẩu tạm một lần (EP-AD7)
-PUT {{baseUrl}}/api/admin/users/2/reset-password
-Authorization: Bearer {{adminToken}}
-
-### 7. Đọc & Cập nhật cấu hình hệ thống (EP-S1, EP-S2)
-GET {{baseUrl}}/api/admin/settings
-Authorization: Bearer {{adminToken}}
-
 ###
-PUT {{baseUrl}}/api/admin/settings
-Authorization: Bearer {{adminToken}}
+PUT {{fixtureBaseUrl}}/api/admin/users/{{fixtureTargetUserId}}/role
+Authorization: Bearer {{fixtureAdminToken}}
 Content-Type: application/json
+Accept: application/json
+
+{
+  "role": "USER"
+}
+
+### Reset — generated one-time password, forced-change. Do not save response.
+PUT {{fixtureBaseUrl}}/api/admin/users/{{fixtureTargetUserId}}/reset-password
+Authorization: Bearer {{fixtureAdminToken}}
+Accept: application/json
+
+### Read settings, snapshot original values for restoration
+GET {{fixtureBaseUrl}}/api/admin/settings
+Authorization: Bearer {{fixtureAdminToken}}
+Accept: application/json
+
+### Valid settings body; keep at least one link method enabled
+PUT {{fixtureBaseUrl}}/api/admin/settings
+Authorization: Bearer {{fixtureAdminToken}}
+Content-Type: application/json
+Accept: application/json
 
 {
   "settings": {
-    "ALLOW_REGISTRATION": "true",
+    "ALLOW_REGISTRATION": "false",
     "MAX_GMAIL_PER_USER": "5",
     "MAX_ATTACHMENT_SIZE_MB": "25"
   }
 }
 
-### 8. Thống kê tổng quan (EP-ST1)
-GET {{baseUrl}}/api/admin/stats
-Authorization: Bearer {{adminToken}}
-
-### 9. Nhật ký hệ thống & Xuất CSV (EP-ST2)
-GET {{baseUrl}}/api/admin/logs?page=0&size=20
-Authorization: Bearer {{adminToken}}
+### Verify effective flags, perform valid register probe, restore saved values
+GET {{fixtureBaseUrl}}/api/public/config
+Accept: application/json
 
 ###
-GET {{baseUrl}}/api/admin/logs/export
-Authorization: Bearer {{adminToken}}
+PUT {{fixtureBaseUrl}}/api/admin/settings
+Authorization: Bearer {{fixtureAdminToken}}
+Content-Type: application/json
+Accept: application/json
 
+{
+  "settings": {
+    "ALLOW_REGISTRATION": "{{fixtureOriginalRegistrationFlag}}",
+    "MAX_GMAIL_PER_USER": "{{fixtureOriginalGmailLimit}}",
+    "MAX_ATTACHMENT_SIZE_MB": "{{fixtureOriginalAttachmentLimit}}"
+  }
+}
+
+### Stats
+GET {{fixtureBaseUrl}}/api/admin/stats
+Authorization: Bearer {{fixtureAdminToken}}
+Accept: application/json
+
+### Audit filtered page; use synthetic target/actor only
+GET {{fixtureBaseUrl}}/api/admin/logs?page=0&size=20&action=MAIL_DELETE
+Authorization: Bearer {{fixtureAdminToken}}
+Accept: application/json
+
+### CSV export — correct media; do not save raw audit output
+GET {{fixtureBaseUrl}}/api/admin/logs/export?action=MAIL_DELETE
+Authorization: Bearer {{fixtureAdminToken}}
+Accept: text/csv
+
+### Negative Accept — expected 406 NOT_ACCEPTABLE in fixed source
+GET {{fixtureBaseUrl}}/api/admin/logs/export?action=MAIL_DELETE
+Authorization: Bearer {{fixtureAdminToken}}
+Accept: application/json
+
+### Delete only the explicitly created fixture target after all its checks — 204
+DELETE {{fixtureBaseUrl}}/api/admin/users/{{fixtureTargetUserId}}
+Authorization: Bearer {{fixtureAdminToken}}
+Accept: application/json

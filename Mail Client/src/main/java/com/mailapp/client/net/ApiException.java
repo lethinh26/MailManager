@@ -29,6 +29,24 @@ public class ApiException extends RuntimeException {
         return retryAfterSeconds;
     }
 
+    /** A failed DELETE response may arrive after the IMAP mutation committed. */
+    public static boolean isDeleteOutcomeUncertain(Throwable error) {
+        return isMutationOutcomeUncertain(error);
+    }
+
+    /** An external mail mutation may have committed before a failed reply. */
+    public static boolean isMutationOutcomeUncertain(Throwable error) {
+        while (error instanceof java.util.concurrent.ExecutionException && error.getCause() != null) {
+            error = error.getCause();
+        }
+        if (error instanceof ApiException api) {
+            return api.statusCode >= 500 && !"MAINTENANCE_MODE".equals(api.code)
+                    && !"AUDIT_UNAVAILABLE".equals(api.code);
+        }
+        return error instanceof java.io.IOException || error instanceof InterruptedException
+                || error instanceof java.util.concurrent.CancellationException;
+    }
+
     @Override
     public String toString() {
         return "ApiException{" +

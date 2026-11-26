@@ -77,6 +77,7 @@ public class MustChangePasswordFilter extends OncePerRequestFilter {
                     errorBody.put("error", "FORBIDDEN");
                     errorBody.put("code", "PASSWORD_CHANGE_REQUIRED");
                     errorBody.put("errorCode", "PASSWORD_CHANGE_REQUIRED");
+                    errorBody.put("path", request.getRequestURI());
                     errorBody.put("message", "Tài khoản yêu cầu bắt buộc phải đổi mật khẩu lần đầu trước khi truy cập các tính năng khác.");
 
                     response.getWriter().write(objectMapper.writeValueAsString(errorBody));

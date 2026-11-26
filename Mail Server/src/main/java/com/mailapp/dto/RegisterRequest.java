@@ -11,13 +11,13 @@ import jakarta.validation.constraints.Size;
  */
 public record RegisterRequest(
     @NotBlank(message = "Tên đăng nhập không được để trống")
-    @Size(min = 3, max = 50, message = "Tên đăng nhập phải từ 3 đến 50 ký tự")
+    @Size(min = 3, max = 64, message = "Tên đăng nhập phải từ 3 đến 64 ký tự")
     @Pattern(regexp = "^[a-zA-Z0-9_]+$", message = "Tên đăng nhập chỉ chứa chữ cái, chữ số và dấu gạch dưới")
     String username,
 
     @NotBlank(message = "Email không được để trống")
     @Email(message = "Email không đúng định dạng")
-    @Size(max = 100, message = "Email tối đa 100 ký tự")
+    @Size(max = 255, message = "Email tối đa 255 ký tự")
     String email,
 
     @NotBlank(message = "Mật khẩu không được để trống")
@@ -25,7 +25,7 @@ public record RegisterRequest(
     String password,
 
     @NotBlank(message = "Họ và tên không được để trống")
-    @Size(max = 100, message = "Họ và tên tối đa 100 ký tự")
+    @Size(max = 255, message = "Họ và tên tối đa 255 ký tự")
     String fullName,
 
     String role // Client gửi giá trị gì thì server cũng bỏ qua, luôn gán ROLE_USER

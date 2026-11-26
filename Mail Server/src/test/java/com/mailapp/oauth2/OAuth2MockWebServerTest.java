@@ -1,10 +1,13 @@
 package com.mailapp.oauth2;
 
 import com.mailapp.config.GoogleOAuthConfig;
+import com.mailapp.dto.GmailAccountResponse.LinkOutcome;
+import com.mailapp.exception.AppException;
 import com.mailapp.exception.ReauthRequiredException;
 import com.mailapp.model.AccountStatus;
 import com.mailapp.model.AuthType;
 import com.mailapp.model.GmailAccount;
+import com.mailapp.model.LinkIntent;
 import com.mailapp.model.Role;
 import com.mailapp.model.User;
 import com.mailapp.repository.GmailAccountRepository;
@@ -62,10 +65,11 @@ class OAuth2MockWebServerTest {
         ReflectionTestUtils.setField(oAuthConfig, "redirectUri", "https://localhost:8443/api/oauth2/callback");
         ReflectionTestUtils.setField(oAuthConfig, "tokenUrl", baseUrl + "token");
         ReflectionTestUtils.setField(oAuthConfig, "userinfoUrl", baseUrl + "userinfo");
+        ReflectionTestUtils.setField(oAuthConfig, "profileUrl", baseUrl + "gmail/v1/users/me/profile");
         ReflectionTestUtils.setField(oAuthConfig, "revokeUrl", baseUrl + "revoke");
         ReflectionTestUtils.setField(oAuthConfig, "authUrl", baseUrl + "auth");
 
-        restClient = RestClient.builder().build();
+        restClient = oAuthConfig.googleRestClient();
         stateStore = new OAuth2StateStore();
         gmailAccountRepository = mock(GmailAccountRepository.class);
         userRepository = mock(UserRepository.class);
@@ -102,6 +106,60 @@ class OAuth2MockWebServerTest {
         mockWebServer.shutdown();
     }
 
+    private void enqueueProfile(String email) {
+        mockWebServer.enqueue(new MockResponse().setHeader("Content-Type", "application/json")
+                .setBody("{\"emailAddress\":\"" + email + "\",\"messagesTotal\":3}"));
+    }
+
+    private void enqueueIdentity(String email) {
+        mockWebServer.enqueue(new MockResponse().setHeader("Content-Type", "application/json")
+                .setBody("{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"scope\":\"https://mail.google.com/\",\"expires_in\":3600}"));
+        mockWebServer.enqueue(new MockResponse().setHeader("Content-Type", "application/json")
+                .setBody("{\"email\":\"" + email + "\",\"email_verified\":true}"));
+    }
+
+    @Test
+    void createCallbackRejectsDuplicateWithoutReplacingCredentials() {
+        User user = new User(1L, "owner", "owner@example.com", Role.USER);
+        GmailAccount existing = new GmailAccount();
+        existing.setId(77L);
+        existing.setUser(user);
+        existing.setEmail("owner@gmail.com");
+        existing.setRefreshTokenEncrypted("preserve");
+        when(userRepository.findById(1L)).thenReturn(Optional.of(user));
+        when(gmailAccountRepository.findByUserIdAndEmailKey(1L, "owner@gmail.com"))
+                .thenReturn(Optional.of(existing));
+        var pair = stateStore.generateLinkState(1L, PkceUtil.generateCodeVerifier(), null);
+        enqueueIdentity("owner@gmail.com");
+        enqueueProfile("owner@gmail.com");
+        String html = oauth2Service.handleCallback("test-code", pair.state(), null, null);
+        assertTrue(html.contains("Gmail này đã liên kết"));
+        assertEquals("GMAIL_DUPLICATE", oauth2Service.pollLink(pair.pollToken(), 1L).code());
+        assertEquals("preserve", existing.getRefreshTokenEncrypted());
+        verify(gmailAccountRepository, never()).save(any(GmailAccount.class));
+    }
+
+    @Test
+    void gmailProfileMustMatchVerifiedIdentity() {
+        var pair = stateStore.generateLinkState(1L, PkceUtil.generateCodeVerifier(), null);
+        enqueueIdentity("owner@gmail.com");
+        enqueueProfile("another@gmail.com");
+        oauth2Service.handleCallback("test-code", pair.state(), null, null);
+        assertEquals("ACCOUNT_MISMATCH", oauth2Service.pollLink(pair.pollToken(), 1L).code());
+        verify(gmailAccountRepository, never()).save(any(GmailAccount.class));
+        verify(userRepository, never()).findById(anyLong());
+    }
+
+    @Test
+    void gmailProfileHttpErrorFailsClosed() {
+        var pair = stateStore.generateLinkState(1L, PkceUtil.generateCodeVerifier(), null);
+        enqueueIdentity("owner@gmail.com");
+        mockWebServer.enqueue(new MockResponse().setResponseCode(403));
+        oauth2Service.handleCallback("test-code", pair.state(), null, null);
+        assertEquals("GOOGLE_PROFILE_ERROR", oauth2Service.pollLink(pair.pollToken(), 1L).code());
+        verify(gmailAccountRepository, never()).save(any(GmailAccount.class));
+    }
+
     @Test
     @DisplayName("Callback thành công: Đổi code kèm code_verifier, lấy email, mã hóa refresh token, lưu DB và trả HTML tiếng Việt")
     void testHandleCallbackFullSuccess() throws InterruptedException {
@@ -113,7 +171,9 @@ class OAuth2MockWebServerTest {
 
         // 1. Tạo state và code_verifier
         String codeVerifier = PkceUtil.generateCodeVerifier();
-        String state = stateStore.generateState(userId, codeVerifier);
+        var pair = stateStore.generateLinkState(userId, codeVerifier, null);
+        String state = pair.state();
+        assertEquals("PENDING", oauth2Service.pollLink(pair.pollToken(), userId).status());
 
         // 2. Mock Google Token response (đầy đủ scope Gmail)
         mockWebServer.enqueue(new MockResponse()
@@ -140,12 +200,21 @@ class OAuth2MockWebServerTest {
                         }
                         """));
 
+        enqueueProfile("CUONGDFLE@gmail.com");
         String html = oauth2Service.handleCallback("mock-auth-code", state, null, null);
 
         assertNotNull(html);
         assertTrue(html.contains("Liên kết thành công"));
         assertTrue(html.contains("c***@gmail.com"));
         assertTrue(html.contains("Bạn có thể đóng cửa sổ trình duyệt này và quay lại ứng dụng"));
+        assertEquals(404, assertThrows(AppException.class,
+                () -> oauth2Service.pollLink(pair.pollToken(), 2L)).getStatus().value());
+        var poll = oauth2Service.pollLink(pair.pollToken(), userId);
+        assertEquals("SUCCESS", poll.status());
+        assertEquals(100L, poll.accountId());
+        assertEquals(LinkOutcome.CREATED, poll.outcome());
+        assertEquals(410, assertThrows(AppException.class,
+                () -> oauth2Service.pollLink(pair.pollToken(), userId)).getStatus().value());
 
         // Kiểm tra request đổi token gửi lên MockWebServer có code_verifier
         RecordedRequest tokenRequest = mockWebServer.takeRequest();
@@ -154,10 +223,81 @@ class OAuth2MockWebServerTest {
         assertTrue(requestBody.contains("grant_type=authorization_code"));
         assertTrue(requestBody.contains("code=mock-auth-code"));
         assertTrue(requestBody.contains("code_verifier=" + codeVerifier));
+        RecordedRequest userInfoRequest = mockWebServer.takeRequest();
+        assertEquals("/userinfo", userInfoRequest.getPath());
+        RecordedRequest profileRequest = mockWebServer.takeRequest();
+        assertEquals("/gmail/v1/users/me/profile", profileRequest.getPath());
+        assertEquals("Bearer mock-google-access-token-12345", profileRequest.getHeader("Authorization"));
 
         // Kiểm tra lưu DB
         verify(gmailAccountRepository).save(any(GmailAccount.class));
-        verify(auditLogService).log(eq(userId), eq("LINK_GMAIL"), contains("c***@gmail.com"), any());
+        verify(auditLogService).log(eq(userId), eq("OAUTH2_CALLBACK"), contains("c***@gmail.com"), org.mockito.ArgumentMatchers.<String>any());
+    }
+
+    @Test
+    void targetedCallbackCannotLinkAnotherGoogleAccount() {
+        long userId = 1L;
+        User user = new User(userId, "owner", "owner@example.com", Role.USER);
+        GmailAccount selected = new GmailAccount();
+        selected.setId(77L);
+        selected.setUser(user);
+        selected.setEmail("selected@gmail.com");
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(gmailAccountRepository.findByIdAndUserId(77L, userId)).thenReturn(Optional.of(selected));
+        var start = oauth2Service.getAuthorizeUrl(userId, 77L);
+        String state = start.authorizeUrl().replaceAll(".*state=([^&]+).*", "$1");
+        mockWebServer.enqueue(new MockResponse().setHeader("Content-Type", "application/json")
+                .setBody("""
+                        {"access_token":"test-access","refresh_token":"test-refresh",
+                         "scope":"https://mail.google.com/","expires_in":3600}
+                        """));
+        mockWebServer.enqueue(new MockResponse().setHeader("Content-Type", "application/json")
+                .setBody("""
+                        {"email":"different@gmail.com","email_verified":true}
+                        """));
+        enqueueProfile("different@gmail.com");
+        String html = oauth2Service.handleCallback("test-code", state, null, null);
+        assertTrue(html.contains("Liên kết thất bại"));
+        var result = oauth2Service.pollLink(start.pollToken(), userId);
+        assertEquals("FAILED", result.status());
+        assertEquals("ACCOUNT_MISMATCH", result.code());
+        verify(gmailAccountRepository, never()).save(any(GmailAccount.class));
+    }
+
+    @Test
+    void featureDisabledAfterAuthorizationCompletesPollWithoutContactingGoogle() {
+        var pair = stateStore.generateLinkState(1L, PkceUtil.generateCodeVerifier(), null);
+        when(systemSettingService.isOAuth2LinkEnabled()).thenReturn(false);
+        oauth2Service.handleCallback("unused", pair.state(), null, null);
+        var result = oauth2Service.pollLink(pair.pollToken(), 1L);
+        assertEquals("FAILED", result.status());
+        assertEquals("FEATURE_DISABLED", result.code());
+        assertEquals(0, mockWebServer.getRequestCount());
+        verify(gmailAccountRepository, never()).save(any(GmailAccount.class));
+    }
+
+    @Test
+    void mandatoryPasswordChangeAfterAuthorizationRejectsCallback() {
+        long userId = 1L;
+        User user = new User(userId, "owner", "owner@example.com", Role.USER);
+        var pair = stateStore.generateLinkState(userId, PkceUtil.generateCodeVerifier(), null);
+        user.setMustChangePassword(true);
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        mockWebServer.enqueue(new MockResponse().setHeader("Content-Type", "application/json")
+                .setBody("""
+                        {"access_token":"test-access","refresh_token":"test-refresh",
+                         "scope":"https://mail.google.com/","expires_in":3600}
+                        """));
+        mockWebServer.enqueue(new MockResponse().setHeader("Content-Type", "application/json")
+                .setBody("""
+                        {"email":"owner@gmail.com","email_verified":true}
+                        """));
+        enqueueProfile("owner@gmail.com");
+        oauth2Service.handleCallback("test-code", pair.state(), null, null);
+        var result = oauth2Service.pollLink(pair.pollToken(), userId);
+        assertEquals("FAILED", result.status());
+        assertEquals("PASSWORD_CHANGE_REQUIRED", result.code());
+        verify(gmailAccountRepository, never()).save(any(GmailAccount.class));
     }
 
     @Test
@@ -179,7 +319,7 @@ class OAuth2MockWebServerTest {
                 .thenReturn(Optional.of(existingAccount));
 
         String codeVerifier = PkceUtil.generateCodeVerifier();
-        String state = stateStore.generateState(userId, codeVerifier);
+        String state = stateStore.generateLinkState(userId, codeVerifier, null, LinkIntent.UPSERT).state();
 
         mockWebServer.enqueue(new MockResponse()
                 .setHeader("Content-Type", "application/json")
@@ -203,6 +343,7 @@ class OAuth2MockWebServerTest {
                         }
                         """));
 
+        enqueueProfile("cuongdfle@gmail.com");
         String html = oauth2Service.handleCallback("code-xyz", state, null, null);
 
         assertTrue(html.contains("Cập nhật ủy quyền thành công"));
@@ -315,8 +456,72 @@ class OAuth2MockWebServerTest {
         );
 
         assertEquals(AccountStatus.NEEDS_REAUTH, account.getStatus());
+        assertThrows(ReauthRequiredException.class, () -> oauth2Service.getFreshAccessToken(account));
+        assertEquals(1, mockWebServer.getRequestCount());
         verify(gmailAccountRepository).save(account);
-        verify(auditLogService).log(any(), eq("GMAIL_NEEDS_REAUTH"), anyString(), any());
+        verify(auditLogService).log(any(), eq("GMAIL_NEEDS_REAUTH"), anyString(), org.mockito.ArgumentMatchers.<String>any());
+    }
+
+    private GmailAccount refreshFixture(Long id, String grant) {
+        GmailAccount account = new GmailAccount();
+        account.setId(id);
+        account.setEmail("refresh-fixture@example.test");
+        account.setAuthType(AuthType.OAUTH2);
+        account.setStatus(AccountStatus.ACTIVE);
+        account.setRefreshTokenEncrypted(aesCipher.encrypt(grant));
+        return account;
+    }
+
+    @Test
+    void refreshCacheIsBoundToGrantAndOnlyPublishedAfterSave() {
+        GmailAccount oldGrant = refreshFixture(200L, "fixture-old-grant");
+        GmailAccount newGrant = refreshFixture(200L, "fixture-new-grant");
+        mockWebServer.enqueue(new MockResponse().setHeader("Content-Type", "application/json")
+                .setBody("{\"access_token\":\"fixture-a\",\"expires_in\":3600}"));
+        assertTrue("fixture-a".equals(oauth2Service.getFreshAccessToken(oldGrant)));
+        mockWebServer.enqueue(new MockResponse().setHeader("Content-Type", "application/json")
+                .setBody("{\"access_token\":\"fixture-b\",\"expires_in\":3600}"));
+        when(gmailAccountRepository.save(newGrant)).thenThrow(new org.springframework.dao.OptimisticLockingFailureException("fixture conflict"));
+        AppException conflict = assertThrows(AppException.class, () -> oauth2Service.getFreshAccessToken(newGrant));
+        assertEquals("GMAIL_ACCOUNT_CHANGED", conflict.getCode());
+        assertEquals(2, mockWebServer.getRequestCount());
+        // A later independent grant must never see the failed save's token.
+        GmailAccount latest = refreshFixture(200L, "fixture-latest-grant");
+        mockWebServer.enqueue(new MockResponse().setHeader("Content-Type", "application/json")
+                .setBody("{\"access_token\":\"fixture-c\",\"refresh_token\":\"fixture-rotated\",\"expires_in\":3600,\"scope\":\"https://mail.google.com/\"}"));
+        assertTrue("fixture-c".equals(oauth2Service.getFreshAccessToken(latest)));
+        assertTrue("fixture-rotated".equals(aesCipher.decrypt(latest.getRefreshTokenEncrypted())));
+        assertTrue("fixture-c".equals(oauth2Service.getFreshAccessToken(latest)));
+        assertEquals(3, mockWebServer.getRequestCount());
+    }
+
+    @Test
+    void explicitReducedScopeRejectsGrantAndSuppressesRepeatedRefresh() {
+        GmailAccount account = refreshFixture(201L, "fixture-reduced-grant");
+        GmailAccount stale = refreshFixture(201L, "unused-fixture");
+        stale.setRefreshTokenEncrypted(account.getRefreshTokenEncrypted());
+        mockWebServer.enqueue(new MockResponse().setHeader("Content-Type", "application/json")
+                .setBody("{\"access_token\":\"fixture-insufficient\",\"expires_in\":3600,\"scope\":\"openid email\"}"));
+        assertThrows(ReauthRequiredException.class, () -> oauth2Service.getFreshAccessToken(account));
+        assertEquals(AccountStatus.NEEDS_REAUTH, account.getStatus());
+        assertThrows(ReauthRequiredException.class, () -> oauth2Service.getFreshAccessToken(stale));
+        assertThrows(ReauthRequiredException.class, () -> oauth2Service.getFreshAccessToken(account));
+        assertEquals(1, mockWebServer.getRequestCount());
+        verify(gmailAccountRepository).save(account);
+        verify(auditLogService).log(any(), eq("GMAIL_NEEDS_REAUTH"), anyString(), org.mockito.ArgumentMatchers.<String>any());
+    }
+
+    @Test
+    void unrelatedProviderErrorDoesNotInvalidateGrantFromDescription() {
+        GmailAccount account = refreshFixture(202L, "fixture-active-grant");
+        mockWebServer.enqueue(new MockResponse().setResponseCode(400).setHeader("Content-Type", "application/json")
+                .setBody("{\"error\":\"invalid_request\",\"error_description\":\"not invalid_grant\"}"));
+        AppException error = assertThrows(AppException.class, () -> oauth2Service.getFreshAccessToken(account));
+        assertEquals("GMAIL_CONNECTION_ERROR", error.getCode());
+        assertEquals(AccountStatus.ACTIVE, account.getStatus());
+        verify(gmailAccountRepository, never()).save(any());
+        verifyNoInteractions(auditLogService);
+        assertEquals(1, mockWebServer.getRequestCount());
     }
 
     @Test
@@ -369,7 +574,7 @@ class OAuth2MockWebServerTest {
         assertEquals(1, mockWebServer.getRequestCount(), "Chỉ gọi /token, không gọi /userinfo khi thiếu scope Gmail");
 
         // Đảm bảo ghi audit LINK_GMAIL_DENIED_SCOPE
-        verify(auditLogService).log(eq(userId), eq("LINK_GMAIL_DENIED_SCOPE"), contains("https://mail.google.com/"), any());
+        verify(auditLogService).log(eq(userId), eq("LINK_GMAIL_DENIED_SCOPE"), contains("https://mail.google.com/"), org.mockito.ArgumentMatchers.<String>any());
     }
 
     @Test
@@ -461,6 +666,7 @@ class OAuth2MockWebServerTest {
                         }
                         """));
 
+        enqueueProfile("cuongdfle@gmail.com");
         String html = loginService.handleCallback("code-merge-123", state, null, null);
         assertTrue(html.contains("hợp nhất tự động"));
         assertTrue(html.contains("Email Google trả về"));
@@ -478,6 +684,36 @@ class OAuth2MockWebServerTest {
 
         // Poll lần 2 bị từ chối vì pollToken chỉ dùng 1 lần (single-use)
         assertThrows(com.mailapp.exception.AppException.class, () -> loginService.pollGoogleLogin(start.pollToken()));
+    }
+
+    @Test
+    void googleLoginCanAuthenticateButCannotAutoLinkBeforePasswordChange() {
+        var mockJwt = mock(com.mailapp.security.JwtProvider.class);
+        var mockEnc = mock(org.springframework.security.crypto.password.PasswordEncoder.class);
+        OAuth2ServiceImpl loginService = new OAuth2ServiceImpl(oAuthConfig, stateStore, gmailAccountRepository,
+                userRepository, systemSettingService, auditLogService, aesCipher, restClient, mockJwt, mockEnc);
+        User user = new User(42L, "password_reset", "reset@gmail.com", Role.USER);
+        user.setFullName("Reset User");
+        user.setMustChangePassword(true);
+        when(userRepository.findByEmailIgnoreCase("reset@gmail.com")).thenReturn(Optional.of(user));
+        when(mockJwt.generateToken(user)).thenReturn("test-jwt");
+        when(mockJwt.getExpirationSeconds()).thenReturn(86400L);
+        var pair = stateStore.generateGoogleLoginState(PkceUtil.generateCodeVerifier());
+        mockWebServer.enqueue(new MockResponse().setHeader("Content-Type", "application/json")
+                .setBody("""
+                        {"access_token":"test-access","refresh_token":"test-refresh",
+                         "scope":"https://mail.google.com/","expires_in":3600}
+                        """));
+        mockWebServer.enqueue(new MockResponse().setHeader("Content-Type", "application/json")
+                .setBody("""
+                        {"email":"reset@gmail.com","email_verified":true}
+                        """));
+        enqueueProfile("reset@gmail.com");
+        loginService.handleCallback("test-code", pair.state(), null, null);
+        var poll = loginService.pollGoogleLogin(pair.pollToken());
+        assertEquals("SUCCESS", poll.status());
+        assertTrue(poll.loginResponse().user().mustChangePassword());
+        verify(gmailAccountRepository, never()).save(any(GmailAccount.class));
     }
 
     @Test
@@ -501,7 +737,7 @@ class OAuth2MockWebServerTest {
                 .thenReturn(Optional.of(existing));
 
         String codeVerifier = PkceUtil.generateCodeVerifier();
-        String state = stateStore.generateState(userId, codeVerifier);
+        String state = stateStore.generateLinkState(userId, codeVerifier, null, LinkIntent.UPSERT).state();
 
         mockWebServer.enqueue(new MockResponse()
                 .setHeader("Content-Type", "application/json")
@@ -524,6 +760,7 @@ class OAuth2MockWebServerTest {
                         }
                         """));
 
+        enqueueProfile("cuongdfle+work@googlemail.com");
         String html = oauth2Service.handleCallback("code-add-oauth", state, null, null);
         assertTrue(html.contains("Đã thêm phương thức"));
         assertTrue(html.contains("Email Google trả về"));

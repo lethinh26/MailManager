@@ -52,15 +52,43 @@ public class ApiClient {
     }
 
     public ApiClient(String baseUrl, File certFile) {
-        this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
+        this.baseUrl = validatedBaseUrl(baseUrl);
         this.objectMapper = createObjectMapper();
         this.httpClient = createHttpClient(certFile, null);
     }
 
     public ApiClient(String baseUrl, SSLContext sslContext) {
-        this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
+        this.baseUrl = validatedBaseUrl(baseUrl);
         this.objectMapper = createObjectMapper();
         this.httpClient = createHttpClient(null, sslContext);
+    }
+
+    private ApiClient(ApiClient previous) {
+        this.baseUrl = previous.baseUrl;
+        this.httpClient = previous.httpClient;
+        this.objectMapper = previous.objectMapper;
+    }
+
+    /**
+     * Preserve the configured TLS transport but never share credentials with a new login.
+     * An unfinished worker from a closed window must not acquire the next user's token.
+     */
+    public ApiClient newUnauthenticatedClient() {
+        return new ApiClient(this);
+    }
+
+    private static String validatedBaseUrl(String value) {
+        URI uri = URI.create(value == null ? DEFAULT_BASE_URL : value.trim());
+        String host = uri.getHost();
+        String scheme = uri.getScheme();
+        boolean loopback = "localhost".equalsIgnoreCase(host) || "127.0.0.1".equals(host)
+                || "[::1]".equals(host) || "::1".equals(host);
+        if (host == null || uri.getUserInfo() != null || uri.getQuery() != null || uri.getFragment() != null
+                || !("https".equalsIgnoreCase(scheme) || ("http".equalsIgnoreCase(scheme) && loopback))) {
+            throw new IllegalArgumentException("Chỉ cho phép HTTPS hoặc HTTP trên loopback để kiểm thử.");
+        }
+        String normalized = uri.toString();
+        return normalized.endsWith("/") ? normalized.substring(0, normalized.length() - 1) : normalized;
     }
 
     private ObjectMapper createObjectMapper() {
@@ -72,10 +100,7 @@ public class ApiClient {
 
     private HttpClient createHttpClient(File explicitCertFile, SSLContext explicitSslContext) {
         try {
-            String lowerUrl = this.baseUrl.toLowerCase(Locale.ROOT);
-            boolean isPlainLoopbackHttp = explicitSslContext == null
-                    && explicitCertFile == null
-                    && (lowerUrl.startsWith("http://localhost") || lowerUrl.startsWith("http://127.0.0.1"));
+            boolean isPlainLoopbackHttp = "http".equalsIgnoreCase(URI.create(this.baseUrl).getScheme());
             if (isPlainLoopbackHttp) {
                 return HttpClient.newBuilder()
                         .connectTimeout(Duration.ofSeconds(10))
@@ -146,7 +171,7 @@ public class ApiClient {
         return sc;
     }
 
-    public void setAccessToken(String token) {
+    public synchronized void setAccessToken(String token) {
         this.accessToken = token;
     }
 
@@ -154,7 +179,7 @@ public class ApiClient {
         return accessToken;
     }
 
-    public void clearAccessToken() {
+    public synchronized void clearAccessToken() {
         this.accessToken = null;
     }
 
@@ -197,6 +222,15 @@ public class ApiClient {
      * [EP-A2] Đăng nhập hệ thống, nhận Access Token JWT.
      */
     public LoginResponse login(String username, String password) throws IOException, InterruptedException {
+        LoginResponse response = requestLogin(username, password);
+        if (response != null && response.accessToken() != null) {
+            this.accessToken = response.accessToken();
+        }
+        return response;
+    }
+
+    /** Login without publishing a token until the UI has verified /me and accepted the result. */
+    public LoginResponse requestLogin(String username, String password) throws IOException, InterruptedException {
         LoginRequest body = new LoginRequest(username, password);
         String json = objectMapper.writeValueAsString(body);
 
@@ -205,11 +239,22 @@ public class ApiClient {
                 .POST(HttpRequest.BodyPublishers.ofString(json))
                 .build();
 
-        LoginResponse response = execute(request, LoginResponse.class);
-        if (response != null && response.accessToken() != null) {
-            this.accessToken = response.accessToken();
+        return execute(request, LoginResponse.class);
+    }
+
+    public LoginResponse verifyLogin(LoginResponse response) throws IOException, InterruptedException {
+        if (response == null || response.accessToken() == null || response.accessToken().isBlank()) {
+            throw new ApiException(401, "INVALID_CREDENTIALS", "Máy chủ không cấp phiên đăng nhập hợp lệ.");
         }
-        return response;
+        HttpRequest request = HttpRequest.newBuilder(URI.create(baseUrl + "/api/auth/me"))
+                .header("Authorization", "Bearer " + response.accessToken())
+                .header("Accept", "application/json")
+                .timeout(Duration.ofSeconds(15)).GET().build();
+        UserDto user = execute(request, UserDto.class);
+        if (user == null || user.id() == null) {
+            throw new ApiException(401, "INVALID_SESSION", "Không xác minh được phiên đăng nhập.");
+        }
+        return new LoginResponse(response.accessToken(), response.tokenType(), response.expiresIn(), user);
     }
 
     public record GoogleLoginStartDto(String authorizeUrl, String pollToken) {}
@@ -229,15 +274,19 @@ public class ApiClient {
      * Kiểm tra kết quả phiên Đăng nhập Google OAuth2 bằng pollToken (PENDING / SUCCESS / FAILED).
      */
     public GoogleLoginPollDto pollGoogleOAuthLogin(String pollToken) throws IOException, InterruptedException {
-        HttpRequest request = newRequestBuilder("/api/auth/oauth2/google/poll?pollToken=" + urlEnc(pollToken))
-                .GET()
-                .build();
-        GoogleLoginPollDto dto = execute(request, GoogleLoginPollDto.class);
+        GoogleLoginPollDto dto = requestGoogleOAuthLoginPoll(pollToken);
         if (dto != null && "SUCCESS".equalsIgnoreCase(dto.status())
                 && dto.loginResponse() != null && dto.loginResponse().accessToken() != null) {
             this.accessToken = dto.loginResponse().accessToken();
         }
         return dto;
+    }
+
+    public GoogleLoginPollDto requestGoogleOAuthLoginPoll(String pollToken) throws IOException, InterruptedException {
+        HttpRequest request = newRequestBuilder("/api/auth/oauth2/google/poll?pollToken=" + urlEnc(pollToken))
+                .GET()
+                .build();
+        return execute(request, GoogleLoginPollDto.class);
     }
 
     /**
@@ -269,6 +318,18 @@ public class ApiClient {
      */
     public ChangePasswordResponse changePassword(String currentPassword, String newPassword)
             throws IOException, InterruptedException {
+        String previous = accessToken;
+        ChangePasswordResponse response = requestChangePassword(currentPassword, newPassword);
+        synchronized (this) {
+            if (response != null && response.accessToken() != null && Objects.equals(previous, accessToken)) {
+                accessToken = response.accessToken();
+            }
+        }
+        return response;
+    }
+
+    public ChangePasswordResponse requestChangePassword(String currentPassword, String newPassword)
+            throws IOException, InterruptedException {
         ChangePasswordRequest body = new ChangePasswordRequest(currentPassword, newPassword);
         String json = objectMapper.writeValueAsString(body);
 
@@ -277,11 +338,7 @@ public class ApiClient {
                 .POST(HttpRequest.BodyPublishers.ofString(json))
                 .build();
 
-        ChangePasswordResponse response = execute(request, ChangePasswordResponse.class);
-        if (response != null && response.accessToken() != null) {
-            this.accessToken = response.accessToken();
-        }
-        return response;
+        return execute(request, ChangePasswordResponse.class);
     }
 
     /**
@@ -312,9 +369,15 @@ public class ApiClient {
      * [EP-O1] Lấy URL uỷ quyền Google OAuth2 (tùy chọn accountId khi thêm OAuth2 hoặc cấp lại quyền cho hộp thư đã có).
      */
     public String getOAuth2AuthorizeUrl(Long existingAccountId) throws IOException, InterruptedException {
-        String path = existingAccountId != null
-                ? "/api/oauth2/authorize-url?accountId=" + existingAccountId
-                : "/api/oauth2/authorize-url";
+        return startOAuth2Link(existingAccountId).authorizeUrl();
+    }
+
+    public record OAuthLinkStartDto(String authorizeUrl, String pollToken) {}
+    public record OAuthLinkPollDto(String status, String code, String message, Long accountId) {}
+
+    public OAuthLinkStartDto startOAuth2Link(Long existingAccountId) throws IOException, InterruptedException {
+        String path = "/api/oauth2/authorize-url?intent=UPSERT"
+                + (existingAccountId != null ? "&accountId=" + existingAccountId : "");
         HttpRequest request = newRequestBuilder(path)
                 .GET()
                 .build();
@@ -322,11 +385,14 @@ public class ApiClient {
         HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
         handleErrorIfNeeded(response);
 
-        JsonNode root = objectMapper.readTree(response.body());
-        if (root.hasNonNull("authorizeUrl")) {
-            return root.get("authorizeUrl").asText();
-        }
+        OAuthLinkStartDto result = objectMapper.readValue(response.body(), OAuthLinkStartDto.class);
+        if (result != null && result.authorizeUrl() != null && !result.authorizeUrl().isBlank()) return result;
         throw new ApiException(response.statusCode(), "PARSE_ERROR", "Không tìm thấy URL uỷ quyền trong phản hồi máy chủ.");
+    }
+
+    public OAuthLinkPollDto pollOAuth2Link(String pollToken) throws IOException, InterruptedException {
+        HttpRequest request = newRequestBuilder("/api/oauth2/link/poll?pollToken=" + urlEnc(pollToken)).GET().build();
+        return execute(request, OAuthLinkPollDto.class);
     }
 
     /**
@@ -366,6 +432,7 @@ public class ApiClient {
         Map<String, String> payload = new java.util.LinkedHashMap<>();
         payload.put("email", email);
         payload.put("appPassword", appPassword);
+        payload.put("intent", "UPSERT");
         if (displayName != null && !displayName.isBlank()) {
             payload.put("displayName", displayName);
         }
@@ -480,11 +547,17 @@ public class ApiClient {
      */
     public MailDetailResponse getMailDetail(Long gmailId, String folder, long uid,
                                             boolean loadRemote, Long uidValidity) throws IOException, InterruptedException {
+        return getMailDetail(gmailId, folder, uid, loadRemote, uidValidity, true);
+    }
+
+    public MailDetailResponse getMailDetail(Long gmailId, String folder, long uid,
+                                            boolean loadRemote, Long uidValidity, boolean markSeen) throws IOException, InterruptedException {
         StringBuilder path = new StringBuilder("/api/mails/")
                 .append(gmailId).append("/")
                 .append(urlEnc(folder)).append("/")
                 .append(uid)
                 .append("?loadRemote=").append(loadRemote);
+        if (!markSeen) path.append("&markSeen=false");
         if (uidValidity != null) path.append("&uidValidity=").append(uidValidity);
 
         HttpRequest request = newMailRequestBuilder(path.toString()).GET().build();
@@ -544,6 +617,10 @@ public class ApiClient {
             }
             os.flush();
         }
+        var expectedLength = response.headers().firstValueAsLong("Content-Length");
+        if (expectedLength.isPresent() && expectedLength.getAsLong() != totalBytes) {
+            throw new IOException("Tệp tải xuống không đầy đủ.");
+        }
 
         StringBuilder hex = new StringBuilder();
         for (byte b : sha.digest()) {
@@ -558,40 +635,40 @@ public class ApiClient {
     public SendMailResponse sendMailMultipart(SendMailPayload payload, List<File> attachmentFiles)
             throws IOException, InterruptedException {
         String boundary = "----MailManagerBoundary" + UUID.randomUUID().toString().replace("-", "");
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        List<HttpRequest.BodyPublisher> parts = new ArrayList<>();
         String crlf = "\r\n";
 
         // Part 1: JSON payload
         String payloadJson = objectMapper.writeValueAsString(payload);
-        baos.write(("--" + boundary + crlf).getBytes(StandardCharsets.UTF_8));
-        baos.write(("Content-Disposition: form-data; name=\"payload\"" + crlf).getBytes(StandardCharsets.UTF_8));
-        baos.write(("Content-Type: application/json; charset=UTF-8" + crlf + crlf).getBytes(StandardCharsets.UTF_8));
-        baos.write(payloadJson.getBytes(StandardCharsets.UTF_8));
-        baos.write(crlf.getBytes(StandardCharsets.UTF_8));
+        parts.add(HttpRequest.BodyPublishers.ofString("--" + boundary + crlf
+                + "Content-Disposition: form-data; name=\"payload\"" + crlf
+                + "Content-Type: application/json; charset=UTF-8" + crlf + crlf
+                + payloadJson + crlf, StandardCharsets.UTF_8));
 
         // Part 2..N: Attachments
         if (attachmentFiles != null) {
             for (File f : attachmentFiles) {
-                if (f == null || !f.exists() || !f.isFile()) continue;
-                String safeName = f.getName().replace("\"", "_");
+                if (!com.mailapp.client.util.ComposeValidation.isReadableRegularFile(f))
+                    throw new IOException("Tệp đính kèm không đọc được.");
+                String safeName = com.mailapp.client.service.AttachmentCleanupService.sanitizeFilename(f.getName());
                 String mimeType = Files.probeContentType(f.toPath());
                 if (mimeType == null || mimeType.isBlank()) mimeType = "application/octet-stream";
 
-                baos.write(("--" + boundary + crlf).getBytes(StandardCharsets.UTF_8));
-                baos.write(("Content-Disposition: form-data; name=\"attachments\"; filename=\"" + safeName + "\"" + crlf).getBytes(StandardCharsets.UTF_8));
-                baos.write(("Content-Type: " + mimeType + crlf + crlf).getBytes(StandardCharsets.UTF_8));
-                baos.write(Files.readAllBytes(f.toPath()));
-                baos.write(crlf.getBytes(StandardCharsets.UTF_8));
+                parts.add(HttpRequest.BodyPublishers.ofString("--" + boundary + crlf
+                        + "Content-Disposition: form-data; name=\"attachments\"; filename=\"" + safeName + "\"" + crlf
+                        + "Content-Type: " + mimeType + crlf + crlf, StandardCharsets.UTF_8));
+                parts.add(HttpRequest.BodyPublishers.ofFile(f.toPath()));
+                parts.add(HttpRequest.BodyPublishers.ofString(crlf, StandardCharsets.UTF_8));
             }
         }
-        baos.write(("--" + boundary + "--" + crlf).getBytes(StandardCharsets.UTF_8));
+        parts.add(HttpRequest.BodyPublishers.ofString("--" + boundary + "--" + crlf, StandardCharsets.UTF_8));
 
         HttpRequest.Builder builder = HttpRequest.newBuilder()
                 .uri(URI.create(baseUrl + "/api/mails/send"))
                 .timeout(Duration.ofSeconds(120))
                 .header("Content-Type", "multipart/form-data; boundary=" + boundary)
                 .header("Accept", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofByteArray(baos.toByteArray()));
+                .POST(HttpRequest.BodyPublishers.concat(parts.toArray(HttpRequest.BodyPublisher[]::new)));
         if (accessToken != null && !accessToken.isBlank()) {
             builder.header("Authorization", "Bearer " + accessToken);
         }
@@ -756,6 +833,17 @@ public class ApiClient {
     public long adminExportLogsCsvToFile(Long userId, String username, String action,
                                          String from, String to, File targetFile)
             throws IOException, InterruptedException {
+        return adminExportLogsCsvToFile(userId, username, action, from, to, targetFile, () -> true);
+    }
+
+    public long adminExportLogsCsvToFile(Long userId, String username, String action,
+                                         String from, String to, File targetFile,
+                                         java.util.function.BooleanSupplier stillCurrent)
+            throws IOException, InterruptedException {
+        if (!stillCurrent.getAsBoolean()) throw new InterruptedException();
+        java.nio.file.Path destination = targetFile.toPath().toAbsolutePath().normalize();
+        if (Files.exists(destination, java.nio.file.LinkOption.NOFOLLOW_LINKS))
+            throw new IOException("Tệp CSV đã tồn tại. Hãy chọn tên khác.");
         StringBuilder path = new StringBuilder("/api/admin/logs/export?");
         if (userId != null) path.append("userId=").append(userId).append("&");
         if (username != null && !username.isBlank()) path.append("username=").append(urlEnc(username.trim())).append("&");
@@ -776,10 +864,24 @@ public class ApiClient {
         if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
             handleErrorBody(resp.statusCode(), new String(resp.body(), StandardCharsets.UTF_8), resp.headers());
         }
-        File parent = targetFile.getParentFile();
-        if (parent != null && !parent.exists()) parent.mkdirs();
-        Files.write(targetFile.toPath(), resp.body());
-        return resp.body().length;
+        if (!resp.headers().firstValue("Content-Type").orElse("").toLowerCase(Locale.ROOT).startsWith("text/csv"))
+            throw new IOException("Máy chủ không trả dữ liệu CSV.");
+        if (!stillCurrent.getAsBoolean() || Thread.currentThread().isInterrupted()) throw new InterruptedException();
+        java.nio.file.Path parent = destination.getParent();
+        Files.createDirectories(parent);
+        java.nio.file.Path temporary = Files.createTempFile(parent, ".mailapp-csv-", ".part");
+        try {
+            Files.write(temporary, resp.body());
+            // Linearize publishing the export with SessionStore's synchronized
+            // clear/save/update methods; a stale callback cannot publish it.
+            synchronized (com.mailapp.client.util.SessionStore.getInstance()) {
+                if (!stillCurrent.getAsBoolean() || Thread.currentThread().isInterrupted()) throw new InterruptedException();
+                Files.move(temporary, destination); // Never overwrite an existing file.
+            }
+            return resp.body().length;
+        } finally {
+            Files.deleteIfExists(temporary);
+        }
     }
 
     private String urlEnc(String s) {
@@ -875,9 +977,7 @@ public class ApiClient {
                 } else if (root.hasNonNull("error")) {
                     message = root.get("error").asText();
                 }
-            } catch (Exception ignored) {
-                message = body;
-            }
+            } catch (Exception ignored) {}
         }
 
         throw new ApiException(status, code, message, (int) retryAfter);

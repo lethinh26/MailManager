@@ -22,6 +22,12 @@ public class GmailFolderResolver {
 
     private static final Logger log = LoggerFactory.getLogger(GmailFolderResolver.class);
 
+    public static final class MissingSpecialFolderException extends MessagingException {
+        public MissingSpecialFolderException(SpecialFolder folder) {
+            super("Không thể phân giải thư mục Gmail: " + folder);
+        }
+    }
+
     public enum SpecialFolder {
         INBOX("\\Inbox"),
         SENT("\\Sent"),
@@ -73,13 +79,7 @@ public class GmailFolderResolver {
 
         // Mỗi lần gọi resolve() riêng lẻ phải LIST một lần. listFolders() dùng overload
         // bên dưới để tái dùng cùng một kết quả LIST cho toàn bộ thư mục đặc biệt.
-        Folder[] allFolders;
-        try {
-            allFolders = store.getDefaultFolder().list("*");
-        } catch (Exception e) {
-            log.debug("Không thể duyệt thuộc tính RFC 6154, chuyển sang cơ chế fallback: {}", e.getMessage());
-            allFolders = new Folder[0];
-        }
+        Folder[] allFolders = store.getDefaultFolder().list("*");
         return resolve(store, allFolders, target);
     }
 
@@ -112,19 +112,18 @@ public class GmailFolderResolver {
         // 3. Fallback: Thử tìm theo danh sách tên phổ biến (đa ngôn ngữ)
         List<String> candidates = FALLBACK_NAMES.getOrDefault(target, Collections.emptyList());
         for (String candidate : candidates) {
-            try {
-                Folder folder = store.getFolder(candidate);
-                if (folder != null && folder.exists()) {
-                    log.debug("Phân giải thư mục {} theo fallback name thành công: {}", target, candidate);
-                    return folder;
-                }
-            } catch (Exception ignored) {}
+            Folder folder = store.getFolder(candidate);
+            if (folder != null && folder.exists()) {
+                log.debug("Phân giải thư mục {} theo fallback name thành công: {}", target, candidate);
+                return folder;
+            }
         }
 
-        throw new MessagingException("Không thể phân giải thư mục Gmail: " + target + ". Đã thử RFC 6154 và các tên thay thế.");
+        throw new MissingSpecialFolderException(target);
     }
 
-    private boolean hasAttribute(Folder folder, String expectedAttribute) {
+    private boolean hasAttribute(Folder folder, String expectedAttribute) throws MessagingException {
+        if (folder == null) return false;
         try {
             java.lang.reflect.Method method = folder.getClass().getMethod("getAttributes");
             String[] attributes = (String[]) method.invoke(folder);
@@ -135,7 +134,12 @@ public class GmailFolderResolver {
                     }
                 }
             }
-        } catch (Exception ignored) {}
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            if (e.getCause() instanceof MessagingException mailError) throw mailError;
+            throw new MessagingException("Không thể đọc thuộc tính thư mục", e);
+        } catch (ReflectiveOperationException ignored) {
+            // Non-IMAP adapters may not expose RFC 6154 attributes.
+        }
         return false;
     }
 }

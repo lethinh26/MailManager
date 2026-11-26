@@ -2,7 +2,10 @@ package com.mailapp.oauth2;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.Ticker;
 import com.mailapp.dto.LoginResponse;
+import com.mailapp.dto.GmailAccountResponse.LinkOutcome;
+import com.mailapp.model.LinkIntent;
 import org.springframework.stereotype.Component;
 
 import java.security.SecureRandom;
@@ -34,27 +37,48 @@ public class OAuth2StateStore {
     /**
      * Dữ liệu lưu kèm mỗi state.
      */
-    public record StateEntry(Long userId, String codeVerifier, Instant createdAt, FlowType flowType, String pollToken) {
+    public record StateEntry(Long userId, String codeVerifier, Instant createdAt, FlowType flowType,
+                             String pollToken, Long accountId, LinkIntent intent) {
         public StateEntry(Long userId, String codeVerifier, Instant createdAt) {
-            this(userId, codeVerifier, createdAt, FlowType.LINK_GMAIL, null);
+            this(userId, codeVerifier, createdAt, FlowType.LINK_GMAIL, null, null, LinkIntent.CREATE);
+        }
+        public StateEntry(Long userId, String codeVerifier, Instant createdAt, FlowType flowType, String pollToken) {
+            this(userId, codeVerifier, createdAt, flowType, pollToken, null, LinkIntent.CREATE);
+        }
+        public StateEntry(Long userId, String codeVerifier, Instant createdAt, FlowType flowType,
+                          String pollToken, Long accountId) {
+            this(userId, codeVerifier, createdAt, flowType, pollToken, accountId,
+                    accountId == null ? LinkIntent.CREATE : LinkIntent.UPSERT);
         }
     }
 
     public record LoginPollEntry(PollStatus status, LoginResponse loginResponse, String errorCode, String errorMessage) {}
+    public record LinkPollEntry(Long userId, PollStatus status, Long accountId, LinkOutcome outcome,
+                                String code, String message) {}
+    public record LinkStatePair(String state, String pollToken) {}
 
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
 
-    // Cache state CSRF trong bộ nhớ với Caffeine, TTL 10 phút
-    private final Cache<String, StateEntry> cache = Caffeine.newBuilder()
-            .expireAfterWrite(10, TimeUnit.MINUTES)
-            .maximumSize(10000)
-            .build();
+    // Cache state CSRF trong bộ nhớ với Caffeine, TTL 5 phút.
+    private final Cache<String, StateEntry> cache;
 
     // Cache phiên chờ đăng nhập Google (key = pollToken 256-bit), TTL 5 phút, dùng 1 lần khi hoàn tất
-    private final Cache<String, LoginPollEntry> loginPollCache = Caffeine.newBuilder()
-            .expireAfterWrite(5, TimeUnit.MINUTES)
-            .maximumSize(5000)
-            .build();
+    private final Cache<String, LoginPollEntry> loginPollCache;
+
+    private final Cache<String, LinkPollEntry> linkPollCache;
+
+    public OAuth2StateStore() {
+        this(Ticker.systemTicker());
+    }
+
+    OAuth2StateStore(Ticker ticker) {
+        cache = Caffeine.newBuilder().ticker(ticker)
+                .expireAfterWrite(5, TimeUnit.MINUTES).maximumSize(10000).build();
+        loginPollCache = Caffeine.newBuilder().ticker(ticker)
+                .expireAfterWrite(5, TimeUnit.MINUTES).maximumSize(5000).build();
+        linkPollCache = Caffeine.newBuilder().ticker(ticker)
+                .expireAfterWrite(5, TimeUnit.MINUTES).maximumSize(10000).build();
+    }
 
     /**
      * Sinh state cho luồng Liên kết Gmail (user đã đăng nhập).
@@ -63,6 +87,44 @@ public class OAuth2StateStore {
         String state = randomToken(24);
         cache.put(state, new StateEntry(userId, codeVerifier, Instant.now(), FlowType.LINK_GMAIL, null));
         return state;
+    }
+
+    public LinkStatePair generateLinkState(Long userId, String codeVerifier, Long accountId) {
+        return generateLinkState(userId, codeVerifier, accountId,
+                accountId == null ? LinkIntent.CREATE : LinkIntent.UPSERT);
+    }
+
+    public LinkStatePair generateLinkState(Long userId, String codeVerifier, Long accountId, LinkIntent intent) {
+        String state = randomToken(24);
+        String pollToken = randomToken(32);
+        cache.put(state, new StateEntry(userId, codeVerifier, Instant.now(), FlowType.LINK_GMAIL, pollToken, accountId, intent));
+        linkPollCache.put(pollToken, new LinkPollEntry(userId, PollStatus.PENDING, accountId, null, null, null));
+        return new LinkStatePair(state, pollToken);
+    }
+
+    public void completeLinkSuccess(String pollToken, Long accountId, LinkOutcome outcome, String message) {
+        if (pollToken != null) {
+            linkPollCache.asMap().computeIfPresent(pollToken, (key, entry) ->
+                    new LinkPollEntry(entry.userId(), PollStatus.SUCCESS, accountId, outcome, null, message));
+        }
+    }
+
+    public void completeLinkFailure(String pollToken, String code, String message) {
+        if (pollToken != null) {
+            linkPollCache.asMap().computeIfPresent(pollToken, (key, entry) ->
+                    new LinkPollEntry(entry.userId(), PollStatus.FAILED, entry.accountId(), null, code, message));
+        }
+    }
+
+    public Optional<LinkPollEntry> pollLinkSession(String pollToken, Long userId) {
+        if (pollToken == null || pollToken.isBlank()) return Optional.empty();
+        LinkPollEntry entry = linkPollCache.getIfPresent(pollToken);
+        if (entry == null) return Optional.empty();
+        // Only the authenticated owner can consume a final result.
+        if (!java.util.Objects.equals(entry.userId(), userId) || entry.status() == PollStatus.PENDING) {
+            return Optional.of(entry);
+        }
+        return Optional.ofNullable(linkPollCache.asMap().remove(pollToken));
     }
 
     /**
@@ -80,13 +142,15 @@ public class OAuth2StateStore {
 
     public void completeGoogleLoginSuccess(String pollToken, LoginResponse response) {
         if (pollToken != null && !pollToken.isBlank()) {
-            loginPollCache.put(pollToken, new LoginPollEntry(PollStatus.SUCCESS, response, null, null));
+            loginPollCache.asMap().computeIfPresent(pollToken, (key, old) ->
+                    old.status() == PollStatus.PENDING ? new LoginPollEntry(PollStatus.SUCCESS, response, null, null) : old);
         }
     }
 
     public void completeGoogleLoginFailure(String pollToken, String errorCode, String errorMessage) {
         if (pollToken != null && !pollToken.isBlank()) {
-            loginPollCache.put(pollToken, new LoginPollEntry(PollStatus.FAILED, null, errorCode, errorMessage));
+            loginPollCache.asMap().computeIfPresent(pollToken, (key, old) ->
+                    old.status() == PollStatus.PENDING ? new LoginPollEntry(PollStatus.FAILED, null, errorCode, errorMessage) : old);
         }
     }
 
@@ -116,6 +180,12 @@ public class OAuth2StateStore {
             return Optional.empty();
         }
         StateEntry entry = cache.asMap().remove(state);
+        if (entry != null && entry.pollToken() != null) {
+            boolean pending = entry.flowType() == FlowType.GOOGLE_LOGIN
+                    ? loginPollCache.getIfPresent(entry.pollToken()) != null
+                    : linkPollCache.getIfPresent(entry.pollToken()) != null;
+            if (!pending) return Optional.empty();
+        }
         return Optional.ofNullable(entry);
     }
 

@@ -38,6 +38,28 @@ class SessionStoreTest {
     }
 
     @Test
+    void cachedAttachmentIsInvalidatedOnChangeOrSessionReplacement(@org.junit.jupiter.api.io.TempDir java.nio.file.Path dir) throws Exception {
+        var user = new UserDto(1L, "fixture", "Fixture", "fixture@example.test", "USER", false, null);
+        sessionStore.saveSession("fixture-only", user);
+        try {
+            long generation = sessionStore.getGeneration();
+            var key = new SessionStore.AttachmentKey(10L, "INBOX", 9L, 7L, 0);
+            var file = java.nio.file.Files.writeString(dir.resolve("fixture.txt"), "original");
+            sessionStore.rememberDownloadedAttachment(generation, key, file);
+            assertEquals(file.toAbsolutePath().normalize(), sessionStore.findDownloadedAttachment(key));
+            java.nio.file.Files.writeString(file, "replacement has a different length");
+            assertNull(sessionStore.findDownloadedAttachment(key));
+            sessionStore.rememberDownloadedAttachment(generation, key, file);
+            sessionStore.clearSession();
+            sessionStore.saveSession("new-fixture-only", user);
+            sessionStore.rememberDownloadedAttachment(generation, key, file);
+            assertNull(sessionStore.findDownloadedAttachment(key));
+        } finally {
+            sessionStore.clearSession();
+        }
+    }
+
+    @Test
     @DisplayName("Cập nhật token mới khi đổi mật khẩu bắt buộc thành công")
     void testUpdateToken() {
         UserDto user = new UserDto(2L, "user1", "User One", "user1@example.com", "USER", true, "2026-11-22T08:00:00Z");

@@ -1,15 +1,21 @@
 package com.mailapp.client.ui.frames;
 
-import com.mailapp.client.model.GmailAccountDto;
+import com.mailapp.client.net.ApiClient.OAuthLinkPollDto;
 import com.mailapp.client.model.MailClientDtos.MailListResponse;
 import com.mailapp.client.model.MailClientDtos.MailSummaryDto;
+import com.mailapp.client.model.MailClientDtos.MailDetailResponse;
+import com.mailapp.client.model.PublicConfigDto;
+import com.mailapp.client.net.ApiException;
+import com.mailapp.client.util.FeatureAdmission;
 
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.Future;
+import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.IntConsumer;
+import java.util.function.BooleanSupplier;
 
 /**
  * View-Model thuần (không phụ thuộc Swing) chứa toàn bộ logic trạng thái hộp thư của MainFrame:
@@ -21,6 +27,13 @@ import java.util.function.IntConsumer;
 public class MailboxViewModel {
 
     // === (a) Phân trang & UIDVALIDITY ===
+
+    /** The criteria of a paginated result must be identical across all of its pages. */
+    public record SearchCriteria(String query, boolean unreadOnly, boolean hasAttachment) {
+        public SearchCriteria {
+            query = query == null ? "" : query.trim();
+        }
+    }
 
     public record PageMergeResult(
             boolean uidValidityChanged,
@@ -84,6 +97,55 @@ public class MailboxViewModel {
                 && resp != null
                 && resp.uidValidity() != 0
                 && resp.uidValidity() != currentUidValidity;
+    }
+
+    public static boolean validMutationSelection(List<MailSummaryDto> selection, long uidValidity) {
+        return uidValidity > 0 && selection != null && !selection.isEmpty()
+                && selection.stream().allMatch(item -> item != null && item.uid() > 0 && item.uidValidity() == uidValidity);
+    }
+
+    /** Detail toolbar actions refer to the displayed message, never a batch selection. */
+    public static List<MailSummaryDto> detailMutationTarget(MailDetailResponse detail,
+            List<MailSummaryDto> selection, long uidValidity) {
+        if (detail == null || detail.uidValidity() != uidValidity
+                || !validMutationSelection(selection, uidValidity)) return List.of();
+        return selection.stream().filter(item -> item.uid() == detail.uid()).limit(1).toList();
+    }
+
+    @FunctionalInterface
+    public interface ConfirmedDelete {
+        void delete(MailSummaryDto item) throws Exception;
+    }
+
+    /** Only acknowledged deletions count; never retry or continue after a failed response. */
+    public record DeleteBatchResult(int acknowledged, int requested, boolean stopped, Exception failure) {}
+
+    public static DeleteBatchResult deleteConfirmedBatch(List<MailSummaryDto> selection,
+            java.util.function.BooleanSupplier stillCurrent, ConfirmedDelete action) {
+        int acknowledged = 0;
+        for (MailSummaryDto item : selection) {
+            if (Thread.currentThread().isInterrupted() || !stillCurrent.getAsBoolean()) {
+                return new DeleteBatchResult(acknowledged, selection.size(), true, null);
+            }
+            try {
+                action.delete(item);
+                acknowledged++;
+            } catch (Exception ex) {
+                if (ex instanceof InterruptedException) Thread.currentThread().interrupt();
+                return new DeleteBatchResult(acknowledged, selection.size(), false, ex);
+            }
+        }
+        return new DeleteBatchResult(acknowledged, selection.size(), false, null);
+    }
+
+    public static boolean passesCleanupAge(String date, Instant cutoff) {
+        if (cutoff == null) return true;
+        if (date == null || date.isBlank()) return false;
+        try {
+            return !Instant.parse(date).isAfter(cutoff);
+        } catch (DateTimeException e) {
+            return false;
+        }
     }
 
     // === (b) Bộ đếm thế hệ & hủy worker cũ ===
@@ -164,64 +226,79 @@ public class MailboxViewModel {
 
     // === (c) Poll OAuth2 hủy tức thì ===
 
+    /** Check before and after preflight; an off/on transition must not revive a link click. */
+    public static void requireOAuthLinkAdmission(FeatureAdmission admission, FeatureAdmission.Ticket ticket,
+                                                 BooleanSupplier stillCurrent) throws InterruptedException {
+        if (!stillCurrent.getAsBoolean() || Thread.currentThread().isInterrupted()) {
+            throw new InterruptedException("OAuth link no longer current");
+        }
+        if (!admission.isCurrent(ticket)) {
+            throw new ApiException(400, "FORM_INVALIDATED",
+                    "Cấu hình liên kết đã thay đổi. Vui lòng thực hiện liên kết lại.");
+        }
+    }
+
+    public static void preflightOAuthLink(FeatureAdmission admission, FeatureAdmission.Ticket ticket,
+                                          BooleanSupplier stillCurrent, Callable<PublicConfigDto> fetchConfig)
+            throws Exception {
+        requireOAuthLinkAdmission(admission, ticket, stillCurrent);
+        PublicConfigDto latest = fetchConfig.call();
+        requireOAuthLinkAdmission(admission, ticket, stillCurrent);
+        if (latest == null) {
+            throw new ApiException(503, "CONFIG_UNAVAILABLE", "Chưa tải được cấu hình liên kết Gmail.");
+        }
+        if (!latest.oauth2LinkEnabled()) {
+            throw new ApiException(403, "FEATURE_DISABLED", "Tính năng liên kết Google OAuth2 đã bị tắt.");
+        }
+    }
+
     @FunctionalInterface
-    public interface AccountFetcher {
-        List<GmailAccountDto> fetch() throws Exception;
+    public interface LinkResultFetcher {
+        OAuthLinkPollDto fetch() throws Exception;
     }
 
-    public enum OAuthPollStatus {
-        LINKED,
-        CANCELLED,
-        TIMEOUT
+    public static OAuthLinkPollDto pollForOAuthLink(LinkResultFetcher fetcher,
+                                                   int maxAttempts, long intervalMs,
+                                                   AtomicBoolean cancelled, IntConsumer onTick) throws Exception {
+        return pollForOAuthLink(fetcher, maxAttempts, intervalMs, cancelled, () -> true, onTick);
     }
 
-    public static OAuthPollStatus pollForOAuthAccount(AccountFetcher fetcher,
-                                                      int initialCount,
-                                                      Set<Long> initialActiveOAuthIds,
-                                                      int maxAttempts,
-                                                      long intervalMs,
-                                                      AtomicBoolean cancelled,
-                                                      IntConsumer onTick) throws Exception {
-        Set<Long> baseline = initialActiveOAuthIds != null ? initialActiveOAuthIds : Set.of();
+    public static OAuthLinkPollDto pollForOAuthLink(LinkResultFetcher fetcher,
+                                                   int maxAttempts, long intervalMs,
+                                                   AtomicBoolean cancelled, BooleanSupplier stillCurrent,
+                                                   IntConsumer onTick) throws Exception {
         for (int i = 1; i <= maxAttempts; i++) {
-            if (cancelled.get() || Thread.currentThread().isInterrupted()) {
-                return OAuthPollStatus.CANCELLED;
+            if (cancelled.get() || !stillCurrent.getAsBoolean() || Thread.currentThread().isInterrupted()) {
+                return new OAuthLinkPollDto("CANCELLED", null, null, null);
             }
             if (intervalMs > 0) {
                 try {
                     Thread.sleep(intervalMs);
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
-                    return OAuthPollStatus.CANCELLED;
+                    return new OAuthLinkPollDto("CANCELLED", null, null, null);
                 }
             }
-            if (cancelled.get() || Thread.currentThread().isInterrupted()) {
-                return OAuthPollStatus.CANCELLED;
+            if (cancelled.get() || !stillCurrent.getAsBoolean() || Thread.currentThread().isInterrupted()) {
+                return new OAuthLinkPollDto("CANCELLED", null, null, null);
             }
             if (onTick != null) {
                 onTick.accept(i);
             }
-            List<GmailAccountDto> updated = fetcher.fetch();
-            if (cancelled.get() || Thread.currentThread().isInterrupted()) {
-                return OAuthPollStatus.CANCELLED;
+            if (cancelled.get() || !stillCurrent.getAsBoolean() || Thread.currentThread().isInterrupted()) {
+                return new OAuthLinkPollDto("CANCELLED", null, null, null);
             }
-            if (updated != null && (updated.size() > initialCount || hasNewActiveOAuth(updated, baseline))) {
-                return OAuthPollStatus.LINKED;
+            OAuthLinkPollDto updated = fetcher.fetch();
+            if (cancelled.get() || !stillCurrent.getAsBoolean() || Thread.currentThread().isInterrupted()) {
+                return new OAuthLinkPollDto("CANCELLED", null, null, null);
             }
-        }
-        return cancelled.get() ? OAuthPollStatus.CANCELLED : OAuthPollStatus.TIMEOUT;
-    }
-
-    private static boolean hasNewActiveOAuth(List<GmailAccountDto> list, Set<Long> baselineActiveIds) {
-        for (GmailAccountDto acc : list) {
-            if (acc != null
-                    && "OAUTH2".equalsIgnoreCase(acc.authType())
-                    && "ACTIVE".equalsIgnoreCase(acc.status())
-                    && !baselineActiveIds.contains(acc.id())) {
-                return true;
+            if (updated != null && !"PENDING".equalsIgnoreCase(updated.status())) {
+                return updated;
             }
         }
-        return false;
+        return cancelled.get() || !stillCurrent.getAsBoolean() || Thread.currentThread().isInterrupted()
+                ? new OAuthLinkPollDto("CANCELLED", null, null, null)
+                : new OAuthLinkPollDto("FAILED", "TIMEOUT", "Hết thời gian chờ xác thực Google. Vui lòng thử lại.", null);
     }
 
     // === (d) Phân giải ngày đa định dạng sang múi giờ máy ===

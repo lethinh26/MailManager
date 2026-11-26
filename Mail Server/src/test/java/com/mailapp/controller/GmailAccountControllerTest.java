@@ -58,6 +58,52 @@ class GmailAccountControllerTest {
     private User userA;
     private User userB;
 
+    @Test
+    void selftestDoesNotReportImapSuccessWhenInboxReadFails() throws Exception {
+        GmailAccount account = new GmailAccount();
+        account.setId(101L);
+        account.setUser(userA);
+        account.setEmail("fixture@gmail.com");
+        account.setAuthType(AuthType.APP_PASSWORD);
+        when(gmailAccountRepository.findByIdAndUserId(101L, 1L)).thenReturn(Optional.of(account));
+        var store = mock(jakarta.mail.Store.class);
+        var inbox = mock(jakarta.mail.Folder.class);
+        when(store.isConnected()).thenReturn(true);
+        when(store.getFolder("INBOX")).thenReturn(inbox);
+        when(inbox.exists()).thenReturn(true);
+        when(inbox.getMessageCount()).thenThrow(new jakarta.mail.MessagingException("fixture read failure"));
+        var lease = new com.mailapp.mail.ImapConnection(store, "***");
+        when(mailConnectionFactory.openImap(account)).thenReturn(lease);
+        var smtp = mock(com.mailapp.mail.SmtpConnection.class);
+        when(smtp.isConnected()).thenReturn(true);
+        when(mailConnectionFactory.openSmtp(account)).thenReturn(smtp);
+        var result = controller.testGmailAccountConnection(101L, userA).getBody();
+        assertNotNull(result);
+        assertEquals(false, result.get("imapOk"));
+        assertEquals(-1, result.get("inboxCount"));
+        assertEquals(true, result.get("smtpOk"));
+        assertTrue(lease.isBroken());
+        verify(inbox).close(false);
+        verify(store).close();
+        verify(gmailAccountRepository, never()).save(any());
+    }
+
+    @Test
+    void staleImapProbeMustNotOpenSmtpOrSaveOldAccount() {
+        GmailAccount account = new GmailAccount();
+        account.setId(102L);
+        account.setUser(userA);
+        account.setEmail("revision-probe@gmail.com");
+        account.setAuthType(AuthType.OAUTH2);
+        when(gmailAccountRepository.findByIdAndUserId(102L, 1L)).thenReturn(Optional.of(account));
+        when(mailConnectionFactory.openImap(account))
+                .thenThrow(new com.mailapp.exception.GmailAccountChangedException());
+        var conflict = assertThrows(AppException.class, () -> controller.testGmailAccountConnection(102L, userA));
+        assertEquals("GMAIL_ACCOUNT_CHANGED", conflict.getCode());
+        verify(mailConnectionFactory, never()).openSmtp(any(GmailAccount.class));
+        verify(gmailAccountRepository, never()).save(any());
+    }
+
     @BeforeEach
     void setUp() {
         aesCipher = new AesCipher("dCPN0qIeMrPFVyn/9c05Pq1O65Re+wsVplG7fEFU4dU=");
@@ -159,7 +205,7 @@ class GmailAccountControllerTest {
         when(mailConnectionFactory.testImap(any(MailCredentials.class))).thenReturn(ConnectionTestResult.ok(80));
         when(gmailAccountRepository.save(any(GmailAccount.class))).thenAnswer(inv -> inv.getArgument(0));
 
-        LinkAppPasswordRequest req = new LinkAppPasswordRequest("d.u.p+backup@googlemail.com", "NEWPASS123456789", "Updated Name");
+        LinkAppPasswordRequest req = new LinkAppPasswordRequest("d.u.p+backup@googlemail.com", "NEWPASS123456789", "Updated Name", com.mailapp.model.LinkIntent.UPSERT);
         ResponseEntity<GmailAccountResponse> res = controller.linkGmailWithAppPassword(req, userA, new MockHttpServletRequest());
 
         assertEquals(HttpStatus.OK, res.getStatusCode());
@@ -280,7 +326,7 @@ class GmailAccountControllerTest {
         acc.setAuthType(AuthType.OAUTH2);
         acc.setStatus(AccountStatus.ACTIVE);
 
-        when(gmailAccountRepository.findById(401L)).thenReturn(Optional.of(acc));
+        when(gmailAccountRepository.findByIdAndUserId(401L, 1L)).thenReturn(Optional.of(acc));
         when(gmailAccountRepository.save(any(GmailAccount.class))).thenAnswer(inv -> inv.getArgument(0));
 
         ResponseEntity<GmailAccountResponse> okRes = controller.updateDisplayName(401L, Map.of("displayName", "PTIT Mail"), userA);
@@ -290,7 +336,12 @@ class GmailAccountControllerTest {
         // Chặn IDOR: User B không được đổi tên Gmail của User A
         AppException idor = assertThrows(AppException.class, () ->
                 controller.updateDisplayName(401L, Map.of("displayName", "Hacked"), userB));
-        assertEquals(HttpStatus.FORBIDDEN, idor.getStatus());
+        assertEquals(HttpStatus.NOT_FOUND, idor.getStatus());
+        assertEquals("ACCOUNT_NOT_FOUND", idor.getCode());
+        AppException missing = assertThrows(AppException.class, () ->
+                controller.updateDisplayName(999L, Map.of("displayName", "Hacked"), userB));
+        assertEquals(idor.getMessage(), missing.getMessage());
+        assertEquals(idor.getCode(), missing.getCode());
     }
 
     @Test
@@ -302,28 +353,29 @@ class GmailAccountControllerTest {
         account.setEmail("usera_oauth@gmail.com");
         account.setAuthType(AuthType.OAUTH2);
 
-        when(gmailAccountRepository.findById(201L)).thenReturn(Optional.of(account));
+        when(gmailAccountRepository.findByIdAndUserId(201L, 1L)).thenReturn(Optional.of(account));
 
         MockHttpServletRequest request = new MockHttpServletRequest();
         request.setRemoteAddr("10.0.0.1");
 
-        ResponseEntity<Map<String, Object>> response = controller.deleteGmailAccount(201L, userA, request);
+        ResponseEntity<Void> response = controller.deleteGmailAccount(201L, userA, request);
 
-        assertEquals(HttpStatus.OK, response.getStatusCode());
+        assertEquals(HttpStatus.NO_CONTENT, response.getStatusCode());
+        assertNull(response.getBody());
         verify(oauth2Service).revokeToken(account);
         verify(gmailAccountRepository).delete(account);
         verify(auditLogService).log(eq(1L), eq("UNLINK_GMAIL"), contains("usera_oauth@gmail.com"), eq("10.0.0.1"));
     }
 
     @Test
-    @DisplayName("EP-G3: DELETE /api/gmail-accounts/{id} ném 403 FORBIDDEN khi user A cố xóa tài khoản của user B")
+    @DisplayName("EP-G3: DELETE /api/gmail-accounts/{id} trả 404 cho ID của người dùng khác")
     void testUserCannotDeleteAnotherUsersGmail() {
         GmailAccount accountOfB = new GmailAccount();
         accountOfB.setId(202L);
         accountOfB.setUser(userB); // Thuộc về User B
         accountOfB.setEmail("userb@gmail.com");
 
-        when(gmailAccountRepository.findById(202L)).thenReturn(Optional.of(accountOfB));
+        when(gmailAccountRepository.findByIdAndUserId(202L, 1L)).thenReturn(Optional.empty());
 
         MockHttpServletRequest request = new MockHttpServletRequest();
 
@@ -331,16 +383,16 @@ class GmailAccountControllerTest {
                 controller.deleteGmailAccount(202L, userA, request)
         );
 
-        assertEquals(HttpStatus.FORBIDDEN, ex.getStatus());
-        assertEquals("FORBIDDEN", ex.getCode());
+        assertEquals(HttpStatus.NOT_FOUND, ex.getStatus());
+        assertEquals("NOT_FOUND", ex.getCode());
         verify(gmailAccountRepository, never()).delete(any());
         verify(oauth2Service, never()).revokeToken(any());
     }
 
     @Test
-    @DisplayName("EP-G3: DELETE /api/gmail-accounts/{id} ném 404 ACCOUNT_NOT_FOUND khi ID không tồn tại")
+    @DisplayName("EP-G3: DELETE /api/gmail-accounts/{id} ném 404 NOT_FOUND khi ID không tồn tại")
     void testDeleteNonExistentAccount() {
-        when(gmailAccountRepository.findById(999L)).thenReturn(Optional.empty());
+        when(gmailAccountRepository.findByIdAndUserId(999L, 1L)).thenReturn(Optional.empty());
 
         MockHttpServletRequest request = new MockHttpServletRequest();
 
@@ -349,7 +401,7 @@ class GmailAccountControllerTest {
         );
 
         assertEquals(HttpStatus.NOT_FOUND, ex.getStatus());
-        assertEquals("ACCOUNT_NOT_FOUND", ex.getCode());
+        assertEquals("NOT_FOUND", ex.getCode());
     }
 
     @Test
@@ -361,15 +413,16 @@ class GmailAccountControllerTest {
         account.setEmail("usera_revoke_error@gmail.com");
         account.setAuthType(AuthType.OAUTH2);
 
-        when(gmailAccountRepository.findById(203L)).thenReturn(Optional.of(account));
+        when(gmailAccountRepository.findByIdAndUserId(203L, 1L)).thenReturn(Optional.of(account));
         doThrow(new RuntimeException("Google 503 Service Unavailable")).when(oauth2Service).revokeToken(account);
 
         MockHttpServletRequest request = new MockHttpServletRequest();
         request.setRemoteAddr("10.0.0.1");
 
-        ResponseEntity<Map<String, Object>> response = controller.deleteGmailAccount(203L, userA, request);
+        ResponseEntity<Void> response = controller.deleteGmailAccount(203L, userA, request);
 
-        assertEquals(HttpStatus.OK, response.getStatusCode());
+        assertEquals(HttpStatus.NO_CONTENT, response.getStatusCode());
+        assertNull(response.getBody());
         verify(gmailAccountRepository).delete(account);
         verify(auditLogService).log(eq(1L), eq("REVOKE_TOKEN_FAILED"), anyString(), eq("10.0.0.1"));
         verify(auditLogService).log(eq(1L), eq("UNLINK_GMAIL"), contains("usera_revoke_error@gmail.com"), eq("10.0.0.1"));

@@ -37,6 +37,14 @@ class PasswordValidatorTest {
     }
 
     @Test
+    void bcryptLimitIsUtf8BytesNotCharacters() {
+        assertTrue(PasswordValidator.meetsPolicy("a1" + "é".repeat(35)));
+        assertFalse(PasswordValidator.meetsPolicy("a1" + "é".repeat(36)));
+        assertTrue(PasswordValidator.meetsPolicy("a1" + "b".repeat(70)));
+        assertFalse(PasswordValidator.meetsPolicy("a1" + "b".repeat(71)));
+    }
+
+    @Test
     @DisplayName("Độ mạnh mật khẩu: WEAK cho mật khẩu không đạt chính sách")
     void testEvaluateStrength_Weak() {
         assertEquals(PasswordValidator.Strength.WEAK, PasswordValidator.evaluateStrength(null));

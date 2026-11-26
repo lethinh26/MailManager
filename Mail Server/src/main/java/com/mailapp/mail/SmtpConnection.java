@@ -9,6 +9,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Wrapper bao bọc jakarta.mail.Transport và Session cho kết nối SMTP.
@@ -25,6 +26,7 @@ public class SmtpConnection implements AutoCloseable {
     private final Transport transport;
     private final Session session;
     private final String maskedEmail;
+    private final AtomicBoolean closed = new AtomicBoolean();
 
     public SmtpConnection(Transport transport, Session session, String maskedEmail) {
         this.transport = Objects.requireNonNull(transport, "Transport không được null");
@@ -33,6 +35,7 @@ public class SmtpConnection implements AutoCloseable {
     }
 
     public Transport getTransport() {
+        if (closed.get()) throw new IllegalStateException("SMTP connection already closed");
         return transport;
     }
 
@@ -59,7 +62,7 @@ public class SmtpConnection implements AutoCloseable {
         if (recipients == null || recipients.length == 0) {
             throw new MessagingException("Thư không có người nhận hợp lệ");
         }
-        transport.sendMessage(message, recipients);
+        getTransport().sendMessage(message, recipients);
         log.info("Đã gửi thư SMTP thành công từ tài khoản: {}", maskedEmail);
     }
 
@@ -67,7 +70,7 @@ public class SmtpConnection implements AutoCloseable {
      * Kiểm tra kết nối SMTP còn hoạt động hay không.
      */
     public boolean isConnected() {
-        return transport != null && transport.isConnected();
+        return !closed.get() && transport.isConnected();
     }
 
     /**
@@ -75,12 +78,12 @@ public class SmtpConnection implements AutoCloseable {
      */
     @Override
     public void close() {
-        if (transport != null && transport.isConnected()) {
+        if (closed.compareAndSet(false, true)) {
             try {
                 transport.close();
                 log.debug("Đã đóng kết nối SMTP cho: {}", maskedEmail);
             } catch (Exception e) {
-                log.debug("Nuốt lỗi khi đóng SMTP Transport cho {}: {}", maskedEmail, e.getMessage());
+                log.debug("Nuốt lỗi khi đóng SMTP Transport cho {}: {}", maskedEmail, e.getClass().getSimpleName());
             }
         }
     }

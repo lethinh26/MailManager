@@ -102,6 +102,28 @@ class GmailMultiAuthIntegrationTest {
     }
 
     @Test
+    void pendingAuthenticatedLinkCannotBypassPasswordReset() {
+        User beforeReset = userRepository.findById(userA.getId()).orElseThrow();
+        User reset = userRepository.findById(userA.getId()).orElseThrow();
+        reset.setMustChangePassword(true);
+        userRepository.save(reset);
+        String encrypted = aesCipher.encrypt("test-refresh");
+        var denied = assertThrows(com.mailapp.exception.AppException.class,
+                () -> linkService.upsertOAuth2(beforeReset, "pending@gmail.com", encrypted, null, null,
+                        LocalDateTime.now().plusHours(1), null));
+        assertEquals("PASSWORD_CHANGE_REQUIRED", denied.getCode());
+        assertEquals(0, gmailAccountRepository.countByUserId(userA.getId()));
+
+        // The login flow's auto-link uses the same owner lock and must also be denied.
+        var loginLink = assertThrows(com.mailapp.exception.AppException.class,
+                () -> linkService.upsertOAuth2(beforeReset, "pending@gmail.com", encrypted, null, null,
+                        LocalDateTime.now().plusHours(1)));
+        assertEquals("PASSWORD_CHANGE_REQUIRED", loginLink.getCode());
+        assertEquals(0, gmailAccountRepository.countByUserId(userA.getId()));
+        assertTrue(userRepository.findById(userA.getId()).orElseThrow().isMustChangePassword());
+    }
+
+    @Test
     @DisplayName("Upsert 2 chiều: OAuth -> AppPassword -> AppPassword lần 2 (giữ id, displayName, cả 2 bí mật, đúng outcome)")
     void upsertOAuthThenAppPasswordAndUpdateAgain() throws Exception {
         // 1. Tạo mới bằng OAuth2
@@ -111,6 +133,17 @@ class GmailMultiAuthIntegrationTest {
         assertEquals(LinkOutcome.CREATED, first.outcome());
         Long originalId = first.account().getId();
 
+        // Legacy CREATE request must fail before probing or touching the existing credentials.
+        mockMvc.perform(post("/api/gmail-accounts/app-password")
+                        .header("Authorization", "Bearer " + tokenA)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"email":"johndoe+backup@googlemail.com","appPassword":"abcd efgh ijkl mnop"}
+                                """))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("GMAIL_DUPLICATE"));
+        verify(mailConnectionFactory, never()).testImap(any(MailCredentials.class));
+
         // 2. Thêm App Password qua API với biến thể +tag & googlemail.com
         mockMvc.perform(post("/api/gmail-accounts/app-password")
                         .header("Authorization", "Bearer " + tokenA)
@@ -119,7 +152,8 @@ class GmailMultiAuthIntegrationTest {
                                 {
                                   "email": "johndoe+backup@googlemail.com",
                                   "appPassword": "abcd efgh ijkl mnop",
-                                  "displayName": "Ignored Display Name"
+                                  "displayName": "Ignored Display Name",
+                                  "intent": "UPSERT"
                                 }
                                 """))
                 .andExpect(status().isOk())
@@ -142,7 +176,8 @@ class GmailMultiAuthIntegrationTest {
                         .content("""
                                 {
                                   "email": "j.o.h.n.d.o.e@gmail.com",
-                                  "appPassword": "zzzz yyyy xxxx wwww"
+                                  "appPassword": "zzzz yyyy xxxx wwww",
+                                  "intent": "UPSERT"
                                 }
                                 """))
                 .andExpect(status().isOk())
@@ -223,7 +258,45 @@ class GmailMultiAuthIntegrationTest {
     }
 
     @Test
-    @DisplayName("IDOR & đa người dùng: User B bị 403 trên tài khoản User A, nhưng User A và User B được phép liên kết cùng 1 Gmail")
+    void concurrentDifferentMailboxesCannotExceedUserLimit() throws Exception {
+        systemSettingService.updateSetting("MAX_GMAIL_PER_USER", "1");
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            java.util.concurrent.Callable<String> app = () -> {
+                assertTrue(start.await(5, TimeUnit.SECONDS));
+                try {
+                    linkService.upsertAppPassword(userA, "one@gmail.com", aesCipher.encrypt("password"), null, "127.0.0.1");
+                    return "CREATED";
+                } catch (com.mailapp.exception.AppException ex) {
+                    return ex.getCode();
+                }
+            };
+            java.util.concurrent.Callable<String> oauth = () -> {
+                assertTrue(start.await(5, TimeUnit.SECONDS));
+                try {
+                    linkService.upsertOAuth2(userA, "two@gmail.com", aesCipher.encrypt("refresh"), null, null,
+                            LocalDateTime.now().plusHours(1));
+                    return "CREATED";
+                } catch (com.mailapp.exception.AppException ex) {
+                    return ex.getCode();
+                }
+            };
+            Future<String> first = pool.submit(app);
+            Future<String> second = pool.submit(oauth);
+            start.countDown();
+            List<String> outcomes = List.of(first.get(10, TimeUnit.SECONDS), second.get(10, TimeUnit.SECONDS));
+            assertTrue(outcomes.contains("CREATED"));
+            assertTrue(outcomes.contains("GMAIL_LIMIT_REACHED"));
+            assertEquals(1, gmailAccountRepository.countByUserId(userA.getId()));
+        } finally {
+            pool.shutdownNow();
+            systemSettingService.updateSetting("MAX_GMAIL_PER_USER", "5");
+        }
+    }
+
+    @Test
+    @DisplayName("IDOR & đa người dùng: User B nhận 404 với tài khoản User A, nhưng hai user được phép liên kết cùng 1 Gmail")
     void idorBlockedAndTwoUsersCanLinkSameGmail() throws Exception {
         var accA = linkService.upsertOAuth2(
                 userA, "shared.mailbox@gmail.com", aesCipher.encrypt("ref-a"), "A Mail", null, LocalDateTime.now().plusHours(1));
@@ -235,19 +308,29 @@ class GmailMultiAuthIntegrationTest {
                 userB, "Shared.Mailbox@gmail.com", aesCipher.encrypt("pass-b-12345678"), "B Mail", "127.0.0.1");
         assertNotEquals(accA.account().getId(), accB.account().getId());
 
-        // User B không được đổi preferredMethod của User A -> 403
+        // Full unlink must hide whether another owner's mailbox ID exists.
+        mockMvc.perform(delete("/api/gmail-accounts/" + accA.account().getId())
+                        .header("Authorization", "Bearer " + tokenB))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.code").value("NOT_FOUND"));
+        mockMvc.perform(delete("/api/gmail-accounts/" + Long.MAX_VALUE)
+                        .header("Authorization", "Bearer " + tokenB))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.code").value("NOT_FOUND"));
+
+        // User B không được đổi preferredMethod của User A -> 404
         mockMvc.perform(put("/api/gmail-accounts/" + accA.account().getId() + "/preferred-method")
                         .header("Authorization", "Bearer " + tokenB)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"preferredMethod\": \"APP_PASSWORD\"}"))
-                .andExpect(status().isForbidden())
-                .andExpect(jsonPath("$.code").value("FORBIDDEN"));
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.code").value("ACCOUNT_NOT_FOUND"));
 
-        // User B không được gỡ phương thức của User A -> 403
+        // User B không được gỡ phương thức của User A -> 404
         mockMvc.perform(delete("/api/gmail-accounts/" + accA.account().getId() + "/methods/APP_PASSWORD")
                         .header("Authorization", "Bearer " + tokenB))
-                .andExpect(status().isForbidden())
-                .andExpect(jsonPath("$.code").value("FORBIDDEN"));
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.code").value("ACCOUNT_NOT_FOUND"));
 
         // User A đổi preferredMethod sang APP_PASSWORD -> 200 OK
         mockMvc.perform(put("/api/gmail-accounts/" + accA.account().getId() + "/preferred-method")
@@ -295,6 +378,39 @@ class GmailMultiAuthIntegrationTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.unlinked").value(true));
         assertTrue(gmailAccountRepository.findById(id).isEmpty());
+    }
+
+    @Test
+    void staleMailboxWriteCannotRestoreRemovedMethodOrDeleteRelinkedMailbox() {
+        var linked = linkService.upsertOAuth2(userA, "revision.fixture@gmail.com",
+                aesCipher.encrypt("synthetic-revision-oauth"), "Revision", null, LocalDateTime.now().plusHours(1));
+        Long id = linked.account().getId();
+        linkService.upsertAppPassword(userA, "revisionfixture@gmail.com",
+                aesCipher.encrypt("synthetic-revision-app"), "Revision", "127.0.0.1");
+        GmailAccount stale = gmailAccountRepository.findById(id).orElseThrow();
+        GmailAccount removal = gmailAccountRepository.findById(id).orElseThrow();
+        removal.setRefreshTokenEncrypted(null);
+        removal.setTokenExpiresAt(null);
+        removal.setAuthType(AuthType.APP_PASSWORD);
+        removal.setFallbackActive(false);
+        gmailAccountRepository.saveAndFlush(removal);
+        stale.setLastVerifiedAt(LocalDateTime.now().plusMinutes(1));
+        assertThrows(org.springframework.dao.OptimisticLockingFailureException.class,
+                () -> gmailAccountRepository.saveAndFlush(stale));
+        GmailAccount after = gmailAccountRepository.findById(id).orElseThrow();
+        assertFalse(after.hasOAuth());
+        assertTrue(after.hasAppPassword());
+        assertEquals(AuthType.APP_PASSWORD, after.getPreferredMethod());
+
+        GmailAccount oldDelete = gmailAccountRepository.findById(id).orElseThrow();
+        linkService.upsertOAuth2(userA, "revisionfixture@gmail.com",
+                aesCipher.encrypt("synthetic-new-grant"), "Revision", null, LocalDateTime.now().plusHours(1));
+        assertThrows(org.springframework.dao.OptimisticLockingFailureException.class,
+                () -> gmailAccountRepository.delete(oldDelete));
+        GmailAccount relinked = gmailAccountRepository.findById(id).orElseThrow();
+        assertTrue(relinked.hasOAuth() && relinked.hasAppPassword());
+        assertEquals(userA.getId(), gmailAccountRepository.findByIdAndUserId(id, userA.getId()).orElseThrow().getUser().getId());
+        assertTrue(gmailAccountRepository.findByIdAndUserId(id, userB.getId()).isEmpty());
     }
 
     @Test

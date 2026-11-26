@@ -7,6 +7,7 @@ import com.mailapp.mail.config.MailConnectionProperties;
 import com.mailapp.mail.model.ConnectionTestResult;
 import com.mailapp.mail.model.MailCredentials;
 import com.mailapp.model.AuthType;
+import com.mailapp.model.GmailAccount;
 import com.mailapp.security.AesCipher;
 import jakarta.mail.Message;
 import jakarta.mail.internet.InternetAddress;
@@ -48,6 +49,7 @@ class DefaultMailConnectionFactoryGreenMailTest {
     void setUp() {
         properties = new MailConnectionProperties();
         properties.setImapHost("127.0.0.1");
+        properties.setLocalTestTransport(true);
         properties.setImapPort(IMAPS_PORT);
         properties.setSmtpHost("127.0.0.1");
         properties.setSmtpPort(SMTP_PORT);
@@ -57,11 +59,92 @@ class DefaultMailConnectionFactoryGreenMailTest {
         properties.setRetryEnabled(true);
         properties.setRetryMaxAttempts(2);
         properties.setRetryWaitDurationMs(100);
+        properties.setPoolEnabled(false);
 
         aesCipher = mock(AesCipher.class);
         accessTokenProvider = mock(AccessTokenProvider.class);
 
         factory = new DefaultMailConnectionFactory(properties, aesCipher, accessTokenProvider, null);
+    }
+
+    @AfterEach
+    void releasePool() {
+        factory.shutdownPool();
+    }
+
+    @Test
+    void allSevenDedicatedMimeSamplesRehearseThroughLocalSmtpAndImap() throws Exception {
+        greenMail.purgeEmailFromAllMailboxes();
+        try {
+            RealGmailMimeFixturesTest.prepareAndVerifySamples(
+                    "MailApp-Local-MIME-" + java.util.UUID.randomUUID(),
+                    MailCredentials.ofAppPassword("testuser@gmail.com", "validAppPassword16"),
+                    factory);
+        } finally {
+            // The GreenMail instance belongs exclusively to this test class.
+            greenMail.purgeEmailFromAllMailboxes();
+        }
+    }
+
+    @Test
+    void healthyLeaseReturnsOnceBrokenLeaseClosesAndIdleStoreExpires() {
+        properties.setPoolEnabled(true);
+        properties.setPoolIdleSeconds(10);
+        MailCredentials credentials = MailCredentials.ofAppPassword("testuser@gmail.com", "validAppPassword16");
+        ImapConnection first = factory.openImap(credentials);
+        var firstStore = first.getStore();
+        first.close();
+        first.close();
+        assertFalse(first.isConnected());
+        assertThrows(IllegalStateException.class, first::getStore);
+        assertTrue(firstStore.isConnected());
+        try (ImapConnection second = factory.openImap(credentials)) {
+            assertSame(firstStore, second.getStore());
+            second.markBroken();
+        }
+        assertFalse(firstStore.isConnected());
+
+        ImapConnection third = factory.openImap(credentials);
+        var thirdStore = third.getStore();
+        assertNotSame(firstStore, thirdStore);
+        third.close();
+        factory.evictExpiredIdleStores(System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(11));
+        assertFalse(thirdStore.isConnected());
+
+        ImapConnection late = factory.openImap(credentials);
+        var lateStore = late.getStore();
+        factory.shutdownPool();
+        late.close();
+        assertFalse(lateStore.isConnected());
+    }
+
+    @Test
+    void poolCapacityAndAccountIsolation() {
+        properties.setPoolEnabled(true);
+        properties.setPoolMaxPerAccount(1);
+        GmailAccount account = new GmailAccount();
+        account.setId(11L);
+        account.setEmail("testuser@gmail.com");
+        account.setAuthType(AuthType.APP_PASSWORD);
+        account.setAppPasswordEncrypted("fixture-cipher");
+        when(aesCipher.decrypt("fixture-cipher")).thenReturn("validAppPassword16");
+        ImapConnection first = factory.openImap(account);
+        ImapConnection second = factory.openImap(account);
+        var a = first.getStore();
+        var b = second.getStore();
+        assertNotSame(a, b);
+        first.close();
+        second.close();
+        assertTrue(a.isConnected());
+        assertFalse(b.isConnected());
+        account.setId(12L);
+        try (ImapConnection other = factory.openImap(account)) {
+            assertNotSame(a, other.getStore());
+        }
+        account.setId(11L);
+        try (ImapConnection reused = factory.openImap(account)) {
+            assertSame(a, reused.getStore());
+        }
     }
 
     @Test
@@ -74,6 +157,30 @@ class DefaultMailConnectionFactoryGreenMailTest {
             assertTrue(connection.isConnected());
             assertNotNull(connection.folder("INBOX"));
         }
+    }
+
+    @Test
+    void legacyRawConnectionsAreUnconnectedAndOwnedByTheCaller() throws Exception {
+        GmailAccount account = new GmailAccount();
+        account.setEmail("testuser@gmail.com");
+        account.setAuthType(AuthType.APP_PASSWORD);
+        account.setAppPasswordEncrypted("fixture-cipher");
+        when(aesCipher.decrypt("fixture-cipher")).thenReturn("validAppPassword16");
+        var store = factory.createImapStore(account);
+        try (store) {
+            assertFalse(store.isConnected());
+            store.connect();
+            assertTrue(store.isConnected());
+        }
+        assertFalse(store.isConnected());
+
+        var transport = factory.createSmtpTransport(account);
+        try (transport) {
+            assertFalse(transport.isConnected());
+            transport.connect();
+            assertTrue(transport.isConnected());
+        }
+        assertFalse(transport.isConnected());
     }
 
     @Test
@@ -137,6 +244,8 @@ class DefaultMailConnectionFactoryGreenMailTest {
     @DisplayName("testImap trả về NETWORK_ERROR khi server đóng cổng không phản hồi")
     void testTestImapNetworkError() {
         properties.setImapPort(49999); // Cổng không có service chạy
+        java.util.concurrent.atomic.AtomicInteger retries = new java.util.concurrent.atomic.AtomicInteger();
+        factory.getNetworkRetry().getEventPublisher().onRetry(event -> retries.incrementAndGet());
 
         MailCredentials credentials = MailCredentials.ofAppPassword("testuser@gmail.com", "validAppPassword16");
         ConnectionTestResult result = factory.testImap(credentials);
@@ -144,6 +253,7 @@ class DefaultMailConnectionFactoryGreenMailTest {
         assertNotNull(result);
         assertEquals(ConnectionTestResult.Status.NETWORK_ERROR, result.status());
         assertFalse(result.isSuccessful());
+        assertEquals(0, retries.get(), "Credential probe must not retry");
     }
 }
 

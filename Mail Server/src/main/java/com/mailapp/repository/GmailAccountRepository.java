@@ -15,10 +15,12 @@ public interface GmailAccountRepository extends JpaRepository<GmailAccount, Long
     Optional<GmailAccount> findByUserIdAndEmail(Long userId, String email);
     Optional<GmailAccount> findByUserIdAndEmailKey(Long userId, String emailKey);
     Optional<GmailAccount> findByIdAndUserId(Long id, Long userId);
+    boolean existsByIdAndUserIdAndRevision(Long id, Long userId, Long revision);
     long countByUserId(Long userId);
     long countByAuthType(AuthType authType);
     long countByStatus(AccountStatus status);
     boolean existsByUserIdAndEmail(Long userId, String email);
+    boolean existsByUserIdAndEmailIgnoreCase(Long userId, String email);
     boolean existsByUserIdAndEmailKey(Long userId, String emailKey);
     void deleteByUserIdAndId(Long userId, Long id);
     void deleteByUserId(Long userId);

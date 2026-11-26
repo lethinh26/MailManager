@@ -55,6 +55,9 @@ dependencies {
 
 tasks.named('test') {
     useJUnitPlatform()
+    // No test context may open the normal server's durable receipt directory.
+    // Journal-specific tests explicitly create their own temporary directory.
+    systemProperty 'mail.audit.receipt-dir', ''
 }
 
 bootRun {

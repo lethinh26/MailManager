@@ -1,82 +1,132 @@
-### 1. Đăng nhập lấy JWT
-POST {{baseUrl}}/api/auth/login
+### Disposable HTTPS/GreenMail fixture only. See README.acceptance.md.
+### No real Gmail account or existing database; do not persist credential/response history.
+### {{fixtureGmailId}} must belong to {{fixtureUserToken}}. Select UID and UIDVALIDITY
+### from current fixture list, never guess them. Only delete explicitly synthetic test mail.
+
+### Owner list — 200 metadata only
+GET {{fixtureBaseUrl}}/api/gmail-accounts
+Authorization: Bearer {{fixtureUserToken}}
+Accept: application/json
+
+### Link App Password CREATE — 201 new / 409 GMAIL_DUPLICATE
+POST {{fixtureBaseUrl}}/api/gmail-accounts/app-password
+Authorization: Bearer {{fixtureUserToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "email": "{{fixtureMailboxEmail}}",
+  "appPassword": "{{fixtureAppPassword}}",
+  "displayName": "Disposable mailbox",
+  "intent": "CREATE"
+}
+
+### Explicit update/add method — 200 METHOD_UPDATED/METHOD_ADDED (same mailbox)
+POST {{fixtureBaseUrl}}/api/gmail-accounts/app-password
+Authorization: Bearer {{fixtureUserToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "email": "{{fixtureMailboxEmail}}",
+  "appPassword": "{{fixtureAppPassword}}",
+  "intent": "UPSERT"
+}
+
+### Disabled App Password link: set ALLOW_APP_PASSWORD_LINK=false while OAuth stays true,
+### confirm public config and use the valid POST above (not GET list); expect 403.
+### Restore original settings immediately after the probe.
+
+### Rename fixture mailbox
+PATCH {{fixtureBaseUrl}}/api/gmail-accounts/{{fixtureGmailId}}
+Authorization: Bearer {{fixtureUserToken}}
 Content-Type: application/json
 
 {
-  "username": "lethanhcuong",
-  "password": "UserPassword123!"
+  "displayName": "Disposable mailbox renamed"
 }
 
-> {% client.global.set("token", response.body.accessToken); %}
-
-### 2. Lấy danh sách tài khoản Gmail (EP-G1)
-GET {{baseUrl}}/api/gmail-accounts
-Authorization: Bearer {{token}}
-
-### 3. Liên kết Gmail bằng App Password (EP-G2)
-POST {{baseUrl}}/api/gmail-accounts/app-password
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-{
-  "email": "your-email@gmail.com",
-  "appPassword": "<GMAIL_APP_PASSWORD_16_KY_TU>",
-  "displayName": "Gmail cá nhân"
-}
-
-### 4. Đổi tên hiển thị Gmail
-PATCH {{baseUrl}}/api/gmail-accounts/1
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-{
-  "displayName": "Gmail Công Việc PTIT"
-}
-
-### 4b. [Mở rộng ngoài 27] Đổi phương thức đăng nhập chính (OAUTH2 hoặc APP_PASSWORD)
-PUT {{baseUrl}}/api/gmail-accounts/1/preferred-method
-Authorization: Bearer {{token}}
+### Preferred method, only if already linked
+PUT {{fixtureBaseUrl}}/api/gmail-accounts/{{fixtureGmailId}}/preferred-method
+Authorization: Bearer {{fixtureUserToken}}
 Content-Type: application/json
 
 {
   "preferredMethod": "APP_PASSWORD"
 }
 
-### 4c. [Mở rộng ngoài 27] Gỡ một phương thức đăng nhập khỏi hộp thư (còn phương thức khác)
-DELETE {{baseUrl}}/api/gmail-accounts/1/methods/APP_PASSWORD
-Authorization: Bearer {{token}}
+### Folders
+GET {{fixtureBaseUrl}}/api/mails/folders?gmailId={{fixtureGmailId}}
+Authorization: Bearer {{fixtureUserToken}}
+Accept: application/json
 
-### 4d. [Mở rộng ngoài 27] Gỡ phương thức cuối cùng (bắt buộc confirmUnlink=true để hủy liên kết)
-DELETE {{baseUrl}}/api/gmail-accounts/1/methods/OAUTH2?confirmUnlink=true
-Authorization: Bearer {{token}}
+### List/search
+GET {{fixtureBaseUrl}}/api/mails?gmailId={{fixtureGmailId}}&folder=INBOX&page=0&size=10&q=manual-fixture
+Authorization: Bearer {{fixtureUserToken}}
+Accept: application/json
 
-### 5. Lấy danh sách thư mục Gmail (M08)
-GET {{baseUrl}}/api/mails/folders?gmailId=1
-Authorization: Bearer {{token}}
+### Preview without marking Seen — attachment sizeAccuracy may be ESTIMATED/UNKNOWN
+GET {{fixtureBaseUrl}}/api/mails/{{fixtureGmailId}}/INBOX/{{fixtureUid}}?uidValidity={{fixtureUidValidity}}&loadRemote=false&markSeen=false
+Authorization: Bearer {{fixtureUserToken}}
+Accept: application/json
 
-### 6. Liệt kê & tìm kiếm thư trong INBOX (M08)
-GET {{baseUrl}}/api/mails?gmailId=1&folder=INBOX&page=0&size=30
-Authorization: Bearer {{token}}
+### Open, marks Seen
+GET {{fixtureBaseUrl}}/api/mails/{{fixtureGmailId}}/INBOX/{{fixtureUid}}?uidValidity={{fixtureUidValidity}}
+Authorization: Bearer {{fixtureUserToken}}
+Accept: application/json
 
-### 7. Đọc chi tiết 1 thư (M08 - mặc định chặn ảnh từ xa)
-GET {{baseUrl}}/api/mails/1/INBOX/1001?loadRemote=false
-Authorization: Bearer {{token}}
+### Binary download index 0: actual Content-Length may differ from estimate
+GET {{fixtureBaseUrl}}/api/mails/{{fixtureGmailId}}/INBOX/{{fixtureUid}}/attachments/0/download?uidValidity={{fixtureUidValidity}}
+Authorization: Bearer {{fixtureUserToken}}
+Accept: */*
 
-### 8. Tải tệp đính kèm dạng stream (M12)
-GET {{baseUrl}}/api/mails/1/INBOX/1001/attachments/0/download
-Authorization: Bearer {{token}}
+### Flags: star + mark unread
+PUT {{fixtureBaseUrl}}/api/mails/{{fixtureGmailId}}/INBOX/{{fixtureUid}}/flags?uidValidity={{fixtureUidValidity}}
+Authorization: Bearer {{fixtureUserToken}}
+Content-Type: application/json
 
-### 9. Cập nhật cờ thư: Đánh dấu đã đọc & gắn sao (M17)
-PUT {{baseUrl}}/api/mails/1/INBOX/1001/flags
-Authorization: Bearer {{token}}
+{
+  "seen": false,
+  "starred": true
+}
+
+### Restore flags if required
+PUT {{fixtureBaseUrl}}/api/mails/{{fixtureGmailId}}/INBOX/{{fixtureUid}}/flags?uidValidity={{fixtureUidValidity}}
+Authorization: Bearer {{fixtureUserToken}}
 Content-Type: application/json
 
 {
   "seen": true,
-  "flagged": true
+  "flagged": false
 }
 
-### 10. Xóa thư (chuyển vào Thùng rác - M16)
-DELETE {{baseUrl}}/api/mails/1/INBOX/1001?permanent=false
-Authorization: Bearer {{token}}
+### Send only to the synthetic loopback mailbox; multipart modern shape.
+### For byte-accurate generated attachment tests use manual-http.cjs multipart.
+POST {{fixtureBaseUrl}}/api/mails/send
+Authorization: Bearer {{fixtureUserToken}}
+Content-Type: multipart/form-data; boundary=fixture-example
 
+--fixture-example
+Content-Disposition: form-data; name="payload"
+Content-Type: application/json
+
+{"gmailId":{{fixtureGmailId}},"to":["{{fixtureMailboxEmail}}"],"cc":[],"bcc":[],"subject":"disposable example","textBody":"Synthetic content"}
+--fixture-example--
+
+### Move exact synthetic message to Trash — 204, no body.
+### After move, refresh source and Trash; do not reuse INBOX UID for Trash.
+DELETE {{fixtureBaseUrl}}/api/mails/{{fixtureGmailId}}/INBOX/{{fixtureSyntheticUid}}?uidValidity={{fixtureUidValidity}}&permanent=false
+Authorization: Bearer {{fixtureUserToken}}
+
+### Trash without explicit confirmation — 400 PERMANENT_DELETE_REQUIRED_IN_TRASH
+DELETE {{fixtureBaseUrl}}/api/mails/{{fixtureGmailId}}/TRASH/{{fixtureTrashUid}}?uidValidity={{fixtureTrashUidValidity}}
+Authorization: Bearer {{fixtureUserToken}}
+
+### Explicit permanent delete of verified synthetic message only — 204.
+### Confirm correct marker, Trash UID and UIDVALIDITY first; never bulk delete.
+DELETE {{fixtureBaseUrl}}/api/mails/{{fixtureGmailId}}/TRASH/{{fixtureTrashUid}}?uidValidity={{fixtureTrashUidValidity}}&permanent=true
+Authorization: Bearer {{fixtureUserToken}}
+
+### Unlink only a disposable mailbox — 204; does not delete remote messages.
+DELETE {{fixtureBaseUrl}}/api/gmail-accounts/{{fixtureGmailId}}
+Authorization: Bearer {{fixtureUserToken}}
